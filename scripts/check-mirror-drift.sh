@@ -50,7 +50,16 @@ for f in index.md decisions.md session-log.md; do
 done
 
 count_dated_rows() { [[ -f "$1" ]] && grep -cE '^\|.*[0-9]{4}-[0-9]{2}-[0-9]{2}' "$1" || echo 0; }
-latest_log_date() { [[ -f "$1" ]] && grep -oE '##[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort | tail -1 || echo ""; }
+# Matches both session-log header styles: the old `## YYYY-MM-DD - Title` form and the
+# `## Session: Title` + `**Date:** YYYY-MM-DD` form end-session.sh (and every recent manual
+# entry) actually writes — the old regex alone never matched current-format entries, so this
+# check could never pass regardless of how current the mirror actually was.
+latest_log_date() {
+  [[ -f "$1" ]] || { echo ""; return; }
+  { grep -oE '##[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}' "$1"
+    grep -oE '\*\*Date:\*\*[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}' "$1"; } \
+    | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort | tail -1
+}
 latest_adr() { [[ -f "$1" ]] && grep -oE '^#+[[:space:]]*ADR-[0-9]+' "$1" | grep -oE '[0-9]+' | sort -n | tail -1 || echo ""; }
 
 REPO_DEC=$(count_dated_rows "$DOCS/decisions.md")

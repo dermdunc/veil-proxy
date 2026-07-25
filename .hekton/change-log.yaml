@@ -446,3 +446,18 @@ changes:
     links:
       - "docs/decisions.md"
       - "docs/session-log.md"
+
+  - id: CHG-8d6f5037
+    date: 2026-07-25
+    title: "M1 + M2 of the masking-proxy plan merged: transport/routing skeleton and daemon core"
+    intent: "Built and merged M1 (transport + routing skeleton, PR #38, 3 doubt-pass rounds, 11 fixes) and M2 (daemon core + H2 session-namespace shim, PR #39, 2 doubt-pass rounds, 12 fixes) of the masking-proxy plan. Both merged to main. crates/vg-proxy now has bind/routing (M1) plus a Daemon opening vg-vault once and a SessionShim resolving per-session Namespace via header or registered loopback address (M2), tested in isolation, not yet wired into the HTTP server."
+    changed_by: "claude (interactive session) + codex (cross-model doubt pass)"
+    change_type: build
+    risk_level: medium
+    validation:
+      - "not recorded"
+    approvals:
+      required: false
+      status: not_required
+    links:
+      - "docs/session-log.md"

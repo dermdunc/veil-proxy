@@ -756,3 +756,27 @@ agent_runs:
       - "Two open items left as documented, not fixed: the port-reuse handoff race (no real per-session-listener caller exists yet to provide registration atomicity; unregister_port/register_port_if_absent are the primitives provided) and binding-store lifetime/eviction (already an explicitly open plan-level question per docs/next-actions.md, predating this session)."
     next_actions:
       - "M3 (request masking, Anthropic direct, non-streaming) per plan §10.3 — first milestone wiring schema-aware parsing and real vg_core::mask calls into the HTTP request path. Branch agent/claude/vg-proxy-m2-daemon-core left open for human review, not merged."
+
+  - id: RUN-c8f34072
+    date: 2026-07-25
+    agent: "claude (interactive session) + codex (cross-model doubt pass)"
+    role: "Build Agent"
+    intent: "M1 + M2 landed: masking-proxy transport, routing, and daemon core — Built and merged M1 (transport + routing skeleton, PR #38, 3 doubt-pass rounds, 11 fixes) and M2 (daemon core + H2 session-namespace shim, PR #39, 2 doubt-pass rounds, 12 fixes) of the masking-proxy plan. Both merged to main. crates/vg-proxy now has bind/routing (M1) plus a Daemon opening vg-vault once and a SessionShim resolving per-session Namespace via header or registered loopback address (M2), tested in isolation, not yet wired into the HTTP server."
+    autonomy_level: 3
+    approvals:
+      required: false
+      status: not_required
+    files_touched:
+      - "docs/blog-signals.md"
+      - "docs/next-actions.md"
+      - "docs/session-log.md"
+      - "docs/gremlin-radar.md"
+      - "docs/next-actions.md.bak.20260725141500"
+    validation:
+      - "not recorded"
+    risks:
+      - "Port-reuse handoff race and binding-store eviction remain open, documented design questions (not new gaps this session) until a real per-session-listener caller and an eviction policy are built."
+    next_actions:
+      - "M3: request masking"
+      - "Anthropic direct"
+      - "non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)"

@@ -1502,3 +1502,30 @@ Branch left open, not merged — human review and merge decision are next.
 
 ### Mind-palace updated
 - No (vault mutation not authorised).
+---
+
+## Session: M1 + M2 landed: masking-proxy transport, routing, and daemon core
+
+**Date:** 2026-07-25 14:15
+
+### What Changed
+
+Built and merged M1 (transport + routing skeleton, PR #38, 3 doubt-pass rounds, 11 fixes) and M2 (daemon core + H2 session-namespace shim, PR #39, 2 doubt-pass rounds, 12 fixes) of the masking-proxy plan. Both merged to main. crates/vg-proxy now has bind/routing (M1) plus a Daemon opening vg-vault once and a SessionShim resolving per-session Namespace via header or registered loopback address (M2), tested in isolation, not yet wired into the HTTP server.
+
+### Decisions
+
+Port-fallback is registration, not derivation, to avoid silently reusing a prior session's namespace on port reuse. Daemon::open/open_with_key mirror Vault's own two-constructor pattern.
+
+### Assumptions
+
+M3 is the first milestone that wires schema-aware masking and the daemon into the real HTTP request path; M2 deliberately stops short of that.
+
+### Risks
+
+Port-reuse handoff race and binding-store eviction remain open, documented design questions (not new gaps this session) until a real per-session-listener caller and an eviction policy are built.
+
+### Next Actions
+
+- [ ] M3: request masking
+- [ ] Anthropic direct
+- [ ] non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)
