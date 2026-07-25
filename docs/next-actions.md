@@ -90,3 +90,9 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 - [ ] Add a `docs/build-log/` entry as each future material task lands, per the standing rule in
       `AGENTS.md`/`CLAUDE.md`/`CODEX.md`.
 - [ ] Re-audit build-log coverage against actual work after each task.
+
+## Session Update: 2026-07-25 — M1 + M2 landed: masking-proxy transport, routing, and daemon core
+
+- [ ] M3: request masking
+- [ ] Anthropic direct
+- [ ] non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)
