@@ -22,13 +22,21 @@ pub enum RouteVerdict {
 /// inference request. `request_target` may be a bare path or a path+query request-target; the
 /// query portion, if present, is discarded before matching.
 pub fn classify(method: &Method, request_target: &str) -> RouteVerdict {
-    let path = request_target.split('?').next().unwrap_or(request_target);
+    let path = match request_target.split_once('?') {
+        Some((path, _)) => path,
+        None => request_target,
+    };
 
     match (method, path) {
         // Anthropic direct — context-carrying, MASK.
         (&Method::POST, "/v1/messages") => RouteVerdict::Mask,
         (&Method::POST, "/v1/messages/count_tokens") => RouteVerdict::Mask,
-        // Recognized, non-context-carrying probes/metadata — PASS.
+        // Recognized, non-context-carrying probes/metadata — PASS. Deliberately query-agnostic
+        // (doubt-pass finding, independently raised by two reviewers): the plan's "match on
+        // path only, ignoring query string" rule (§5 step 2) is stated once, governing the
+        // whole classify step, not scoped to the Mask examples alone — and both these routes
+        // are non-context-carrying by design (Claude Code's own probes, not user content), so
+        // a query variant carries no additional masking risk. Not an oversight.
         (&Method::HEAD, "/") => RouteVerdict::Pass,
         (&Method::HEAD, "/api/hello") => RouteVerdict::Pass,
         (&Method::GET, "/inference-profiles") => RouteVerdict::Pass,
@@ -47,6 +55,15 @@ pub fn classify(method: &Method, request_target: &str) -> RouteVerdict {
 /// InvokeModel routes (streaming and non-streaming). `{model}` must be a single non-empty path
 /// segment; anything else (an empty segment, extra trailing segments, `/converse`) is not a
 /// match and falls through to `Block`.
+///
+/// **Invariant (doubt-pass finding): matching happens on the raw, undecoded path bytes.**
+/// `{model}` is accepted as an opaque segment exactly as the plan describes it — no
+/// percent-decoding or normalization happens here, so `%2F`/`%2e%2e`/etc. inside a model ID are
+/// just bytes that happen to not equal the literal `/` this function splits on, not a decoded
+/// path-traversal shape. This is the safe order (match-then-never-decode, not decode-then-match)
+/// and must stay that way: any future milestone that decodes the model ID must do so strictly
+/// *after* this match, never before it, or the classifier and whatever decodes downstream could
+/// disagree about where the segment boundary is.
 fn is_bedrock_invoke(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/model/") else {
         return false;

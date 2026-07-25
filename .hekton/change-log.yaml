@@ -382,3 +382,51 @@ changes:
       - "docs/decisions.md"
       - "docs/session-log.md"
       - "docs/build-log/2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md"
+  - id: CHG-0021
+    date: 2026-07-25
+    title: "Doubt-driven-development round 1 on M1: 6 real fixes (loopback enforcement, accept-loop resilience, real-wire test coverage)"
+    intent: "Adversarial review of crates/vg-proxy's M1 artifact (single-model + Codex cross-model, both independently flagging unenforced loopback binding as the strongest finding). Fixed: accept()-error-kills-daemon bug, unenforced loopback binding (new ProxyError::NotLoopback + server::bind()), missing real-wire-path test coverage (new tests/server_smoke.rs), missing adversarial/regression test rows, a dead unwrap_or fallback, unbounded response-body reflection. Documented 3 out-of-scope invariants and 1 reviewer mis-read as doc comments. Accepted 1 trade-off (shutdown drain deferred to M2)."
+    changed_by: "claude (interactive session) + codex (cross-model doubt pass)"
+    change_type: fix
+    risk_level: low
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 2 new vg-proxy tests; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS"
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+  - id: CHG-0022
+    date: 2026-07-25
+    title: "Doubt-driven-development round 2 on M1: closed a bypass of round 1's own loopback fix"
+    intent: "Single-model review targeted at round 1's own new code found run_with_listener (made pub in round 1 for testability) had no loopback check of its own, reopening the off-host-exposure gap round 1's bind() fix was supposed to close for any caller that bypasses bind() and calls run_with_listener directly. Fixed by re-checking loopback inside run_with_listener itself (bind()'s check kept as cheap defense-in-depth). Also fixed an accept-loop busy-loop risk (capped exponential backoff on repeated accept() errors) and added test coverage proving the bypass is closed."
+    changed_by: "claude (interactive session)"
+    change_type: fix
+    risk_level: medium
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 3 tests in server_smoke.rs (up from 2); cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS"
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+  - id: CHG-0023
+    date: 2026-07-25
+    title: "Doubt-driven-development round 3 on M1: shutdown-race fix + regression-test hardening"
+    intent: "Single-model review targeted at round 2's own new code found the backoff sleep wasn't raced against shutdown (could delay shutdown observation during a sustained accept-error storm) and round 2's own regression test had no timeout (would hang instead of fail if the guarded fix were ever reverted). Fixed both; verified the test fix by deliberately reintroducing the guarded bug and confirming the test now fails fast instead of hanging. Stopping the doubt-pass here (3 rounds, diminishing findings: 6 -> 3 -> 2) per the skill's own guidance."
+    changed_by: "claude (interactive session)"
+    change_type: fix
+    risk_level: low
+    validation:
+      - "cargo test --workspace: PASS, no regressions; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS; manually verified the regression test catches its guarded regression"
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"

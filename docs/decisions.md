@@ -2440,3 +2440,195 @@ contract) and Bedrock Converse excluded (Claude Code never calls it) — both no
   currently call out" — there is nothing in the dependency graph capable of it yet.
 - Branch `agent/claude/vg-proxy-m1-transport-routing` left open for human review before merge,
   per the git contract's "close branches deliberately" rule — not merged this session.
+
+## 2026-07-25 - Doubt-driven-development round 1 on M1 (single-model + Codex cross-model)
+
+### Context
+
+Ran the `doubt-driven-development` skill against the M1 artifact (`crates/vg-proxy/src/{route,server,error}.rs`)
+immediately after PR #38, per the user's request. Single-model adversarial review first, then a
+Codex cross-model pass on the identical ARTIFACT/CONTRACT — offered per the skill's "never skip
+the cross-model offer" rule, user chose to run it.
+
+### Findings and disposition
+
+Single-model pass: 8 findings. Codex pass: 8 findings, independently converging on the same
+loopback-enforcement gap the single-model pass found (highest-confidence finding of the round —
+two differently-built models flagging the identical gap from the identical prompt) and raising
+several new ones. Reconciled against the artifact text and the plan's actual §5 step 2 wording
+(precedence: contract misread > valid+actionable > valid trade-off > noise):
+
+- **Fixed — accept-loop resilience.** `run()`'s connection loop used `accepted?`, propagating
+  any single `TcpListener::accept()` `io::Error` (fd exhaustion, a transient ECONNRESET) out of
+  the loop and killing the whole daemon. Now logs and continues, the conventional pattern for a
+  long-lived server's accept loop.
+- **Fixed — loopback binding enforced, not just documented.** Both reviewers independently
+  flagged that `run()`'s doc comments assert "plain HTTP on loopback" but nothing checked
+  `addr.ip().is_loopback()`. Added `ProxyError::NotLoopback` and a new `server::bind()` that
+  refuses non-loopback addresses; `run()` now calls it. Split `run()` into `bind()` +
+  `run_with_listener()` in the process — a deliberate, useful side effect, not scope creep: it's
+  also what let the new integration test bind `127.0.0.1:0` and read the real port back via
+  `TcpListener::local_addr()` instead of hardcoding a port.
+- **Fixed — real wire-path test coverage.** Both reviewers noted `route_classification.rs` only
+  ever called `route::classify` directly, never proving `server::handle`'s
+  `req.uri().path_and_query()` extraction behaves the same way. Added
+  `tests/server_smoke.rs`: real TCP connections against a real `bind`/`run_with_listener`
+  instance for one case per verdict, hand-rolled HTTP/1.1 request bytes (no new production
+  dependency — the client-side test code is a dev-dependency only, so `cargo tree`'s
+  zero-egress-client claim for the shipped crate is unaffected).
+- **Fixed — adversarial + regression test rows.** Added percent-encoded-slash and
+  encoded-dot-segment Bedrock model-ID cases (both reviewers raised path-confusion concerns;
+  confirmed and documented as intentional — matching happens on raw undecoded bytes, decode
+  strictly happens later if ever, so these are correctly `Mask`, not a hole) and
+  case-sensitivity/trailing-slash `Block` rows locking in today's fail-closed default against a
+  future accidental normalization.
+- **Fixed — dead `unwrap_or` fallback.** `request_target.split('?').next().unwrap_or(...)` is
+  unreachable (`str::split` always yields ≥1 item); replaced with an explicit
+  `split_once`-based match.
+- **Fixed — bounded reflection.** Test-double response bodies echoed the caller's request-target
+  unbounded; capped at 2048 chars.
+- **Documented, not changed — Pass-route query-agnostic matching.** Both reviewers read the
+  contract's two literal Pass-route examples (`GET /inference-profiles?type=SYSTEM_DEFINED`,
+  `GET /v1/models?limit=1000`) as scoping "match on path only" to those exact queries. Re-reading
+  §5 step 2: "match on path only, ignoring query string" is stated once, governing the whole
+  classify step, not scoped to the Mask examples — and both Pass routes are non-context-carrying
+  by design (Claude Code's own probes, not user content), so a query variant carries no
+  additional masking risk. Classified as **noise** (reviewers lacked that framing), but since two
+  independent models read it the same way, added an explicit doc comment on the `Pass` match arms
+  so a future reader doesn't hit the same false alarm.
+- **Documented, not changed — GET-with-body, absolute-form request-target authority dropped,
+  Bedrock model-ID character class.** All three are real observations about future risk, not M1
+  bugs: `handle()` never reads the request body for any verdict today (any milestone that starts
+  forwarding `Pass` routes unchanged must not assume bodylessness); the plan's own design (§8.1)
+  never derives the forwarding upstream from the client's request-target, so a silently-dropped
+  absolute-form authority can't become a confused-deputy path unless that design changes; the
+  plan calls the Bedrock model ID "opaque," not a specific grammar, so no character-class
+  validation was added. All three are recorded as doc-comment invariants in `server.rs`/`route.rs`
+  for whichever future milestone's own review should re-check them (M7/M8, real forwarding).
+- **Accepted trade-off, not fixed — shutdown doesn't drain in-flight connections.** Real gap
+  (spawned per-connection tasks are detached; `run_with_listener` returning `Ok(())` doesn't wait
+  for them), but full graceful-shutdown lifecycle is `daemon.rs`'s job per §10.2's module split
+  (M2, not M1) — documented in `run_with_listener`'s doc comment, not built early.
+
+### Validation
+
+`cargo test --workspace`: all green, 2 new tests in `vg-proxy` (server smoke test,
+loopback-refusal test) plus the expanded table test, no regressions elsewhere. `cargo clippy
+--workspace --all-targets -- -D warnings`: clean. `cargo fmt --check`: clean.
+`scripts/verify-project.sh`: PASS.
+
+## 2026-07-25 - Doubt-driven-development round 2 on M1 (single-model, targeted at round 1's own new code)
+
+### Context
+
+Per the repo's established doubt-pass pattern (each round targets the *previous* round's own
+new code, not the whole file fresh — see the T10 FP-detector-fix rounds), ran a single-model
+adversarial review against round 1's fix code specifically: the `bind()`/`run_with_listener()`
+split, the `NotLoopback` error variant, the accept-loop fix, and the two new tests.
+
+### Findings and disposition
+
+- **Fixed (High) — `run_with_listener` completely bypassed the loopback check it was supposed
+  to help enforce.** Round 1 made `run_with_listener` `pub` for testability; the loopback check
+  lived only in `bind()`. Any caller — including M2's `daemon.rs`, the function's own next real
+  consumer — could bind a listener to `0.0.0.0` directly and call `run_with_listener` with it,
+  silently reopening the exact off-host-exposure gap round 1's fix was written to close. This is
+  a genuinely more serious finding than anything in round 1: it's a bypass of round 1's own fix,
+  introduced by the fix itself. Closed by re-checking `listener.local_addr()?.ip().is_loopback()`
+  at the top of `run_with_listener`, so the invariant holds regardless of entry point — `bind()`'s
+  check stays too, as cheap defense-in-depth (and fails faster, before a socket is even opened).
+- **Fixed (Medium-High) — the accept-loop's error path had no backoff, risking a busy-loop under
+  the exact conditions (fd exhaustion, rapid connect-then-RST) where accept() errors actually
+  recur.** A bare `continue` with no yield point spins the loop under sustained accept failures,
+  competing for scheduler time instead of giving other connections a chance to free descriptors —
+  the same failure mode Go's `net/http.Server.Serve` backs off for. Added capped exponential
+  backoff (5ms doubling to a 1s cap, reset on the next successful accept), gated behind a new
+  `time` feature on the production `tokio` dependency (the crate's first — still no HTTP client
+  feature anywhere in the graph, so the zero-egress-client property is unaffected).
+- **Fixed (Medium) — test coverage proved the weaker, bypassable half of the loopback contract.**
+  The round-1 test only exercised `bind()` directly; nothing tested `run_with_listener`'s own
+  enforcement, so the test suite gave false confidence that "misconfigured caller gets no error"
+  was fully closed when it only was for callers going through `bind()` first. Added a test that
+  binds a raw `tokio::net::TcpListener` to `0.0.0.0` directly (bypassing `server::bind` entirely)
+  and confirms `run_with_listener` still refuses it.
+- **Documented, not fixed (Low) — `Ipv6Addr::is_loopback()` doesn't recognize IPv4-mapped IPv6
+  loopback (`::ffff:127.0.0.1`).** A false-*rejection*, not a bypass — the safe direction of
+  error for a security proxy. M1 doesn't need to support that address form; not fixed.
+
+No other issues found in round 1's new code (the error variants themselves, the doc-comment
+invariants, `is_bedrock_invoke`'s match-before-decode ordering) after thorough examination —
+recorded as a real "clean" result on that part of the pass, not a sign of insufficient scrutiny.
+
+### Validation
+
+`cargo test --workspace`: all green, 3 tests in `vg-proxy`'s `server_smoke.rs` (up from 2), no
+regressions elsewhere. `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo
+fmt --check`: clean. `scripts/verify-project.sh`: PASS.
+
+### Stop condition
+
+Two cycles run (single-model + Codex cross-model in round 1; single-model targeted at round 1's
+own new code in round 2). Round 2 found one High-severity bypass of round 1's own fix — the
+kind of finding that specifically justifies the "target the previous round's own new code"
+pattern, since it wouldn't have been caught by re-reviewing the original files fresh. Given the
+diminishing-but-real-findings trajectory (round 1: 6 real fixes; round 2: 3 real fixes, one
+higher severity than anything in round 1), this warrants at least one more round before treating
+M1 as settled — user to decide whether to run round 3 or stop here.
+
+## 2026-07-25 - Doubt-driven-development round 3 on M1 (single-model, targeted at round 2's own new code)
+
+### Context
+
+User chose to continue after round 2's higher-severity finding. Single-model review targeted at
+round 2's own new code specifically: the loopback re-check added to `run_with_listener`, the
+accept-error backoff logic, and the new bypass-closure test.
+
+### Findings and disposition
+
+- **Fixed (High) — the backoff sleep wasn't raced against `shutdown`, so a sustained
+  accept-error storm could delay shutdown observation by up to the current backoff (capped at
+  1s) per iteration, repeatedly.** Once `tokio::select!` commits to the accept-error branch,
+  `shutdown` isn't polled again until that branch's block finishes — a bare
+  `sleep(backoff).await` runs entirely outside the race. This contradicted the documented "runs
+  until shutdown resolves" contract during exactly the failure mode the backoff exists to
+  survive. Fixed by nesting a `select!` around the sleep itself, racing it against `&mut
+  shutdown` too.
+- **Fixed (Medium — a real false-negative in the regression test itself) — the new
+  `run_with_listener_refuses_a_non_loopback_listener_...` test (added in round 2) had no
+  timeout, so if the loopback re-check it guards were ever removed, the test would hang forever
+  instead of failing.** `run_with_listener` would fall into its accept loop; nothing connects to
+  the `0.0.0.0:0` test listener, and `_shutdown_tx` isn't dropped until the test function
+  returns — which can't happen while the function is still awaiting the hung call. This is
+  exactly the kind of regression-test bug that defeats the test's own purpose: it would pass
+  today and silently stop protecting anything if the fix under test were ever reverted, without
+  ever turning red — it would just stall CI. **Verified directly, not just reasoned about:**
+  temporarily reverted the loopback re-check in `run_with_listener`, confirmed the test now
+  fails cleanly in ~2s with a clear panic message (`Elapsed(())`) instead of hanging, then
+  restored the real fix. Closed by wrapping the call in `tokio::time::timeout`, matching the
+  sibling test's existing pattern.
+- Fixing the first finding incidentally resolved a third, minor doc/behavior-mismatch
+  observation (the shutdown-semantics doc comment not mentioning the backoff-delay nuance) —
+  once shutdown is genuinely observed promptly during backoff, there was nothing left to
+  document as an exception.
+
+No other issues found in round 2's new code (the loopback re-check's core logic — no real
+TOCTOU, since `local_addr()` on an already-bound listener is a fixed OS-level fact, not
+re-bindable out from under the running function; the backoff's doubling arithmetic — no
+overflow risk, capped well within `Duration`'s range; the reset-on-success logic) after
+thorough examination.
+
+### Validation
+
+`cargo test --workspace`: all green, no regressions. `cargo clippy --workspace --all-targets --
+-D warnings`: clean. `cargo fmt --check`: clean. `scripts/verify-project.sh`: PASS. Additionally
+verified the regression test's own effectiveness by deliberately reintroducing the bug it
+guards against and confirming the test fails (not hangs) — see above.
+
+### Stop condition
+
+Three cycles run. Round 3's own new code (the shutdown-race fix in the backoff, the
+now-timeout-wrapped test) was not itself re-reviewed by a fourth round — per the skill's
+guidance ("escalate to the user rather than grinding a 4th alone"), stopping here and reporting
+back rather than continuing solo. Findings trajectory across all three rounds: 6 → 3 → 2 real
+fixes, genuinely diminishing, with round 3's fixes being smaller in scope (a race condition and
+a test-hygiene gap) than round 2's (a security bypass). Reasonable stop point.

@@ -1294,3 +1294,131 @@ under the line-length limit). Manual `curl` verification against a live instance
 
 ### Mind-palace updated
 - No (vault mutation not authorised).
+
+## Session: Doubt-driven-development round 1 on M1
+
+**Date:** 2026-07-25
+
+Ran the `doubt-driven-development` skill against the just-committed M1 artifact, per the user's
+request. Single-model adversarial review (general-purpose agent, ARTIFACT + CONTRACT only, no
+CLAIM) found 8 issues; offered a Codex cross-model pass, user accepted; Codex found 8 more,
+independently converging on the same loopback-enforcement gap as the single-model pass — the
+strongest signal of the round. Reconciled both sets against the artifact text and the plan's own
+§5 step 2 wording. Full findings-by-findings disposition in `docs/decisions.md` (2026-07-25,
+"Doubt-driven-development round 1 on M1").
+
+Fixed six real issues: the accept-loop's fatal-on-any-error bug (now logs and continues),
+unenforced loopback binding (new `ProxyError::NotLoopback` + `server::bind()`, `run()` split into
+`bind()` + `run_with_listener()`), missing real-wire-path test coverage (new
+`tests/server_smoke.rs`, real TCP against a real server instance), missing adversarial/regression
+test rows (percent-encoded Bedrock model-ID cases, case/trailing-slash `Block` rows), a dead
+`unwrap_or` fallback, and unbounded response-body reflection. Documented three real-but-
+out-of-scope-for-M1 observations as doc-comment invariants for future milestones to re-check
+(GET-with-body, absolute-form request-target authority, Bedrock model-ID character class) and one
+reviewer mis-read (Pass-route query-agnostic matching is deliberate, not an oversight — but
+worth a doc comment since two independent models read it the same way). One accepted trade-off,
+not fixed: shutdown doesn't drain in-flight connections — real gap, but full lifecycle management
+is M2's `daemon.rs` job, not M1's.
+
+### Changed / created files
+- `crates/vg-proxy/src/error.rs` — new `ProxyError::NotLoopback` variant.
+- `crates/vg-proxy/src/server.rs` — `bind()`/`run_with_listener()` split; accept-loop resilience;
+  bounded response-body reflection; new doc-comment invariants.
+- `crates/vg-proxy/src/route.rs` — dead-code fix; new doc comments (Pass query-agnostic design,
+  raw-bytes matching invariant).
+- `crates/vg-proxy/tests/route_classification.rs` — adversarial + regression rows added.
+- `crates/vg-proxy/tests/server_smoke.rs` — new, real-HTTP integration test.
+- `crates/vg-proxy/Cargo.toml` — dev-dependency-only tokio feature additions (`io-util`, `sync`)
+  for the new integration test; no production dependency changed.
+
+### Validation
+`cargo test --workspace`: all green, no regressions, 2 new `vg-proxy` tests. `cargo clippy
+--workspace --all-targets -- -D warnings`: clean. `cargo fmt --check`: clean.
+`scripts/verify-project.sh`: PASS.
+
+### Mind-palace updated
+- No (vault mutation not authorised).
+
+## Session: Doubt-driven-development round 2 on M1
+
+**Date:** 2026-07-25
+
+Continued the doubt-pass on M1, per the repo's established pattern of targeting each round at
+the *previous* round's own new code (the T10 detector-fix precedent). Single-model review
+against round 1's fix code (the `bind()`/`run_with_listener()` split, `NotLoopback`, the
+accept-loop fix, the two new tests) found something more serious than anything in round 1: the
+fix itself introduced a bypass. `run_with_listener` is `pub` (round 1 made it so for testing)
+and took an already-bound listener with no loopback check of its own — any caller binding
+`0.0.0.0` directly and calling it would have silently reopened the exact exposure gap round 1
+closed. Full disposition in `docs/decisions.md` (2026-07-25, round 2).
+
+Fixed: `run_with_listener` now re-checks `listener.local_addr()?.ip().is_loopback()` itself,
+closing the bypass regardless of entry point; accept-loop errors now back off (capped
+exponential, 5ms→1s, reset on success) instead of risking a busy-loop under sustained accept
+failures (fd exhaustion, rapid connect-then-RST) — this needed the `time` feature added to the
+production `tokio` dependency (the crate's first; no HTTP client feature anywhere in the graph
+still). Added a test proving `run_with_listener`'s own enforcement independent of `bind()`.
+Documented, not fixed: `Ipv6Addr::is_loopback()` doesn't recognize IPv4-mapped IPv6 loopback —
+a false-rejection, the safe direction of error, not fixed for M1.
+
+### Changed / created files
+- `crates/vg-proxy/src/server.rs` — `run_with_listener` re-checks loopback; accept-loop backoff.
+- `crates/vg-proxy/Cargo.toml` — production `tokio` gains the `time` feature.
+- `crates/vg-proxy/tests/server_smoke.rs` — new test proving the bypass is closed.
+- `docs/decisions.md` — full findings disposition.
+
+### Validation
+`cargo test --workspace`: all green, 3 tests in `server_smoke.rs` (up from 2), no regressions.
+`cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo fmt --check`: clean.
+`scripts/verify-project.sh`: PASS.
+
+### Next actions
+Round 2 found a higher-severity issue than round 1 (a bypass of round 1's own fix) — per the
+doubt-driven-development stop condition, this is real signal that another round is warranted
+before treating M1 as settled, not a trivial-findings stop point. Asking the user whether to run
+round 3 or stop here.
+
+### Mind-palace updated
+- No (vault mutation not authorised).
+
+## Session: Doubt-driven-development round 3 on M1
+
+**Date:** 2026-07-25
+
+User chose to continue past round 2's higher-severity finding. Single-model review targeted at
+round 2's own new code (the loopback re-check, the accept-error backoff, the new test) found two
+real issues: the backoff sleep wasn't raced against `shutdown`, so a sustained accept-error
+storm could delay shutdown observation by up to 1s per iteration repeatedly; and round 2's own
+new regression test had no timeout, so if the loopback re-check it guards were ever removed, the
+test would hang forever instead of failing — a false-negative in the test itself. Verified the
+second fix directly: temporarily reverted the loopback re-check, confirmed the test now fails
+cleanly in ~2s instead of hanging, restored the fix. Full disposition in `docs/decisions.md`
+(2026-07-25, round 3).
+
+Fixed both: the backoff sleep now races against shutdown via a nested `select!`; the regression
+test now wraps its call in `tokio::time::timeout`, matching its sibling test's existing pattern.
+No other issues found in round 2's own code after thorough examination (no TOCTOU in the
+loopback re-check, no overflow risk in the backoff doubling, reset-on-success logic correct).
+
+Findings trajectory across three rounds: 6 → 3 → 2 real fixes, genuinely diminishing, with round
+3's fixes smaller in scope than round 2's security bypass. Stopping here per the
+doubt-driven-development skill's own guidance ("escalate to the user rather than grinding a 4th
+alone") — reporting back rather than continuing solo.
+
+### Changed / created files
+- `crates/vg-proxy/src/server.rs` — backoff sleep now races against shutdown.
+- `crates/vg-proxy/tests/server_smoke.rs` — regression test now timeout-wrapped.
+- `docs/decisions.md` — full findings disposition.
+
+### Validation
+`cargo test --workspace`: all green, no regressions. `cargo clippy --workspace --all-targets --
+-D warnings`: clean. `cargo fmt --check`: clean. `scripts/verify-project.sh`: PASS. Also
+manually verified the fixed regression test actually catches the regression it guards against
+(reverted the fix, confirmed fast failure, restored it).
+
+### Next actions
+Recommending stop here — 3 rounds, diminishing real findings, PR #38 ready for human review
+covering all three rounds' fixes on top of the original M1 skeleton.
+
+### Mind-palace updated
+- No (vault mutation not authorised).

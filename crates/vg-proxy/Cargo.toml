@@ -10,11 +10,11 @@ description = "Local masking-proxy daemon front door (vg-daemon/vg-proxy): a pla
 workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 thiserror = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util", "sync"] }

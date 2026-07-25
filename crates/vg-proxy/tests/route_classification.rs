@@ -33,6 +33,12 @@ fn enumerated_routes_classify_correctly() {
             "/model/anthropic.claude-3-opus%3A0/invoke",
             RouteVerdict::Mask,
         ),
+        // doubt-pass (cross-model): percent-encoded slash/dot-segment inside the opaque model
+        // ID is still a single raw segment (no literal '/'), so this stays Mask by the
+        // match-on-raw-bytes invariant (route.rs `is_bedrock_invoke` doc comment) — not a
+        // path-traversal shape until something decodes it, which nothing here does.
+        (Method::POST, "/model/foo%2Fbar/invoke", RouteVerdict::Mask),
+        (Method::POST, "/model/%2e%2e/invoke", RouteVerdict::Mask),
         // --- Recognized, non-context-carrying probes/metadata — PASS ---
         (Method::HEAD, "/", RouteVerdict::Pass),
         (Method::HEAD, "/api/hello", RouteVerdict::Pass),
@@ -71,6 +77,13 @@ fn enumerated_routes_classify_correctly() {
         // unenumerated routes
         (Method::POST, "/", RouteVerdict::Block),
         (Method::GET, "/unknown", RouteVerdict::Block),
+        // doubt-pass: lock in that case/trailing-slash variants fail closed today, so a future
+        // "helpful" normalization patch can't silently flip these to Mask/Pass without this
+        // test catching it.
+        (Method::POST, "/V1/Messages", RouteVerdict::Block),
+        (Method::POST, "/v1/messages/", RouteVerdict::Block),
+        (Method::GET, "/v1/models/", RouteVerdict::Block),
+        (Method::HEAD, "//", RouteVerdict::Block),
     ];
 
     for (method, target, expected) in cases {

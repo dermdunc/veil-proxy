@@ -650,3 +650,80 @@ agent_runs:
       - "None new — M1 has no upstream client in its dependency graph at all (confirmed via cargo tree), so egress is impossible by construction, not merely policy-denied."
     next_actions:
       - "M2 (daemon core: Vault opened once, H2 session-namespace shim, session store as a bare data structure) per plan §10.3. Branch agent/claude/vg-proxy-m1-transport-routing left open for human review, not merged."
+  - id: RUN-0021
+    date: 2026-07-25
+    agent: "claude (interactive session) + codex (cross-model doubt pass)"
+    role: "Review Agent"
+    intent: "doubt-driven-development round 1 on M1 (crates/vg-proxy): single-model adversarial review (general-purpose agent, ARTIFACT+CONTRACT only) found 8 findings; Codex cross-model pass on the identical prompt found 8 more, independently converging on the same loopback-enforcement gap. Reconciled against the plan's §5 step 2 text; fixed 6 real issues (accept-loop fatal-on-error, unenforced loopback binding, missing real-wire-path test coverage, missing adversarial/regression test rows, dead unwrap_or, unbounded response reflection), documented 3 out-of-scope-for-M1 invariants as doc comments, accepted 1 trade-off (shutdown drain deferred to M2's daemon.rs), classified 1 finding as reviewer mis-read (documented anyway since two models agreed)."
+    autonomy_level: 3
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    files_touched:
+      - "crates/vg-proxy/src/error.rs"
+      - "crates/vg-proxy/src/server.rs"
+      - "crates/vg-proxy/src/route.rs"
+      - "crates/vg-proxy/tests/route_classification.rs"
+      - "crates/vg-proxy/tests/server_smoke.rs"
+      - "crates/vg-proxy/Cargo.toml"
+      - "docs/session-log.md"
+      - "docs/decisions.md"
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 2 new vg-proxy tests; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS"
+    risks:
+      - "None new. Shutdown-drain gap (accepted trade-off) is a pre-existing M1 property, not introduced by this round; documented, deferred to M2's daemon.rs by design."
+    next_actions:
+      - "M2 (daemon core) per plan §10.3, once human review of PR #38 (updated) lands. User to decide whether to run a second doubt-pass cycle on this round's fixes or stop here."
+  - id: RUN-0022
+    date: 2026-07-25
+    agent: "claude (interactive session)"
+    role: "Review Agent"
+    intent: "doubt-driven-development round 2 on M1, targeted at round 1's own new code (bind()/run_with_listener() split, NotLoopback, accept-loop fix, new tests) per the repo's established pattern. Found a High-severity bypass: run_with_listener (made pub in round 1 for testability) had no loopback check of its own, reopening the exact off-host-exposure gap round 1's bind() fix closed for any caller that binds its own listener and calls run_with_listener directly. Fixed by re-checking loopback inside run_with_listener itself. Also fixed a Medium-High accept-loop busy-loop risk (no backoff on repeated accept() errors) and added test coverage proving run_with_listener's own enforcement. One Low finding (IPv4-mapped IPv6 loopback not recognized) documented, not fixed — false-rejection, safe direction."
+    autonomy_level: 3
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    files_touched:
+      - "crates/vg-proxy/src/server.rs"
+      - "crates/vg-proxy/Cargo.toml"
+      - "crates/vg-proxy/tests/server_smoke.rs"
+      - "docs/session-log.md"
+      - "docs/decisions.md"
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 3 tests in server_smoke.rs (up from 2); cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS"
+    risks:
+      - "Round 2 found a higher-severity issue than round 1 (a bypass of round 1's own fix) — real signal that a round 3 targeted at this round's own new code is warranted before treating M1 as fully settled, not a trivial-findings stop point."
+    next_actions:
+      - "User to decide whether to run doubt-pass round 3 (targeted at round 2's own new code) or stop here and proceed to M2."
+  - id: RUN-0023
+    date: 2026-07-25
+    agent: "claude (interactive session)"
+    role: "Review Agent"
+    intent: "doubt-driven-development round 3 on M1, targeted at round 2's own new code (the loopback re-check, the accept-error backoff, the new test) per the repo's established pattern. Found: backoff sleep not raced against shutdown (could delay shutdown observation by up to 1s per iteration during a sustained accept-error storm); round 2's own regression test had no timeout, so it would hang instead of fail if the loopback re-check it guards were ever removed. Fixed both. Verified the test fix directly by temporarily reverting the guarded fix and confirming the test now fails fast instead of hanging."
+    autonomy_level: 3
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    files_touched:
+      - "crates/vg-proxy/src/server.rs"
+      - "crates/vg-proxy/tests/server_smoke.rs"
+      - "docs/session-log.md"
+      - "docs/decisions.md"
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+    validation:
+      - "cargo test --workspace: PASS, no regressions; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS; manually verified the fixed regression test catches its guarded regression (reverted the fix, confirmed fast failure in ~2s, restored it)"
+    risks:
+      - "None new. Findings trajectory across 3 rounds (6 -> 3 -> 2 real fixes) is diminishing; stopping per the doubt-driven-development skill's own guidance rather than running a 4th round solo."
+    next_actions:
+      - "PR #38 ready for human review, covering the original M1 skeleton plus all 3 doubt-pass rounds. M2 (daemon core) next per plan §10.3 once reviewed."
