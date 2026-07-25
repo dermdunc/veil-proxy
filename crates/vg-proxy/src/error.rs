@@ -15,4 +15,8 @@ pub enum ProxyError {
     },
     #[error("connection I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("vault error: {0}")]
+    Vault(#[from] vg_core::VaultError),
+    #[error("session resolution error: {0}")]
+    Session(#[from] crate::session::SessionError),
 }
