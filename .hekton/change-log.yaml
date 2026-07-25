@@ -365,3 +365,20 @@ changes:
     links:
       - "docs/decisions.md"
       - "docs/architecture/interface-contracts.md"
+  - id: CHG-0020
+    date: 2026-07-25
+    title: "New crate crates/vg-proxy, milestone M1: masking-proxy transport + routing skeleton"
+    intent: "First implementation milestone of ~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md (v3.1) — a plain-HTTP hyper loopback server plus a deny-by-default route classifier matching the plan's §5 step 2 / §8.7 route table verbatim (including the v3.1 scope corrections: Batch API removed, Bedrock Converse excluded). No upstream client, no credentials, no masking logic in this milestone — zero egress risk by construction."
+    changed_by: "claude (interactive session)"
+    change_type: build
+    risk_level: low
+    validation:
+      - "cargo test --workspace: PASS, no regressions across all 9 crates; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; manual curl verification of mask/pass/block route responses against a live server instance"
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+      - "docs/build-log/2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md"

@@ -21,6 +21,7 @@
 | 2026-07-04 | Repo made **public** under the **dermdunc** account | VeilGremlin is an enterprise architecture/governance/risk tool, not agentic-engineering tooling — it belongs under the professional-identity account per Hekton's domain-based GitHub routing decision (see `~/hekton/docs/decisions.md`, 2026-07-04). Refines the 2026-06-30 private-scaffold decision above. |
 | 2026-07-17 | ADR-011 (T05) `vg-vault` = **SQLCipher via `rusqlite` (vendored OpenSSL), OS-keychain-wrapped DB key, per-install salt in an encrypted `meta` table; `Keyer` ordinal counters reseeded from persisted rows at open** | Encrypted-at-rest reversible mapping store; keychain wrap keeps the key off disk; reseed prevents display-ordinal collision/drift across process restarts. Added an additive `Keyer::seed_ordinal` to `vg-core` (not a frozen-contract change). See the 2026-07-17 T05 entry below. |
 | 2026-07-18 | ADR-012 (T07) **`vg-core::scan`/`mask` pipeline wired; contract bumped v1 → v1.1 (`mask` gains `ctx: &Context`)** | `mask` needs the same detectors/parsers `scan` runs but the frozen signature had no `Context`; the sanctioned contract-change fix is an explicit param, not smuggling detectors into `Policy` or pre-computing findings. Also fixed the pipeline order (artefact-Block short-circuit; `Pass` never skips detection; full-buffer detection with spans as enrichment; specific-over-generic overlap resolution; irreversible/entity-Block never interned; one Scan/Block audit event; vault owns demask attribution). See the 2026-07-18 T07 entry below. |
+| 2026-07-25 | New crate **`crates/vg-proxy`**, milestone M1 (transport + routing skeleton) | First implementation milestone of `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1); plain-HTTP `hyper` loopback server + deny-by-default route classifier, zero egress risk by construction (no upstream client exists yet). See the 2026-07-25 entry below. |
 
 Full reasoning and the Mermaid-illustrated design are in [`spec/requirements-and-design-spec.md`](spec/requirements-and-design-spec.md).
 
@@ -2396,3 +2397,46 @@ reasonable stop point** — 23 findings across four rounds, every freely-fixable
 gap closed, remaining surface is a named, accepted, dictionary-check-shaped limit consistent
 with this detector's stated design boundary. Still on `agent/claude/t10-fp-detector-fixes`,
 still not merged; human review and merge decision are next.
+
+## 2026-07-25 - Milestone M1: masking-proxy transport + routing skeleton
+
+### Context
+
+`~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1) is the design; both its
+blocking spikes closed 2026-07-24 in the `~/hekton` factory repo, unblocking M1. `docs/next-actions.md`
+already carried the masking proxy as item **#1 — nothing above it**. This session built the
+plan's own §10.3 milestone 1: transport + routing skeleton, no real upstream, no real
+credentials.
+
+### Decision
+
+Built `crates/vg-proxy` to the letter of §10.2/§10.3's M1 scope, and no further, with two
+judgment calls the plan doesn't spell out explicitly:
+
+1. **Module surface kept to exactly `route.rs` + `server.rs` + `error.rs`.** §10.2's full
+   module list (`config.rs`, `daemon.rs`, `session.rs`, `schema/`, `mask_request.rs`, ...) is
+   the crate's *eventual* shape across all milestones, not M1's. Stubbing those modules now
+   with empty bodies would add surface area with no behavior to test against — deferred to the
+   milestones that actually need them (M2 for `daemon.rs`/`session.rs`, M3 for `schema/` +
+   `mask_request.rs`).
+2. **`RouteVerdict` stays three-valued (`Mask`/`Pass`/`Block`) even though M1's own HTTP
+   behavior only distinguishes two outcomes (matched vs. rejected).** The plan's route table
+   in §5 step 2 is explicitly three-way, and M3 needs the `Mask`/`Pass` distinction to decide
+   whether to run `vg_core::mask` at all — collapsing it to a boolean now would just require
+   re-splitting it in M3 for no M1-scoped benefit.
+
+Route table transcribed verbatim from §5 step 2 / §8.7, including the two scope corrections
+the plan's v3.1 doubt pass made: "The Batch API" removed (never in Claude Code's real gateway
+contract) and Bedrock Converse excluded (Claude Code never calls it) — both now enforced as
+`Block`, not silently omitted.
+
+### Consequences
+
+- M1 is complete and independently testable per the plan's own milestone-granularity intent
+  (§10.3: "scoped to be startable and finishable without the ones after it existing"). M2
+  (daemon core) can start without anything in M1 changing.
+- Zero egress risk by construction: `cargo tree -p vg-proxy` has no HTTP client dependency at
+  all in this milestone, only a server. This is a stronger property than "the code doesn't
+  currently call out" — there is nothing in the dependency graph capable of it yet.
+- Branch `agent/claude/vg-proxy-m1-transport-routing` left open for human review before merge,
+  per the git contract's "close branches deliberately" rule — not merged this session.

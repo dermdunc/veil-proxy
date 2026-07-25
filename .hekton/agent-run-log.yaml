@@ -620,3 +620,33 @@ agent_runs:
       - "The NO-GO is a product truth, not a harness bug: detector FP rates and placeholder consistency fail their gates; display-collision corruption confirmed. T11 owns the decisions (detector thresholds, collision-avoiding minting, by_language fix-or-drop)."
     next_actions:
       - "Fable doubt round on the T10 diff, Codex cross-model offer, tollgate, land; T11 is the final gate."
+  - id: RUN-0020
+    date: 2026-07-25
+    agent: "claude (interactive session)"
+    role: "Build Agent"
+    intent: "Milestone M1 of the masking-proxy plan (~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md, v3.1): new crates/vg-proxy — plain-HTTP hyper loopback server + deny-by-default route classifier (§10.3 item 1). No upstream client, no credentials, no masking logic; zero egress risk by construction. Verified against the workspace test suite plus a manual curl smoke test of all three route verdicts against a live instance."
+    autonomy_level: 3
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    files_touched:
+      - "Cargo.toml"
+      - "crates/vg-proxy/Cargo.toml"
+      - "crates/vg-proxy/src/{lib,route,server,error}.rs"
+      - "crates/vg-proxy/tests/route_classification.rs"
+      - "docs/session-log.md"
+      - "docs/decisions.md"
+      - "docs/next-actions.md"
+      - "docs/build-log/2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md"
+      - "docs/build-log/README.md"
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+      - "docs/build-log/2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md"
+    validation:
+      - "cargo test --workspace: PASS, no regressions; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; manual curl verification of mask/pass/block responses against a live instance"
+    risks:
+      - "None new — M1 has no upstream client in its dependency graph at all (confirmed via cargo tree), so egress is impossible by construction, not merely policy-denied."
+    next_actions:
+      - "M2 (daemon core: Vault opened once, H2 session-namespace shim, session store as a bare data structure) per plan §10.3. Branch agent/claude/vg-proxy-m1-transport-routing left open for human review, not merged."

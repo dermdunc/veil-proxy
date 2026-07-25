@@ -1219,3 +1219,78 @@ clean. `vg bench`: GO, FP rate 0.0%, unchanged.
 
 ### Mind-palace updated
 - No (vault mutation not authorised).
+
+## Session: M1 — masking-proxy transport + routing skeleton
+
+**Date:** 2026-07-25
+
+First real code toward `docs/next-actions.md`'s "Now" item #1 (the local masking proxy +
+daemon), following `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1,
+doubt-pass reconciled, both blocking spikes closed 2026-07-24 in the `~/hekton` factory repo —
+that plan and its spikes are tracked there, not here; this session is the plan's first
+implementation milestone landing in this repo). Started on `main` with a clean working tree;
+created `agent/claude/vg-proxy-m1-transport-routing` per the git contract before touching
+anything.
+
+Built milestone M1 exactly as scoped in the plan's §10.3 item 1: **transport + routing
+skeleton, no real upstream, no real credentials.** New `crates/vg-proxy` (sibling of
+`vg-adapters-claude`, registered in the workspace root `Cargo.toml`): a plain-HTTP `hyper`
+loopback server (`server.rs`, `tokio` + `hyper` 1.x + `http-body-util` + `hyper-util`, no TLS
+layer at all) in front of `route.rs`'s deny-by-default classifier, matching the plan's §5
+step 2 / §8.7 route table verbatim — MASK: `POST /v1/messages`, `POST
+/v1/messages/count_tokens`, `POST /model/{model}/invoke[-with-response-stream]`; PASS: `HEAD
+/`, `HEAD /api/hello`, `GET /inference-profiles`, `GET /v1/models`; everything else BLOCKs,
+including the routes the plan explicitly named as removed (`/v1/messages/batches` — "the
+Batch API," never in Claude Code's real gateway contract — and Bedrock Converse, which Claude
+Code never calls). Matching is on path only, query string discarded first, per the plan's
+`/v1/messages?beta=true` example. There is no upstream client anywhere in this crate yet — a
+matched route gets a fixed test-double response, an unmatched one gets `403`, so egress is
+impossible by construction rather than merely policy-denied, exactly the property M1 is
+supposed to establish before any credential- or forwarding-bearing milestone builds on it.
+
+Verified end-to-end, not just unit-tested: ran the server standalone (a throwaway
+`examples/smoke_server.rs`, deleted afterward — not part of the milestone's scope) and hit it
+with real HTTP requests over `curl` for all three verdicts — `POST /v1/messages?beta=true`
+(mask, query stripped correctly), `HEAD /` (pass — via `curl -I`; `curl -X HEAD` without
+`--head` hangs waiting for a body HTTP correctly omits for HEAD responses, a curl gotcha, not
+a server bug), `POST /model/.../invoke-with-response-stream` (mask), and two block cases
+(`GET /unknown`, `POST /model/.../converse`). All four behaved as designed.
+
+### Changed / created files
+- `Cargo.toml` (workspace root) — added `crates/vg-proxy` to `members` and
+  `workspace.dependencies`.
+- `crates/vg-proxy/Cargo.toml` — new crate: `tokio`, `hyper` 1.x, `http-body-util`,
+  `hyper-util`, `thiserror`.
+- `crates/vg-proxy/src/lib.rs`, `route.rs`, `server.rs`, `error.rs` — new.
+- `crates/vg-proxy/tests/route_classification.rs` — new, table-driven per plan §10.2.
+
+### Decisions
+- See `docs/decisions.md` (2026-07-25 entry) for the two judgment calls made without an
+  explicit plan citation: keeping M1's module surface to exactly `route.rs` + `server.rs` +
+  `error.rs` (deferring `config.rs`/`daemon.rs`/`session.rs`/`schema/` to M2+ rather than
+  stubbing them now), and modeling `Mask`/`Pass` as one HTTP-visible behavior in M1 while
+  keeping the enum three-valued for M3's sake.
+
+### Validation
+`cargo test --workspace`: all green (M1 adds 1 new integration test; no regressions in the
+other 8 crates). `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo fmt
+--check`: clean (after `cargo fmt` auto-wrapped two test-table rows the initial write had
+under the line-length limit). Manual `curl` verification against a live instance, see above.
+
+### Assumptions
+- `hyper` 1.x + `hyper-util`'s `TokioIo`/HTTP1-server pattern (not `hudsucker`, matching the
+  plan's §3.1 call) is the right foundation to carry into M2's daemon core and, later, M6's
+  streaming work — not reconfirmed independently this session, taken from the plan as given.
+
+### Risks
+- None new. M1 is deliberately zero-egress-risk by construction (no upstream client exists in
+  this crate yet); nothing here touches the vault, credentials, or real Claude Code traffic.
+
+### Next actions
+- M2 (daemon core: `Vault::open_with_key` opened once, per-session namespace shim, session
+  store as a bare data structure) is next per the plan's §10.3 build order. Branch left open,
+  not merged — human review and merge decision are next, per the git contract's "close
+  branches deliberately" rule.
+
+### Mind-palace updated
+- No (vault mutation not authorised).
