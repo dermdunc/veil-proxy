@@ -430,3 +430,19 @@ changes:
     links:
       - "docs/decisions.md"
       - "docs/session-log.md"
+  - id: CHG-0024
+    date: 2026-07-25
+    title: "Milestone M2: daemon core (Daemon, H2 session-namespace shim), 2 doubt-pass rounds"
+    intent: "New crates/vg-proxy/src/{daemon,session}.rs per plan §10.3 milestone 2: Daemon opens vg-vault once; H2 session-namespace shim resolves the X-VG-Namespace header or a registered loopback address (registration, not stateless derivation, since a reused port would otherwise silently resolve to a prior session's namespace); session-scoped accumulated binding store (H1's fix) as a data structure. Tested in isolation, not wired into the HTTP server yet. Two doubt-pass rounds (single-model + Codex cross-model) found and fixed 12 real issues, the most severe a cross-session correctness bug in round 1's own new unregister_port (fixed via compare-and-remove, directly regression-tested)."
+    changed_by: "claude (interactive session) + codex (cross-model doubt pass)"
+    change_type: build
+    risk_level: medium
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 13 tests in vg-proxy/tests/daemon.rs; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS; cargo tree -p vg-proxy -e normal: confirmed no HTTP client dependency"
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"

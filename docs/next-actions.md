@@ -16,19 +16,29 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 
-- [x] **M1 — transport + routing skeleton (2026-07-25).** `crates/vg-proxy`: plain-HTTP `hyper`
-      loopback server + deny-by-default route classifier, no upstream client, no credentials.
-      See `docs/session-log.md`/`docs/decisions.md` (2026-07-25) and
-      `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.3. Branch
-      `agent/claude/vg-proxy-m1-transport-routing`, not yet merged — human review pending.
-- [ ] **Local masking proxy + daemon — M2 next.** Intercept the actual request to the model
+- [x] **M1 — transport + routing skeleton (2026-07-25, merged to main as 8da9561).**
+      `crates/vg-proxy`: plain-HTTP `hyper` loopback server + deny-by-default route classifier,
+      no upstream client, no credentials. Hardened by 3 doubt-driven-development rounds (11
+      real fixes) before merge. See `docs/session-log.md`/`docs/decisions.md` (2026-07-25) and
+      `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.3.
+- [x] **M2 — daemon core (2026-07-25).** `Daemon`: opens `Vault` once (`open`/`open_with_key`,
+      mirroring `Vault`'s own two-constructor pattern); H2 session-namespace shim (`session.rs`)
+      resolving the `X-VG-Namespace` header or a registered loopback address; the session-scoped
+      accumulated binding store (H1's fix) as a data structure, not yet fed real content. Tested
+      in isolation via direct calls — not yet wired into the HTTP server's request path (that's
+      M3+, once there's something schema-aware to route toward). Hardened by 2 doubt-driven-
+      development rounds (single-model + Codex cross-model, 12 real fixes, including a
+      cross-session mapping-deletion bug in round 1's own new `unregister_port` primitive). See
+      `docs/session-log.md`/`docs/decisions.md` (2026-07-25). Branch
+      `agent/claude/vg-proxy-m2-daemon-core`, not yet merged — human review pending.
+- [ ] **Local masking proxy + daemon — M3 next.** Intercept the actual request to the model
       endpoint, mask the entire assembled payload (prompt + context) via the vault, demask the
-      response — invisible to the user; a long-lived daemon holds the vault key once (removing
-      the keychain friction). This is what turns the proven mechanism into a product that
-      actually solves the governance/risk/privacy problem. The already-deferred "route masked
-      request to Bedrock" / LiteLLM-gateway warm path. **#1 — nothing above it.** Next up: M2
-      (daemon core — `Vault` opened once, H2 session-namespace shim, session store as a bare
-      data structure), per the plan's §10.3 build order.
+      response — invisible to the user. This is what turns the proven mechanism into a product
+      that actually solves the governance/risk/privacy problem. The already-deferred "route
+      masked request to Bedrock" / LiteLLM-gateway warm path. **#1 — nothing above it.** Next up:
+      M3 (request masking, Anthropic direct, non-streaming — `schema/anthropic.rs` +
+      `mask_request.rs` wired end-to-end against a mock upstream), per the plan's §10.3 build
+      order.
 - [ ] **Precision NO-GO — fix implemented, FOUR doubt-pass rounds run, STOP signal reached;
       PENDING HUMAN REVIEW, not merged.** Branch `agent/claude/t10-fp-detector-fixes`
       implements the targeted fix (`EntropyDetector` git-SHA-context exclusion,

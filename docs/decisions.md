@@ -22,6 +22,7 @@
 | 2026-07-17 | ADR-011 (T05) `vg-vault` = **SQLCipher via `rusqlite` (vendored OpenSSL), OS-keychain-wrapped DB key, per-install salt in an encrypted `meta` table; `Keyer` ordinal counters reseeded from persisted rows at open** | Encrypted-at-rest reversible mapping store; keychain wrap keeps the key off disk; reseed prevents display-ordinal collision/drift across process restarts. Added an additive `Keyer::seed_ordinal` to `vg-core` (not a frozen-contract change). See the 2026-07-17 T05 entry below. |
 | 2026-07-18 | ADR-012 (T07) **`vg-core::scan`/`mask` pipeline wired; contract bumped v1 → v1.1 (`mask` gains `ctx: &Context`)** | `mask` needs the same detectors/parsers `scan` runs but the frozen signature had no `Context`; the sanctioned contract-change fix is an explicit param, not smuggling detectors into `Policy` or pre-computing findings. Also fixed the pipeline order (artefact-Block short-circuit; `Pass` never skips detection; full-buffer detection with spans as enrichment; specific-over-generic overlap resolution; irreversible/entity-Block never interned; one Scan/Block audit event; vault owns demask attribution). See the 2026-07-18 T07 entry below. |
 | 2026-07-25 | New crate **`crates/vg-proxy`**, milestone M1 (transport + routing skeleton) | First implementation milestone of `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1); plain-HTTP `hyper` loopback server + deny-by-default route classifier, zero egress risk by construction (no upstream client exists yet). See the 2026-07-25 entry below. |
+| 2026-07-25 | Milestone M2 (daemon core) — `Daemon` opens `vg-vault` once, H2 session-namespace shim (`session.rs`), registration-not-derivation port fallback | Second implementation milestone of the masking-proxy plan; tested in isolation via direct calls, not yet wired into the HTTP server (M3+ has something schema-aware to route toward). See the 2026-07-25 entry below. |
 
 Full reasoning and the Mermaid-illustrated design are in [`spec/requirements-and-design-spec.md`](spec/requirements-and-design-spec.md).
 
@@ -2632,3 +2633,129 @@ guidance ("escalate to the user rather than grinding a 4th alone"), stopping her
 back rather than continuing solo. Findings trajectory across all three rounds: 6 → 3 → 2 real
 fixes, genuinely diminishing, with round 3's fixes being smaller in scope (a race condition and
 a test-hygiene gap) than round 2's (a security bypass). Reasonable stop point.
+
+## 2026-07-25 - Milestone M2: daemon core (`Daemon`, H2 session-namespace shim)
+
+### Context
+
+PR #38 (M1 + 3 doubt-pass rounds) merged to `main` as `8da9561`. Read plan §5 H2 (the
+session-namespace shim's human-locked design), §8.5 ("H1's fix," the accumulated binding store),
+and the actual `vg-core`/`vg-vault` APIs (`Namespace`, `SessionId`, `PlaceholderBinding`,
+`Vault::open`/`open_with_key`, `VaultStore::purge_expired`) before writing anything, per this
+repo's own operating rules. Started M2 (§10.3 milestone 2) on
+`agent/claude/vg-proxy-m2-daemon-core`.
+
+### Decision
+
+Built `Daemon` (`daemon.rs`) and `SessionShim` (`session.rs`) as a self-contained, directly
+testable pair, deliberately **not** wired into `server::handle` — the milestone's own "serves
+many sequential fake requests" framing, and the fact that M3 is explicitly where schema-aware
+parsing and real forwarding start, both point to isolated testing being the right scope rather
+than premature HTTP integration.
+
+Two judgment calls made and documented up front, not left implicit:
+
+1. **`Daemon::open`/`open_with_key` mirror `Vault`'s own two-constructor pattern exactly** —
+   same naming, same "keychain path is production, `_with_key` is the test/alternative-custodian
+   seam" split — rather than inventing a different shape, since `Daemon` is a thin owner of
+   exactly one `Vault`.
+2. **Port-fallback is registration, not derivation.** A stateless function deriving a
+   `Namespace` from a port number (e.g. a deterministic UUID hash) would have been simpler to
+   write, but would be *actively wrong*, not merely simplified: once the OS reassigns a port to
+   an unrelated later session, a stateless derivation silently resolves it to the same
+   `Namespace` the previous session used, defeating the isolation the shim exists to provide.
+   `SessionShim::register_port` requires an explicit call instead. The real caller that would
+   give registration true atomicity (a per-session-listener milestone) doesn't exist yet — this
+   is named as an open gap, not silently assumed away (see the doubt-pass findings below).
+
+### Doubt-driven-development, two rounds
+
+**Round 1 (single-model):** 7 findings.
+
+- **Fixed:** mutex-poisoning blast radius — `.lock().expect(...)` would have permanently
+  poison-panicked every subsequent call from every session for the process's remaining life if
+  any future change ever panicked while holding either lock. Every critical section here is a
+  single `HashMap` op with no half-applied invariant, so recovering a poisoned guard
+  (`unwrap_or_else(|p| p.into_inner())`) is safe.
+- **Fixed:** a dual-stack port-collision bug — registrations were keyed by bare `u16`, so a
+  daemon binding both `127.0.0.1` and `::1` on the same numeric port would have collided two
+  distinct sessions onto one map slot. Re-keyed by the full `SocketAddr`.
+- **Fixed:** `register_port`'s silent overwrite made observable — now returns the previously-
+  registered `Namespace`, if any.
+- **Fixed:** an unbounded, unvalidated header value echoed into `SessionError`'s `Display` —
+  capped at 256 chars, same reasoning as M1's `MAX_ECHOED_TARGET_LEN`.
+- **Fixed:** no concurrency test existed despite two `Mutex`es guarding shared state — added one
+  hammering `register_port`/`resolve`/`record_bindings`/`bindings_for` from 50 threads
+  concurrently.
+- **Documented, not fixed — the port-reuse handoff race.** Nothing ties "session B starts
+  listening on port P" to "`register_port(P, B)` has been called" atomically; the real caller
+  that would provide that doesn't exist yet. `unregister_port` was added as the primitive a
+  future caller needs to release a mapping the instant a session ends — the atomicity itself is
+  deferred to that milestone.
+- **Documented, not fixed — binding-store lifetime/eviction.** Already an explicitly open
+  plan-level question (`docs/next-actions.md`: "session-store lifetime/eviction... still
+  undecided," carried forward unresolved from v2) — not invented here, since a namespace token
+  being reused would otherwise transparently hand back a prior session's accumulated bindings
+  once demask is wired to this store (M4+), and the plan hasn't decided the policy yet.
+
+**Round 2 (Codex cross-model, `codex exec --sandbox read-only`):** 9 findings.
+
+- **Fixed (the most severe finding of either round) — a genuine cross-session correctness bug
+  in round 1's own new `unregister_port`.** Remove-by-address-alone meant session A's delayed or
+  stale cleanup call could delete session B's live mapping after B had already taken over the
+  address (a real sequencing bug, not a hypothetical: exactly the port-reuse scenario round 1's
+  own doc comment named as a known risk, now shown to have a second, sharper failure mode within
+  the primitive meant to help address it). Changed to compare-and-remove: `unregister_port` now
+  takes the `Namespace` the caller expects to be there and is a no-op if the current registration
+  doesn't match. Regression-tested directly (`unregister_port_is_compare_and_remove_not_remove_by_address_alone`):
+  A's stale cleanup naming A must not evict B; only a cleanup naming the *currently* registered
+  namespace removes it.
+- **Fixed — loopback enforcement missing at the registration boundary.** The same class of gap
+  M1's own doubt-pass closed for the listener bind itself (round 1/round 2 of M1's pass),
+  recurring here: `register_port` accepted any `SocketAddr`, including non-loopback. Now refuses
+  with a new `SessionError::NotLoopback`.
+- **Fixed — a false claim in the `lock()` helper's own doc comment.** It asserted every critical
+  section is a single, panic-free `HashMap` op, but `record_bindings`'s `.extend(bindings)` ran
+  caller-supplied iterator code *inside* the lock — an iterator that panics partway through would
+  have left a torn, partially-applied batch under a poisoned-then-silently-recovered lock,
+  contradicting the doc comment's own safety claim. Fixed by materializing `bindings` into a
+  `Vec` before acquiring the lock, so the critical section really is infallible now.
+- **Fixed — the nil UUID (`00000000-...-000000000000`) was accepted as a legitimate, distinct
+  namespace.** A common uninitialized/default sentinel; now rejected the same way a malformed
+  token is.
+- **Added — `register_port_if_absent`.** For a caller that wants "clobbering an existing mapping
+  is always suspicious" rather than "clobbering is fine, just tell me what I overwrote" (which
+  `register_port`'s `Option<Namespace>` return already provided). Idempotent re-registration of
+  the *same* namespace still succeeds; a *different* namespace trying to claim an already-claimed
+  address is rejected via a new `SessionConflict` error type.
+- **Classified as describing the plan's own already-locked design, not a gap — documented, not
+  changed (4 findings):** (1) the header always winning over a registered address with no
+  daemon-side validation against a "live session registry" — the plan states the token
+  explicitly as "a tenancy selector, not an authenticator," and assigns spoofing/collision
+  mitigation to the *injection* side (`vg-adapters-claude`'s `wrapper.rs`), not this shim's
+  resolution side; building a live-session registry here would contradict that trust model, not
+  fix a bug in it. (2) A real integration-time trap for whichever milestone wires a real
+  `hyper::HeaderMap` into `resolve`'s `Option<&str>` parameter (`HeaderValue::to_str()` returning
+  `Err` must map to `InvalidNamespaceHeader`, never silently to `None`) — nothing to fix in this
+  crate today since no header-extraction code exists yet; documented as a doc-comment invariant
+  for that future caller. (3) Same-display/different-`MappingRef` collisions in the binding
+  store — an invariant that belongs to `vg-core`/`vg-vault`'s stable-placeholder keying guarantee
+  (the same raw value always mints the same display within a namespace), not something this
+  session store should independently defend against; doing so risks masking a real upstream
+  keying bug rather than surfacing it.
+
+### Validation
+
+`cargo test --workspace`: all green, 13 tests in `vg-proxy/tests/daemon.rs`, no regressions
+elsewhere. `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo fmt --check`:
+clean. `scripts/verify-project.sh`: PASS. `cargo tree -p vg-proxy -e normal`: confirmed no HTTP
+client dependency anywhere in the graph — M2 remains zero-egress-risk by construction.
+
+### Stop condition
+
+Two cycles run (single-model, then Codex cross-model targeted at round 1's own new code). Per
+user decision: stopping here rather than running a third round targeted at round 2's own new
+code. The most severe finding class (cross-session correctness — the `unregister_port` bug) is
+closed and directly regression-tested; the remaining open items (port-reuse atomicity,
+binding-store eviction) are genuinely plan-level questions predating this session, not gaps this
+session introduced.

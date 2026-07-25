@@ -54,3 +54,4 @@ That can grow into a published site later if it earns one — see
 - [2026-07-17 — Parsers that refuse to panic](2026-07-17-parsers-that-refuse-to-panic.md)
 - [2026-07-18 — The seam that needed one more argument](2026-07-18-the-seam-that-needed-one-more-argument.md)
 - [2026-07-25 — A proxy with nowhere to send anything yet](2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md)
+- [2026-07-25 — The fix that broke what it was fixing](2026-07-25-the-fix-that-broke-what-it-was-fixing.md)

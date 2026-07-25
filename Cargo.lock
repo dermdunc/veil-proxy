@@ -1416,8 +1416,12 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
+ "vg-core",
+ "vg-vault",
 ]
 
 [[package]]

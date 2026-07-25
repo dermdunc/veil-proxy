@@ -1422,3 +1422,83 @@ covering all three rounds' fixes on top of the original M1 skeleton.
 
 ### Mind-palace updated
 - No (vault mutation not authorised).
+
+## Session: M1 merged; M2 — daemon core, hardened by 2 doubt-pass rounds
+
+**Date:** 2026-07-25
+
+PR #38 (M1 + 3 doubt-pass rounds) merged to `main` as `8da9561` on the user's explicit go-ahead
+("please emerge" — read as "please merge"); all CI checks green, PR clean/mergeable. Note: a
+follow-up plain read-only verification command in the same turn was blocked by Claude Code's own
+auto-mode safety classifier ("Merge Without Review" — this project's `CLAUDE.md` requires
+explicit human approval before merging a self-authored PR, and the classifier judged the user's
+instruction insufficiently explicit about waiving that review step). The merge itself had already
+completed successfully before the block; flagged to the user rather than worked around.
+
+Started M2 (daemon core, plan §10.3 milestone 2) on a fresh branch
+(`agent/claude/vg-proxy-m2-daemon-core`) off the updated `main`. Read the plan's §5 H2 design,
+§8.5 (accumulated binding store / H1's fix), and the actual `vg-core`/`vg-vault` APIs
+(`Namespace`, `SessionId`, `PlaceholderBinding`, `Vault::open`/`open_with_key`,
+`VaultStore::purge_expired`) before writing anything, per this repo's own operating rules.
+
+Built `Daemon` (`daemon.rs`) and the H2 session-namespace shim (`session.rs`), deliberately
+**not** wired into `server::handle` — M2 is tested in isolation via direct calls
+(`handle_fake_request`, matching the milestone's own "fake requests" framing), since nothing
+schema-aware exists yet to route toward (that's M3+). `Daemon::open`/`open_with_key` mirror
+`Vault`'s own two-constructor pattern exactly. The port-fallback path is **registration, not
+derivation** — a design call made and documented up front: deriving a `Namespace` deterministically
+from a port number would be actively wrong (a reused port would silently resolve to the previous
+session's namespace), so `SessionShim` requires an explicit `register_port` call, with the real
+per-session-listener caller that would provide registration atomicity left as documented future
+work (no milestone builds per-session listeners yet).
+
+Ran two doubt-driven-development rounds before finalizing — full disposition in
+`docs/decisions.md` (2026-07-25 entries):
+
+- **Round 1 (single-model):** 7 findings. Fixed: mutex-poisoning blast radius (`.expect()` →
+  recover-on-poison, since no critical section leaves a half-applied invariant), a dual-stack
+  port-collision bug (keyed registrations by full `SocketAddr`, not bare `u16`), silent-overwrite
+  observability (`register_port` returns the previous `Namespace`), an unbounded echoed-header
+  length, and added the missing concurrency test. Documented, not fixed: the port-reuse handoff
+  race (no real caller exists yet to provide atomicity — `unregister_port` added as the primitive
+  a future caller needs) and binding-store lifetime/eviction (already an explicitly open
+  plan-level question per `docs/next-actions.md`, not invented here).
+- **Round 2 (Codex cross-model):** 9 findings. Fixed: a genuine cross-session correctness bug in
+  round 1's own new `unregister_port` — remove-by-address-alone let a stale session's delayed
+  cleanup delete a *different*, newer session's live mapping after a port handoff; now
+  compare-and-remove, only releasing a mapping if the caller names the `Namespace` it expects to
+  be there. Also fixed: loopback enforcement missing at the registration boundary (the same class
+  of gap M1's own doubt-pass already closed for the listener bind, recurring here), a
+  `record_bindings` doc-comment that overclaimed lock-recovery safety (caller-supplied iterator
+  code was running *inside* the critical section — now materialized to a `Vec` before locking),
+  and the nil UUID being accepted as a legitimate namespace. Added
+  `register_port_if_absent` for a caller that wants conflicts rejected outright rather than
+  silently observed. Four findings classified as describing the plan's own already-locked design
+  (the header's non-authenticating trust model, spoofing mitigation living in `wrapper.rs` not
+  this shim, an integration-time trap for a future `HeaderMap`-extraction caller, and same-display
+  binding collisions being an upstream vault-keying guarantee) — documented, not changed.
+
+Stopped after 2 rounds per user decision — the most severe finding class (cross-session
+correctness) is closed and tested; remaining open items are genuinely plan-level questions, not
+gaps introduced this session.
+
+### Changed / created files
+- `crates/vg-proxy/src/daemon.rs`, `session.rs` — new.
+- `crates/vg-proxy/src/error.rs`, `lib.rs` — updated for the new modules/error variants.
+- `crates/vg-proxy/tests/daemon.rs` — new, 13 tests.
+- `crates/vg-proxy/Cargo.toml` — `vg-core`, `vg-vault`, `uuid` (prod); `uuid` v4, `tempfile` (dev).
+- `docs/decisions.md`, `docs/next-actions.md` — updated.
+
+### Validation
+`cargo test --workspace`: all green, 13 tests in `vg-proxy/tests/daemon.rs`, no regressions
+elsewhere. `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo fmt --check`:
+clean. `scripts/verify-project.sh`: PASS. `cargo tree -p vg-proxy -e normal`: confirmed no HTTP
+client dependency anywhere in the graph — M2 remains zero-egress-risk by construction, same as M1.
+
+### Next actions
+M3 (request masking, Anthropic direct, non-streaming) per plan §10.3 — the first milestone that
+actually wires schema-aware parsing and real `vg_core::mask` calls into the HTTP request path.
+Branch left open, not merged — human review and merge decision are next.
+
+### Mind-palace updated
+- No (vault mutation not authorised).

@@ -727,3 +727,32 @@ agent_runs:
       - "None new. Findings trajectory across 3 rounds (6 -> 3 -> 2 real fixes) is diminishing; stopping per the doubt-driven-development skill's own guidance rather than running a 4th round solo."
     next_actions:
       - "PR #38 ready for human review, covering the original M1 skeleton plus all 3 doubt-pass rounds. M2 (daemon core) next per plan §10.3 once reviewed."
+  - id: RUN-0024
+    date: 2026-07-25
+    agent: "claude (interactive session) + codex (cross-model doubt pass)"
+    role: "Build Agent"
+    intent: "PR #38 merged to main as 8da9561 on user's explicit go-ahead ('please emerge' read as merge). Milestone M2 (daemon core, plan §10.3): new crates/vg-proxy/src/{daemon,session}.rs — Daemon opens vg-vault once (open/open_with_key mirroring Vault's own constructors), H2 session-namespace shim resolving X-VG-Namespace header or a registered loopback address (registration, not derivation — a stateless port-to-namespace derivation would be actively wrong across port reuse), session-scoped accumulated binding store (H1's fix) as a data structure. Tested in isolation via direct calls, not wired into server::handle yet (M3+). Two doubt-pass rounds (single-model 7 findings, Codex cross-model 9 findings) found and fixed 12 real issues, most severe a cross-session correctness bug in round 1's own new unregister_port (remove-by-address-alone let a stale cleanup delete a different session's live mapping after a port handoff) — fixed via compare-and-remove, directly regression-tested."
+    autonomy_level: 3
+    approvals:
+      required: true
+      status: pending
+      approver: dermdunc
+    files_touched:
+      - "crates/vg-proxy/src/daemon.rs"
+      - "crates/vg-proxy/src/session.rs"
+      - "crates/vg-proxy/src/error.rs"
+      - "crates/vg-proxy/src/lib.rs"
+      - "crates/vg-proxy/tests/daemon.rs"
+      - "crates/vg-proxy/Cargo.toml"
+      - "docs/session-log.md"
+      - "docs/decisions.md"
+      - "docs/next-actions.md"
+    links:
+      - "docs/decisions.md"
+      - "docs/session-log.md"
+    validation:
+      - "cargo test --workspace: PASS, no regressions, 13 tests in vg-proxy/tests/daemon.rs; cargo clippy --workspace --all-targets -- -D warnings: clean; cargo fmt --check: clean; scripts/verify-project.sh: PASS; cargo tree -p vg-proxy -e normal: confirmed no HTTP client dependency"
+    risks:
+      - "Two open items left as documented, not fixed: the port-reuse handoff race (no real per-session-listener caller exists yet to provide registration atomicity; unregister_port/register_port_if_absent are the primitives provided) and binding-store lifetime/eviction (already an explicitly open plan-level question per docs/next-actions.md, predating this session)."
+    next_actions:
+      - "M3 (request masking, Anthropic direct, non-streaming) per plan §10.3 — first milestone wiring schema-aware parsing and real vg_core::mask calls into the HTTP request path. Branch agent/claude/vg-proxy-m2-daemon-core left open for human review, not merged."
