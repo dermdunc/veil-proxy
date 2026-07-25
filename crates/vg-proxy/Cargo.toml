@@ -1,0 +1,20 @@
+[package]
+name = "vg-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Local masking-proxy daemon front door (vg-daemon/vg-proxy): a plain-HTTP loopback server Claude Code is pointed at via ANTHROPIC_BASE_URL, masking the assembled request/response instead of a per-invocation hook. M1: transport + routing skeleton only — no real upstream, no real credentials."
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util", "sync"] }

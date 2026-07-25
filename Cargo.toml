@@ -10,6 +10,7 @@ members = [
     "crates/vg-cli",
     "crates/vg-adapters-claude",
     "crates/vg-bench",
+    "crates/vg-proxy",
 ]
 
 [workspace.package]
@@ -35,3 +36,4 @@ vg-policy = { path = "crates/vg-policy", version = "0.1.0" }
 vg-audit = { path = "crates/vg-audit", version = "0.1.0" }
 vg-adapters-claude = { path = "crates/vg-adapters-claude", version = "0.1.0" }
 vg-bench = { path = "crates/vg-bench", version = "0.1.0" }
+vg-proxy = { path = "crates/vg-proxy", version = "0.1.0" }

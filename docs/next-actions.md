@@ -16,12 +16,19 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 
-- [ ] **Local masking proxy + daemon.** Intercept the actual request to the model endpoint,
-      mask the entire assembled payload (prompt + context) via the vault, demask the response —
-      invisible to the user; a long-lived daemon holds the vault key once (removing the keychain
-      friction). This is what turns the proven mechanism into a product that actually solves the
-      governance/risk/privacy problem. The already-deferred "route masked request to Bedrock" /
-      LiteLLM-gateway warm path. **#1 — nothing above it.**
+- [x] **M1 — transport + routing skeleton (2026-07-25).** `crates/vg-proxy`: plain-HTTP `hyper`
+      loopback server + deny-by-default route classifier, no upstream client, no credentials.
+      See `docs/session-log.md`/`docs/decisions.md` (2026-07-25) and
+      `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.3. Branch
+      `agent/claude/vg-proxy-m1-transport-routing`, not yet merged — human review pending.
+- [ ] **Local masking proxy + daemon — M2 next.** Intercept the actual request to the model
+      endpoint, mask the entire assembled payload (prompt + context) via the vault, demask the
+      response — invisible to the user; a long-lived daemon holds the vault key once (removing
+      the keychain friction). This is what turns the proven mechanism into a product that
+      actually solves the governance/risk/privacy problem. The already-deferred "route masked
+      request to Bedrock" / LiteLLM-gateway warm path. **#1 — nothing above it.** Next up: M2
+      (daemon core — `Vault` opened once, H2 session-namespace shim, session store as a bare
+      data structure), per the plan's §10.3 build order.
 - [ ] **Precision NO-GO — fix implemented, FOUR doubt-pass rounds run, STOP signal reached;
       PENDING HUMAN REVIEW, not merged.** Branch `agent/claude/t10-fp-detector-fixes`
       implements the targeted fix (`EntropyDetector` git-SHA-context exclusion,
