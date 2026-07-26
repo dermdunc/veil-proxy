@@ -96,3 +96,12 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 - [ ] M3: request masking
 - [ ] Anthropic direct
 - [ ] non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)
+
+## Session Update: 2026-07-26 — product-family architecture design (proposal only, not ratified)
+
+- [ ] Human review and ratify/amend/reject `docs/architecture/product-family.md` (VeilGremlin
+      family taxonomy, `veil-observatory`, `veil-dashboard`, `veil-walled-garden`) and the
+      corresponding PROPOSED decision entries in `docs/decisions.md` (2026-07-26). No renames or
+      structural changes have been made — this is design-only, pending ratification before any
+      of its §7 sequencing work begins. M3 (request masking) above remains the actual priority
+      regardless of this proposal's outcome.

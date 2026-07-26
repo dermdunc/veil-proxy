@@ -2759,3 +2759,110 @@ code. The most severe finding class (cross-session correctness — the `unregist
 closed and directly regression-tested; the remaining open items (port-reuse atomicity,
 binding-store eviction) are genuinely plan-level questions predating this session, not gaps this
 session introduced.
+
+## 2026-07-26 — PROPOSED, not yet ratified: VeilGremlin product-family architecture
+
+**Context:** greenfield product/portfolio design requested for a taxonomy where "VeilGremlin"
+becomes an umbrella family name spanning this repo (proposed external identity: `veil-proxy`),
+a new telemetry/audit component (`veil-observatory`), a dashboard serving CSOC and Legal/Privacy
+audiences, and a new Terraform project constraining Amazon Bedrock as an LLM invocation control
+plane (`veil-walled-garden`). Full design in
+[`docs/architecture/product-family.md`](architecture/product-family.md). **Design only — no
+rename, no crate/Cargo.toml/source change was made or is proposed to happen automatically; this
+entry and that document are proposals requiring separate human ratification before any of the
+naming or repo-structure recommendations below are acted on.**
+
+**Proposed, not ratified:**
+
+- **PROPOSED ADR-013** — VeilGremlin becomes the family/umbrella brand; this repo's crates
+  (`vg-*`), binary (`vg`), and Hekton project registration (`project_name: veilgremlin`) stay
+  **permanently unchanged** — no rename now or later, matching the `git`/`gh`/`rg` short-binary-
+  name pattern. Only the GitHub repo's external description/positioning would eventually
+  reference "veil-proxy," and only once a second family repo exists to disambiguate from — not
+  now. Rationale: the ambiguity is a documentation/positioning problem, not a source-naming one;
+  a mechanical rename mid-flight of two unmerged branches (`agent/claude/t10-fp-detector-fixes`,
+  `agent/claude/vg-proxy-m2-daemon-core`) would cost real merge friction for zero functional
+  gain.
+- **PROPOSED ADR-014** — Three repos for the family: this repo (`veil-proxy`, unchanged),
+  `veil-observatory` (ingestion + event store + retention tiers + the dashboard as an app within
+  it, not a fourth repo), `veil-walled-garden` (Terraform only, fully independent lifecycle).
+  Rationale: the dashboard has no independent data model from `veil-observatory`'s event store;
+  `veil-walled-garden` is a genuinely different artifact type (infra-as-code) with no code-level
+  dependency on the other two.
+- **PROPOSED ADR-015** — The claim "PII never leaves the machine" / "invisible governance"
+  (as worded in the 2026-07-19 T11 sign-off entry, above) is retired in favour of a precise,
+  weaker, true claim once `veil-observatory` exists: reversal material (vault, key, raw values)
+  never leaves the laptop, unconditionally; masked telemetry (counts/refs/decisions, never a
+  human-readable value) may leave, only opt-in, only via a new `TelemetryEvent` type that is
+  type-level incapable of holding a raw value (stronger than `MaskedPack`'s current
+  tested-not-type-enforced invariant, per `interface-contracts.md` §1). Full wording proposal in
+  `docs/architecture/product-family.md` §3.5.
+- **PROPOSED, sequencing note** — real actor/device authentication (today's `--actor`/`--role`
+  are explicitly self-asserted attribution, not authentication — see `docs/next-actions.md`'s F4
+  item) is recommended to land *before* `veil-observatory` ships anything, not after, since fleet
+  policy distribution, dashboard RBAC, and evidence-pack chain-of-custody all inherit its
+  weakness otherwise if built first.
+
+**Explicitly not resolved by this proposal, named as an honest open problem:** DSAR / right-to-
+erasure against a fleet of reversible per-laptop vaults has no engineering answer here — recorded
+as a candidate non-goal, not a solved gap. See product-family.md §8.7 (section renumbered in the
+2026-07-26 revision below; content unchanged).
+
+**Next step:** human review of `docs/architecture/product-family.md` in full; ratify, amend, or
+reject each proposed item above before any of §9's sequencing work begins.
+
+## 2026-07-26 (same day, second pass) — product-family.md updated: two open questions answered, one new design direction developed
+
+**Context:** direct continuation of the proposal above. The human answered two of the document's
+open questions and set a new design direction; `docs/architecture/product-family.md` was updated
+in place (still PROPOSED, not ratified) rather than left inconsistent with the answers. No
+renames, source changes, or `session-log.md` edits were made — design-doc and this decisions.md
+entry only.
+
+**Resolved — dashboard build order (was open question Q4).** Legal/Risk/Privacy view ships
+first; CSOC gets alerting (not the full investigation surface) from day one. Reworked §4
+(personas) and §9 (sequencing, renumbered from §7) to specify what "alerting from day one"
+actually requires beyond a Legal/Risk-only data model: a local, on-device alert-rule evaluator in
+`veil-proxy`; a second, deliberately minimal, immediate/unbatched delivery lane distinct from the
+batched bulk-telemetry lane (resolving an explicit tension with the earlier batched-push
+recommendation — both lanes now coexist rather than one lane serving two incompatible latency
+needs); and routing into the customer's existing on-call tooling rather than a bespoke pager.
+The persona conflict (CSOC wants speed/detail, Legal/Risk wants minimisation/short retention) is
+resolved by making the alert-lane payload *more* minimised than bulk telemetry, not less — CSOC
+gets speed on day one, not additional scope or retention; the full investigation surface remains
+deferred until the alerting lane has generated real demand for it.
+
+**Direction set, not fully resolved — device identity (was open question Q7).** The human
+proposed keying `veil-observatory` on the device rather than the user, with the device→user
+mapping held separately. Developed into a new dedicated §6 (moved out of the gaps list, which
+previously squeezed it into a single gap item): an opaque device pseudonym minted at enrolment
+(explicitly never the OS hostname, which is itself enterprise-sensitivity-class data under this
+project's own taxonomy — the premise that "device name is already sent in logs today" describes
+the leak to fix, not a baseline to keep), a mapping held by a separate custodian, and resolution
+back to a real identity treated as an explicit, authorised, audited act — architecturally the
+same discipline `veil-proxy`'s vault/`rehydrate` already applies to data, deliberately *not*
+literally reusing that code (the vault is laptop-local/single-tenant by design; the mapping
+custodian must be centrally queryable — reusing the API would break one or the other). Named
+explicitly as pseudonymisation, not anonymisation, matching the spec's existing GDPR caveat.
+**Still open:** the cryptographic mechanism that backs "this device really is device X" — mTLS
+certificate, TPM/hardware attestation, or SSO/IdP exchange — which §6 assumes gets answered but
+does not answer itself.
+
+**New: AWS-native dashboard options evaluated (new §7).** Given `veil-walled-garden` already
+assumes AWS, evaluated QuickSight/Athena/Lake Formation/OpenSearch/Security Lake as a dashboard
+implementation. Finding: Lake Formation's row/column-level access control genuinely maps onto the
+Legal/Risk-vs-CSOC split (§4, §6), with one real gap — it governs *who can query which data*, not
+the device-pseudonym-to-identity *resolution* step, which needs its own service with its own
+audit trail rather than being conflated with an IAM/Lake Formation grant. Named the honest
+downsides (QuickSight per-reader cost at fleet scale, Athena's latency being wrong for the alert
+lane, Lake Formation's operational weight) and the biggest one: committing to AWS-native services
+contradicts the VPC-portable posture recommended for `veil-observatory` generally. Recommendation:
+commit to a portable **data model** (Parquet/Iceberg, optionally OCSF-normalised), not a portable
+implementation — AWS-native becomes one deployment target among others, not the only one.
+
+**Mechanical result:** §§6 and 7 are new; the former §6 (gaps) is now §8, former §7 (sequencing)
+is now §9, former §8 (open questions) is now §10, with Q4 marked resolved, Q7 marked partially
+resolved, and three new open questions added (mapping-custodian ownership; independent opt-in
+for the alert lane vs. bulk lane; AWS-native vs. portable `veil-observatory` implementation).
+Cross-references throughout the document were updated to match. Still fully proposed, not
+ratified — same next step as above.
