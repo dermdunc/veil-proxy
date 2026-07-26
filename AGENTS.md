@@ -1,10 +1,11 @@
-# AGENTS.md — VeilGremlin
+# AGENTS.md — Veil Proxy (VeilGremlin family)
 
 ## Project Classification
 
 - **Type:** factory-output
+- **Product family:** VeilGremlin — this repo is the masking data plane
 - **Local repo:** <repo>
-- **Vault:** <vault>/20-projects/factory-output/veilgremlin
+- **Vault:** <vault>/20-projects/factory-output/veil-proxy
 - **Vault mutation allowed:** false
 - **Owner:** dermdunc
 

@@ -1,4 +1,4 @@
-# VeilGremlin build DAG — the machine source of truth for the task-DAG
+# Veil Proxy build DAG — the machine source of truth for the task-DAG
 # orchestrator (agentic-control-tower's `dag` commands). Transcribed once from
 # docs/architecture/work-breakdown.md's table + compact DAG diagram; edit
 # THIS file if the plan changes, not the markdown (which stays the

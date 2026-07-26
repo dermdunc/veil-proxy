@@ -1,12 +1,13 @@
-# CLAUDE.md — VeilGremlin
+# CLAUDE.md — Veil Proxy (VeilGremlin family)
 
 ## Project Classification
 
 - **Type:** factory-output
-- **Name:** veilgremlin
-- **Title:** VeilGremlin
+- **Name:** veil-proxy
+- **Title:** Veil Proxy
+- **Product family:** VeilGremlin — this repo is the masking data plane
 - **Local repo:** <repo>
-- **Vault control plane:** <vault>/20-projects/factory-output/veilgremlin
+- **Vault control plane:** <vault>/20-projects/factory-output/veil-proxy
 - **Lifecycle stage:** active
 - **Promotion target:** none
 - **Privacy boundary:** public

@@ -2,7 +2,7 @@
 //! already merged) through this task's keying logic end to end.
 //!
 //! Added per the 2026-07-16 cross-crate integration requirement recorded in
-//! `docs/architecture/work-breakdown.md` and `.hekton/veilgremlin-dag.toml`'s T04 entry:
+//! `docs/architecture/work-breakdown.md` and `.hekton/veil-proxy-dag.toml`'s T04 entry:
 //! testing keying only against hand-built mock values would mean the first time it ever sees
 //! a real `Finding` is Task T07's full pipeline wiring, several tasks later. This is a
 //! dev-dependency-only edge (`vg-core`'s `[dev-dependencies]` on `vg-detectors`) — it does not
