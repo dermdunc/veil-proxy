@@ -1,22 +1,24 @@
-# VeilGremlin
+# Veil Proxy
 
-**Local-first privacy layer for AI coding agents.** VeilGremlin keeps real PII and sensitive enterprise identifiers out of an AI coding agent's cloud context. It masks automatically on your laptop in milliseconds and reverses only locally, explicitly, and auditably, so the cloud model works against placeholders instead of real values.
+**The masking data plane of [VeilGremlin](#the-veilgremlin-product-family).** Veil Proxy keeps real PII and sensitive enterprise identifiers out of an AI coding agent's cloud context. It masks automatically on your laptop in milliseconds and reverses only locally, explicitly, and auditably, so the cloud model works against placeholders instead of real values.
 
 > **Invisible governance for AI coding agents. The cloud model sees placeholders, not the values behind them.**
 
 **Classification:** factory-output (Hekton) · **Owner:** dermdunc · **Status:** built through T10, contract v1.4, 221 passing tests · eval verdict: **honest NO-GO on precision** (false-positive rate 16.7%), remediation in progress before T11 sign-off.
 
+> **Naming:** this repo was called `veilgremlin` until 2026-07-26. VeilGremlin is now the name of the **end-to-end product family**, and this repo is `veil-proxy`, the component that does the masking. The product's runtime identity is deliberately unchanged — the state directory is still `.veilgremlin/`, the macOS keychain service is still `com.veilgremlin.vault`, and the CLI is still `vg`. Those name the product, not the repo, so existing installs and vaults keep working.
+
 ## The problem
 
 Agentic coding tools (Claude Code, Codex, Cursor, Cline) pull in far more than a prompt: files, diffs, terminal output, logs, tickets, MCP resources. Any of it can carry real customer or employee data. Guardrails and DLP scanners inspect data *after* the provider already holds it. VeilGremlin changes *what leaves the laptop in the first place*, which is what privacy and risk teams actually care about.
 
-## What VeilGremlin is
+## What Veil Proxy is
 
-VeilGremlin is **not** another guardrail or DLP scanner. It is a file-aware, **reversible-pseudonymisation** layer that sits on the local hot path of a coding-agent turn and keeps the reversal material on your laptop.
+Veil Proxy is **not** another guardrail or DLP scanner. It is a file-aware, **reversible-pseudonymisation** layer that sits on the local hot path of a coding-agent turn and keeps the reversal material on your laptop.
 
-**The one hard rule (as designed):** *unless the model is local and explicitly approved, VeilGremlin does not hand it real PII or sensitive enterprise identifiers that its detectors have caught.*
+**The one hard rule (as designed):** *unless the model is local and explicitly approved, Veil Proxy does not hand it real PII or sensitive enterprise identifiers that its detectors have caught.*
 
-That rule is scoped to what the detectors catch, and that is the honest boundary. Detection is deterministic and measured, not perfect: low-entropy or prose-style passwords, structured licence keys, and dotenv-shaped content with no filename hint can currently pass through undetected, and the T10 eval returned a **NO-GO** on precision (see [Status](#status)). Treat VeilGremlin as a strong data-minimisation control, not an absolute guarantee that no real value can ever reach the model.
+That rule is scoped to what the detectors catch, and that is the honest boundary. Detection is deterministic and measured, not perfect: low-entropy or prose-style passwords, structured licence keys, and dotenv-shaped content with no filename hint can currently pass through undetected, and the T10 eval returned a **NO-GO** on precision (see [Status](#status)). Treat Veil Proxy as a strong data-minimisation control, not an absolute guarantee that no real value can ever reach the model.
 
 > **Positioning:** a technical and governance control **supporting** data minimisation, privacy by design, auditability, and risk-based adoption. Not a GDPR or EU AI Act "compliance" guarantee.
 
@@ -47,6 +49,21 @@ Built through task T10; interface contract at v1.4; 221 tests passing.
 VeilGremlin runs its own Go/No-Go eval harness (`vg bench`) over a synthetic seeded corpus, and the current verdict is an honest **NO-GO on false-positive rate: 16.7%** against a `<3%` gate (entropy 13.3%, phone 40%), plus a display-collision corruption found in 1 of 3 mask→demask round-trips. Passing gates in the same run: zero raw PII leaked (11/11), secret recall 5/5, PII recall 15/15, placeholder consistency 10/10, and cold-hook end-to-end p95 of 17.0 ms under the 50 ms budget.
 
 We publish that failing number on purpose. A privacy tool that measures itself against a bar and tells you it has not cleared it yet is a privacy tool you can check. The green harness reporting red product numbers is the tool working. **Next:** close the precision NO-GO (entropy and phone false positives, and collision-avoiding minting) ahead of T11 review and sign-off.
+
+## The VeilGremlin product family
+
+VeilGremlin is the end-to-end product. This repo is one component of it.
+
+| Component | What it is | Status |
+|---|---|---|
+| **veil-proxy** (this repo) | The masking data plane: on-laptop parse → detect → vault → policy → masked pack, plus the agent adapters and the `vg` CLI | Built through T10 / M2 |
+| **veil-observatory** | Telemetry, audit and evidence plane — what a fleet of proxies reports centrally, and what it provably never reports | In design |
+| **Dashboard** | Sits on proxy + observatory. Two audiences: CSOC for near-real-time usage monitoring, and legal/risk/privacy for after-the-fact audit and evidence | In design |
+| **veil-walled-garden** | Terraform for Amazon Bedrock as an LLM invocation control plane — which models can be invoked, by whom, under what guardrails and logging | In design |
+
+The proxy minimises what leaves the laptop; the walled garden constrains what can be invoked at all. They are intended as defence in depth, not alternatives.
+
+See [Product family architecture](docs/architecture/product-family.md) for component boundaries, trust boundaries, and the open questions — including how a central observatory is reconciled with this repo's local-first promise.
 
 ## Documentation
 

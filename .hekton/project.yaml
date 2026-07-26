@@ -1,15 +1,24 @@
-project_name: veilgremlin
-project_title: "VeilGremlin"
+project_name: veil-proxy
+project_title: "Veil Proxy"
+# Product family: VeilGremlin is the end-to-end product; veil-proxy is its masking data
+# plane. Sibling components (veil-observatory, the CSOC/audit dashboard, and
+# veil-walled-garden) are separate projects — see docs/architecture/product-family.md.
+# The product name VeilGremlin is retained deliberately in runtime identity (the
+# `.veilgremlin/` state dir, the `com.veilgremlin.vault` keychain service, policy
+# `version` strings, and CLI output): those name the product, not this repo.
 classification: factory-output
 status: active
 lifecycle_stage: active
 local_repo_path: <repo>
-mind_palace_path: 20-projects/factory-output/veilgremlin
+mind_palace_path: 20-projects/factory-output/veil-proxy
 owner: dermdunc
 created_date: 2026-06-30
 promotion_target: none
 privacy_boundary: public
 github_account: dermdunc
+# Still the old remote: the GitHub repo rename is deliberately deferred until
+# veil-observatory exists to disambiguate from (docs/architecture/product-family.md §8 Q1).
+# Target on rename: git@github.com:dermdunc/veil-proxy.git
 github_remote_url: "git@github.com:dermdunc/veilgremlin.git"
 vault_mutation_allowed: false
 # version: applies to platform components (alpha|beta|v1.0|v1.x|v2.0) and factory outputs (v0|beta|v1.0|v1.x)
@@ -61,10 +70,11 @@ architecture:
   next_architecture_step: "T01-T10 built and merged; contract at v1.4. Outstanding: close the T10 precision NO-GO (false-positive-rate 16.7% vs the <3% gate; entropy 13.3%, phone 40%) and the display-collision minting fix, then run T11 review + /security-review + milestone sign-off."
   last_validated: 2026-07-18
   evidence_links:
-    - ".hekton/veilgremlin-dag.toml (the 11-task build DAG, transcribed from docs/architecture/work-breakdown.md)"
+    - ".hekton/veil-proxy-dag.toml (the 11-task build DAG, transcribed from docs/architecture/work-breakdown.md)"
     - "dag load/gen-specs correctly registered and rendered all 12 tasks; dag status/next correctly show only Wave A (T01/T02) as ready"
   risks: []
   owner: dermdunc
 notes:
   - Local-first privacy shield that keeps real PII and sensitive enterprise identifiers out of model context in agentic coding workflows.
+  - Renamed from `veilgremlin` to `veil-proxy` on 2026-07-26. VeilGremlin was promoted from the name of this repo to the name of the end-to-end product family; this repo is the masking data plane within it.
 
