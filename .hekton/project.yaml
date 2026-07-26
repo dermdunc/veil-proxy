@@ -67,8 +67,8 @@ architecture:
     - agentic-control-tower
   promotion_candidate: false
   promotion_target: none
-  next_architecture_step: "T01-T10 built and merged; contract at v1.4. Outstanding: close the T10 precision NO-GO (false-positive-rate 16.7% vs the <3% gate; entropy 13.3%, phone 40%) and the display-collision minting fix, then run T11 review + /security-review + milestone sign-off."
-  last_validated: 2026-07-18
+  next_architecture_step: "T01-T10 built and merged; M1+M2 merged; contract at v1.4. The T10 precision NO-GO is CLOSED (PR #37 — vg bench verdict GO, false-positive-rate 0.0%, was 16.7%). VeilGremlin is now a product family: veil-custodian and veil-foundations scaffolded with merged implementation plans; veil-observatory deliberately not created, gated behind Phase 1a. Outstanding, in order: (1) remediate the custom-entity-label leak reaching MaskedPack.text via api.rs:450 and keying.rs:219 — three-model-reviewed plan agreed, not yet implemented, needs a compiler; (2) re-run vg bench to bank the current display-collision measurement; (3) Phase 1a — close the six raw-capable String surfaces and land the interface-contracts v1.4->v1.5 bump; then T11 review + /security-review + milestone sign-off."
+  last_validated: 2026-07-26
   evidence_links:
     - ".hekton/veil-proxy-dag.toml (the 11-task build DAG, transcribed from docs/architecture/work-breakdown.md)"
     - "dag load/gen-specs correctly registered and rendered all 12 tasks; dag status/next correctly show only Wave A (T01/T02) as ready"
