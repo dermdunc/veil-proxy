@@ -91,27 +91,43 @@ All of this is in the existing repo. Nothing central can start until it lands.
 | `EntityType::Custom(String)` | `vg-core/src/types.rs:38` | Bounded label type, or excluded from telemetry entirely |
 | `ArtefactKind::SourceCode(String)` | `vg-core/src/traits.rs:38` | Bounded language enum |
 
-> ### ⚠️ Correction — this was misfiled, and it is the highest-severity item in this document
+> ### ⚠️ Correction — custom entity class names reach `MaskedPack.text`
 >
-> An earlier revision listed the `redaction_marker` defect here as "outside the telemetry scope
-> but worth fixing." **That was wrong, and the misfiling understated it badly.** It is not a
-> telemetry issue at all — it is a live content leak on the shipped hot path.
+> This item was first filed as "outside the telemetry scope but worth fixing," then over-corrected
+> to "a live content leak on the shipped hot path." **Both were wrong.** The accurate statement,
+> after tracing the code twice and having the second pass independently reviewed:
 >
-> `vg-core/src/api.rs:450` returns `[REDACTED:CUSTOM:{name}]` for `EntityType::Custom(name)`.
-> Traced and verified: that string is pushed into `replacements` (`api.rs:303`), spliced into
-> `out` (`api.rs:322`), and becomes `MaskedPack.text` (`api.rs:325`) — **which is the artefact
-> sent to the model.** A custom entity class named after a real value puts that value into the
-> cloud prompt.
+> **The defect is real, it affects two code paths, and it is not reachable through a production
+> `vg run` today.**
 >
-> It fires for both `HandlingClass::IrreversibleRedact` and `HandlingClass::Block` — including
-> the strictest class, whose entire purpose is that the content is never sent.
+> Two paths interpolate a policy-declared custom entity class *name* into `MaskedPack.text`, the
+> artefact sent to the model:
 >
-> Every other item in Phase 0 and Phase 1 concerns metadata leaving for an observatory that does
-> not exist yet. This one is live in shipped code today. **It is the first code change to make,
-> ahead of everything else, on its own branch** (task T15).
+> | Path | Handling classes | Renders |
+> |---|---|---|
+> | `redaction_marker` (`vg-core/src/api.rs:450`) | `IrreversibleRedact`, `Block` | `[REDACTED:CUSTOM:{name}]` |
+> | `type_tag_for_display` (`vg-core/src/keying.rs:219`) | **`Mask` — the default class** | `CUSTOM_{SCREAMING_SNAKE}_001` |
 >
-> It is currently invisible to the test suite: `assert_masked_pack_excludes_raw_values` would
-> catch it, but no test supplies a custom label as the raw value.
+> The `api.rs` chain is: `replacements` (`:303`) → spliced into `out` (`:322`) → `text` (`:325`).
+> The `keying.rs` path is the more exposed of the two, since `Mask` is the default.
+>
+> **Why it is not reachable today:** no shipped detector declares `EntityType::Custom` — zero
+> occurrences in `crates/vg-detectors/` or `crates/vg-adapters-claude/`. Nothing currently
+> *produces* a `Custom` finding. But every other layer is already wired for it
+> (`vg-vault/src/codec.rs:65,95`, `vg-policy/src/config.rs:313`, `keying.rs:219`), so the defect
+> arms itself the moment a custom detector is added, with nothing guarding the path.
+>
+> **A latent leak in a security control, with all the plumbing already in place and no test
+> covering it, still warrants fixing first** — but it is not an active incident, and this document
+> should not have said it was.
+>
+> **The `keying.rs` fix is not trivial.** `screaming_snake` collapses non-alphanumerics, so
+> `foo-bar` and `foo_bar` both render `FOO_BAR` — a display collision that
+> `vg-vault/src/codec.rs:130-131` already tests for. Flattening the name naively risks `rehydrate`
+> substituting the wrong value. Remediation is under three-model review; see task T15.
+>
+> Currently invisible to the suite: `assert_masked_pack_excludes_raw_values` would catch it, but
+> no test supplies a custom label as the raw value.
 
 ### 3.2 The `TelemetryEvent` type
 
