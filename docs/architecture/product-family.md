@@ -6,7 +6,7 @@ See `docs/decisions.md` for the corresponding PROPOSED decision entries and
 `docs/next-actions.md` for the resulting queue item.
 
 **Scope:** naming/taxonomy, component architecture, trust boundaries, personas and dashboard
-sequencing, device identity, the Bedrock control-plane design (`veil-walled-garden`), an
+sequencing, device identity, the Bedrock control-plane design (`veil-foundations`), an
 AWS-native dashboard evaluation, the gaps this expansion opens up, sequencing, and open
 questions for the human to decide. Where this document speculates beyond what the repo today
 establishes, it says so.
@@ -15,6 +15,21 @@ establishes, it says so.
 > applied in the working session, and differs in one respect from what §1.2 originally argued
 > for — see the note inline in §1.2. Q4 (dashboard build order) and Q7 (device identity) below
 > have also moved from open to (fully, and partially) resolved — see §4, §6, and §10.
+>
+> **Naming supersession:** the component described throughout this document as
+> **`veil-foundations`** was originally named `veil-walled-garden`. Same deliverable, renamed once
+> inference profiles and per-team cost attribution came into scope, which "walled garden" does not
+> suggest. If you encounter the older term in session logs, build-log entries, or earlier commits,
+> it refers to this component. The repo now exists at `dermdunc/veil-foundations`.
+>
+> **Sibling repos now exist.** `veil-custodian` and `veil-foundations` were scaffolded and their
+> implementation plans merged on 2026-07-26. `veil-observatory` remains deliberately uncreated —
+> it is gated behind Phase 1a of `implementation-plan.md`.
+>
+> **Q7 is now fully resolved:** attestation is **mTLS device certificates** (human decision,
+> 2026-07-26). See `veil-custodian`'s `docs/decisions.md` ADR-A. **Retention** is likewise settled:
+> a 24-hour hot tier feeding S3, with lifecycle tiering for regulatory hot and cold archive
+> (ADR-B), which closes the retention half of Q8.
 
 ---
 
@@ -44,7 +59,7 @@ head-on in §3, not glossed over.
 | **veil-proxy** | The masking data plane — parse → detect → vault → policy → masked pack, plus the in-flight masking proxy (`vg-proxy`) that intercepts the real request/response. **This repo.** | Proposed name for this repo's external identity |
 | **veil-observatory** | The telemetry / audit / evidence plane. Ingests redacted, structured events from a fleet of `veil-proxy` instances; serves the dashboard. | New, not yet built |
 | **veil-dashboard** | Two query surfaces over `veil-observatory`'s store — CSOC and Legal/Privacy. Proposed as part of the `veil-observatory` repo, not a fourth repo (see §1.3). | New, not yet built |
-| **veil-walled-garden** | Terraform for Amazon Bedrock as an LLM invocation control plane — IAM allowlists, Guardrails, invocation logging, VPC endpoints, cross-account layout. | New, not yet built |
+| **veil-foundations** | Terraform for Amazon Bedrock as an LLM invocation control plane — IAM allowlists, Guardrails, invocation logging, VPC endpoints, cross-account layout. | New, not yet built |
 
 ### 1.2 The concrete question: does `veil-proxy` stay one repo, and what happens to `vg-*`/`vg`?
 
@@ -102,7 +117,7 @@ still recommends: the GitHub remote URL, and the crate/binary/runtime-identity l
 |---|---|---|
 | `veilgremlin` (external identity: `veil-proxy`) | Everything that exists today: `vg-core`, `vg-detectors`, `vg-parsers`, `vg-vault`, `vg-policy`, `vg-audit`, `vg-cli`, `vg-adapters-claude`, `vg-bench`, `vg-proxy` | One deployable unit, one release cadence, one threat model (laptop-local, no network in the hot path). Splitting the masking core across repos would buy nothing — no other component reuses `vg-vault` or the detectors. |
 | `veil-observatory` | Ingestion service, event store, retention/tiering, evidence-pack generation, **and the dashboard** (as an app within this repo, e.g. `apps/dashboard`) | The dashboard has no independent data model — both CSOC and Legal/Privacy views are two query surfaces over the *same* observatory event store. A fourth repo for the dashboard alone would add cross-repo API-versioning overhead for zero isolation benefit. Split it out later only if a distinct frontend team/release cadence actually forms (flagged as an open question, §10). |
-| `veil-walled-garden` | Terraform modules + supporting docs only | Different artifact type entirely (infra-as-code vs. Rust binary), different review discipline (cloud/security sign-off, not `cargo test`), different deploy mechanism (`terraform apply`, not a release binary), and — importantly — genuinely independent of the other two: it can be built and applied without `veil-proxy` or `veil-observatory` existing at all. |
+| `veil-foundations` | Terraform modules + supporting docs only | Different artifact type entirely (infra-as-code vs. Rust binary), different review discipline (cloud/security sign-off, not `cargo test`), different deploy mechanism (`terraform apply`, not a release binary), and — importantly — genuinely independent of the other two: it can be built and applied without `veil-proxy` or `veil-observatory` existing at all. |
 
 **A fourth, lightweight thing worth naming even though it isn't a repo of its own:** the
 **telemetry event schema** that `veil-proxy` emits and `veil-observatory` ingests needs the same
@@ -138,7 +153,7 @@ flowchart TB
 
     subgraph AWS["Customer AWS account(s)"]
         direction TB
-        WG["veil-walled-garden<br/>(Terraform: IAM allowlist, Guardrails,\ninvocation logging, VPC endpoints)"]
+        WG["veil-foundations<br/>(Terraform: IAM allowlist, Guardrails,\ninvocation logging, VPC endpoints)"]
         Bedrock["Amazon Bedrock"]
         WG -.constrains.-> Bedrock
     end
@@ -157,8 +172,8 @@ flowchart TB
 | | |
 |---|---|
 | **Responsibilities** | Everything this repo does today: parse/detect/mask/vault/policy/audit, the masking proxy intercepting the real request/response (M3+), local demask. |
-| **Explicit non-responsibilities** | Does not decide fleet-wide policy (only resolves the 3-layer policy it's given). Does not aggregate telemetry across machines. Does not authenticate its own actor (`--actor`/`--role` remain self-asserted attribution — see §6). Does not gate *whether* Bedrock will accept a call at all (that's `veil-walled-garden`) — it only minimizes *what's in* the call it's allowed to make. Does not run incident-response workflows. |
-| **Interfaces to other components** | Emits the existing local `AuditEvent` types (unchanged). New, additive: an opt-in telemetry emitter (§3) sending a *narrower*, purpose-built event type toward `veil-observatory` on two lanes — batched bulk and immediate alert (§4.2). Sits inside whatever IAM/network boundary `veil-walled-garden` establishes for Bedrock calls — composes with it, doesn't call into it directly. |
+| **Explicit non-responsibilities** | Does not decide fleet-wide policy (only resolves the 3-layer policy it's given). Does not aggregate telemetry across machines. Does not authenticate its own actor (`--actor`/`--role` remain self-asserted attribution — see §6). Does not gate *whether* Bedrock will accept a call at all (that's `veil-foundations`) — it only minimizes *what's in* the call it's allowed to make. Does not run incident-response workflows. |
+| **Interfaces to other components** | Emits the existing local `AuditEvent` types (unchanged). New, additive: an opt-in telemetry emitter (§3) sending a *narrower*, purpose-built event type toward `veil-observatory` on two lanes — batched bulk and immediate alert (§4.2). Sits inside whatever IAM/network boundary `veil-foundations` establishes for Bedrock calls — composes with it, doesn't call into it directly. |
 | **Deployment model** | Laptop only. A cloud desktop/VDI session is architecturally identical to a laptop for this purpose (one developer, one local vault) and needs no special-casing. **Never** a shared multi-user service — that would break the one-vault-per-developer model this whole design rests on. |
 
 ### veil-observatory
@@ -179,7 +194,7 @@ flowchart TB
 | **Interfaces** | Read-only query API against `veil-observatory`; RBAC gating which fields/tier a given role can see (§4 covers why this matters — the two personas' needs genuinely conflict, not just differ). |
 | **Deployment model** | Co-located with `veil-observatory` (VPC, SaaS, or AWS-native per §7 — matching whichever the customer chose). |
 
-### veil-walled-garden
+### veil-foundations
 
 | | |
 |---|---|
@@ -188,24 +203,24 @@ flowchart TB
 | **Interfaces** | None to the other two components at the code level — the "interface" is that `veil-proxy`'s Bedrock calls happen to execute *inside* the account/network boundary this Terraform establishes. No shared library, no API. |
 | **Deployment model** | Customer AWS account(s), applied via Terraform, reviewed by cloud/security engineering — a fundamentally different artifact and review discipline from the other two. |
 
-**Composition as defense in depth:** `veil-proxy` minimizes *what* goes out; `veil-walled-garden`
+**Composition as defense in depth:** `veil-proxy` minimizes *what* goes out; `veil-foundations`
 constrains *whether it can go out at all, and to which model*. Deployed together, a leak
 requires **both** a masking failure **and** an invocation-authority failure — genuinely
 independent layers, not two names for the same control. Deployed alone, each is weaker in a
-specific, nameable way: `veil-walled-garden` without `veil-proxy` constrains models but not
+specific, nameable way: `veil-foundations` without `veil-proxy` constrains models but not
 content (an authorized user can still send raw PII to an allowlisted model). `veil-proxy`
-without `veil-walled-garden` minimizes content but not invocation authority (anyone with AWS
+without `veil-foundations` minimizes content but not invocation authority (anyone with AWS
 credentials can call any enabled model directly, bypassing the laptop entirely). **Recommend
 both**, but the document doesn't pretend either is sufficient alone.
 
 **A genuinely useful side effect of the combination, worth stating plainly:** if
-`veil-walled-garden`'s Bedrock invocation logging is enabled, and all traffic reaching Bedrock
+`veil-foundations`'s Bedrock invocation logging is enabled, and all traffic reaching Bedrock
 has already passed through `veil-proxy`, then AWS's own invocation log becomes a **second,
 redundant, masked-only audit trail** — populated entirely by AWS, outside VeilGremlin's control,
 and still never containing raw PII (because by the time content reaches Bedrock, `veil-proxy`
 already masked it). That's a real, checkable claim, not marketing: it only holds if the
 composition is enforced (IAM makes bypassing `veil-proxy` impossible), which is exactly what
-`veil-walled-garden`'s allowlist is for.
+`veil-foundations`'s allowlist is for.
 
 ---
 
@@ -305,7 +320,7 @@ sequenceDiagram
     participant Dev as Developer
     participant VP as veil-proxy (laptop)
     participant Vault as Local vault (never leaves)
-    participant BR as Amazon Bedrock (inside veil-walled-garden)
+    participant BR as Amazon Bedrock (inside veil-foundations)
     participant Obs as veil-observatory
 
     Dev->>VP: prompt + files + tool output
@@ -430,7 +445,7 @@ a workflow gap, covered in §8.6.
 
 ---
 
-## 5. veil-walled-garden in Depth
+## 5. veil-foundations in Depth
 
 ### 5.1 What Bedrock actually enforces, stated honestly
 
@@ -448,12 +463,12 @@ already-masked placeholder text (`EMAIL_001`) as something it needs to act on (g
 redact), but it's untested whether Guardrails' own heuristics could **misfire on placeholder
 text itself** (flagging `ACCOUNT_ID_014`-shaped strings as suspicious, or conversely treating
 masked content as a signal to relax scrutiny it shouldn't). This needs an integration test once
-`veil-walled-garden` and `veil-proxy` are both real, not assumed to compose cleanly.
+`veil-foundations` and `veil-proxy` are both real, not assumed to compose cleanly.
 
 ### 5.2 Terraform module sketch (speculative — no AWS account exists to validate against yet)
 
 ```
-veil-walled-garden/
+veil-foundations/
   modules/
     iam-model-allowlist/       # per-role/per-principal Bedrock model invoke permissions
     bedrock-guardrails/        # guardrail definitions: denied topics, PII filters, word lists
@@ -605,7 +620,7 @@ gets answered; it does not answer it.
 
 ## 7. AWS-Native Dashboard Options
 
-Since `veil-walled-garden` already puts the customer in AWS, it's worth evaluating whether the
+Since `veil-foundations` already puts the customer in AWS, it's worth evaluating whether the
 dashboard/observatory's visualisation and query layer should be built from AWS-native managed
 services rather than a bespoke stack.
 
@@ -652,11 +667,11 @@ gap:
   If this stack is chosen, the alert lane needs OpenSearch (or an equivalent) as a genuinely
   separate service, not "the same Athena tables, queried more often."
 - **Lake Formation is operationally heavy.** Permission model complexity (LF-Tags, resource
-  links, cross-account grants if `veil-observatory` and `veil-walled-garden` sit in different
+  links, cross-account grants if `veil-observatory` and `veil-foundations` sit in different
   accounts) is a real ongoing maintenance cost, not a one-time setup.
 - **The biggest one, stated plainly: committing `veil-observatory` to AWS-native services
   contradicts the VPC-portable posture recommended at §10 Q5.** A customer whose Bedrock usage
-  sits in an AWS account (reasonable — that's what `veil-walled-garden` assumes) is not
+  sits in an AWS account (reasonable — that's what `veil-foundations` assumes) is not
   necessarily a customer who wants their *entire telemetry/dashboard stack* locked into
   AWS-specific managed services, especially if they operate multi-cloud or want to self-host
   `veil-observatory` without depending on AWS at all. **If this path is taken, say so as a
@@ -797,7 +812,7 @@ actor-identity story — a CI job is not a person, which sharpens §6 rather tha
 exists, an offline/air-gapped laptop must **not** be forced to choose between "can't mask" and
 "must phone home." Recommend: telemetry (both lanes) queues locally (bounded buffer, user-visible
 backlog) and drains on reconnect; masking itself must keep working with zero network,
-unconditionally. Separately: `veil-walled-garden`'s entire premise is a *cloud* Bedrock account —
+unconditionally. Separately: `veil-foundations`'s entire premise is a *cloud* Bedrock account —
 a genuinely air-gapped deployment needs a local-model destination instead, which the spec already
 names ("unless the model is local and explicitly approved") but has never been built.
 
@@ -819,7 +834,7 @@ names ("unless the model is local and explicitly approved") but has never been b
   metadata — a centralized (esp. SaaS) `veil-observatory` raises its own residency question
   independent of the vault question.
 - **Bedrock model lifecycle drift.** AWS deprecates/updates model IDs over time;
-  `veil-walled-garden`'s allowlist needs an ongoing maintenance process, not just an initial
+  `veil-foundations`'s allowlist needs an ongoing maintenance process, not just an initial
   `terraform apply`.
 
 ---
@@ -857,13 +872,13 @@ a month of calendar time); nothing below of that size should be estimated at mil
 6. **Full CSOC investigation surface — deferred.** Drill-down, correlation, case management,
    built once the alerting lane (step 3-4) has generated real signal and demand for it, not
    speculatively alongside step 4.
-7. **`veil-walled-garden` Terraform. (large)** Independent of 1–6; can start in parallel any time
+7. **`veil-foundations` Terraform. (large)** Independent of 1–6; can start in parallel any time
    an AWS account exists to build against. Cross-account IAM, Guardrails config, and VPC
    endpoints each warrant their own security review.
 8. **AWS-native dashboard evaluation (§7), if pursued.** Depends on step 3's event schema being
    finalised in a portable format (§7.4) before Lake Formation/Athena/QuickSight specifics are
    locked in — sequence after step 3, and realistically alongside or after step 7 if a genuinely
-   AWS-native deployment is the target, since it benefits from `veil-walled-garden`'s AWS account
+   AWS-native deployment is the target, since it benefits from `veil-foundations`'s AWS account
    already existing.
 9. **Later-phase, largely additive once 1–8 exist:** MDM enrollment mechanics beyond device-
    pseudonym minting, the IR workflow runbook (§8.6), DSAR/retention formalization (§8.7/§8.8),
@@ -912,7 +927,7 @@ is given, but it's a recommendation, not a default to assume.
    local-first thesis and would need the most airtight isolation/encryption story this document
    can offer if pursued anyway. See also Q11, which raises a related but distinct axis (AWS-
    native vs. portable) that VPC-hosting alone doesn't resolve.
-6. **Scope `veil-walled-garden` to Bedrock only (as literally asked) or design the module names
+6. **Scope `veil-foundations` to Bedrock only (as literally asked) or design the module names
    for future portability to other providers?** *Recommendation:* build Bedrock first, but avoid
    hardcoding "bedrock" into module/variable names where a two-line difference avoids future
    lock-in (`invocation-logging`, not `bedrock-invocation-logging`). *Tradeoff:* a small

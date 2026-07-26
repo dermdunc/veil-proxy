@@ -16,7 +16,7 @@ Supersedes nothing until reviewed; see `docs/decisions.md`.
 |---|---|---|
 | `veil-proxy` | **Exists** (this repo, renamed from `veilgremlin`) | Masking data plane, `vg` CLI, agent adapters, **and the telemetry emitter + schema** |
 | `veil-observatory` | **New — build 3rd** | Ingest gateway, curated store, alert lane, dashboard app |
-| `veil-walled-garden` | **New — can start immediately** | Terraform only: Bedrock invocation control plane |
+| `veil-foundations` | **New — can start immediately** | Terraform only: Bedrock invocation control plane |
 | `veil-identity-custodian` | **Conditional — gated on Q9** | Device→user mapping. Only exists if the existing MDM/CMDB fails the §6.3 separation-of-duties audit |
 
 Two deliberate non-repos:
@@ -197,7 +197,7 @@ unvalidated landing data, which preserves rather than prevents a leak.
 
 ---
 
-## 6. Phase 4 — `veil-walled-garden` (new repo, parallelisable **now**)
+## 6. Phase 4 — `veil-foundations` (new repo, parallelisable **now**)
 
 **This is the only workstream with no dependency on the telemetry work.** Different skillset
 (Terraform/AWS, not Rust). If parallel capacity exists, start it in Phase 0.
@@ -268,8 +268,8 @@ Phase 2 (identity decisions)       ──┘
                                       ├──> Phase 3: veil-observatory (new repo)
                                       └──> Phase 5: dashboard
 
-Phase 4: veil-walled-garden (new repo) ── independent, start any time
+Phase 4: veil-foundations (new repo) ── independent, start any time
 ```
 
-**Start now, in parallel:** Phase 0 corrections, and `veil-walled-garden`.
+**Start now, in parallel:** Phase 0 corrections, and `veil-foundations`.
 **Do not start until Phase 1 lands:** anything that ships data off the laptop.

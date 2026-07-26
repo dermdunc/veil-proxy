@@ -29,8 +29,7 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       M3+, once there's something schema-aware to route toward). Hardened by 2 doubt-driven-
       development rounds (single-model + Codex cross-model, 12 real fixes, including a
       cross-session mapping-deletion bug in round 1's own new `unregister_port` primitive). See
-      `docs/session-log.md`/`docs/decisions.md` (2026-07-25). Branch
-      `agent/claude/vg-proxy-m2-daemon-core`, not yet merged — human review pending.
+      `docs/session-log.md`/`docs/decisions.md` (2026-07-25). **MERGED** as `def856f` (PR #39).
 - [ ] **Local masking proxy + daemon — M3 next.** Intercept the actual request to the model
       endpoint, mask the entire assembled payload (prompt + context) via the vault, demask the
       response — invisible to the user. This is what turns the proven mechanism into a product
@@ -39,8 +38,9 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       M3 (request masking, Anthropic direct, non-streaming — `schema/anthropic.rs` +
       `mask_request.rs` wired end-to-end against a mock upstream), per the plan's §10.3 build
       order.
-- [ ] **Precision NO-GO — fix implemented, FOUR doubt-pass rounds run, STOP signal reached;
-      PENDING HUMAN REVIEW, not merged.** Branch `agent/claude/t10-fp-detector-fixes`
+- [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
+      **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
+      reached. Branch `agent/claude/t10-fp-detector-fixes`
       implements the targeted fix (`EntropyDetector` git-SHA-context exclusion,
       `PhoneDetector` ISBN-13/10 checksum + ZIP+4 shape exclusion, `is_structured_identifier`
       `=`-handling closing a `LICENSE_KEY=ACME-2026-DEMO-KEY`-shaped residual). Rounds 1-3
@@ -97,11 +97,42 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 - [ ] Anthropic direct
 - [ ] non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)
 
-## Session Update: 2026-07-26 — product-family architecture design (proposal only, not ratified)
+## Session Update: 2026-07-26 — product family established, leak found
 
-- [ ] Human review and ratify/amend/reject `docs/architecture/product-family.md` (VeilGremlin
-      family taxonomy, `veil-observatory`, `veil-dashboard`, `veil-walled-garden`) and the
-      corresponding PROPOSED decision entries in `docs/decisions.md` (2026-07-26). No renames or
-      structural changes have been made — this is design-only, pending ratification before any
-      of its §7 sequencing work begins. M3 (request masking) above remains the actual priority
-      regardless of this proposal's outcome.
+- [x] ~~Human review of `docs/architecture/product-family.md`~~ — **merged** (PR #41), along with
+      the project-identity rename `veilgremlin` → `veil-proxy`. `veil-walled-garden` was renamed
+      `veil-foundations` in the same pass.
+- [x] ~~Decide the sibling repos~~ — `veil-custodian` and `veil-foundations` scaffolded, planned,
+      and their plans merged. `veil-observatory` deliberately **not** created; gated behind
+      Phase 1a.
+- [x] ~~Attestation mechanism~~ — **mTLS device certificates** (`veil-custodian` ADR-A).
+- [x] ~~Retention windows~~ — **24-hour hot tier → S3** for regulatory hot/cold archive (ADR-B).
+
+### Now open, in priority order
+
+- [ ] **Remediate the custom-entity-label leak — needs a compiler.** Two paths interpolate a
+      policy-declared custom entity class name into `MaskedPack.text`: `vg-core/src/api.rs:450`
+      (`IrreversibleRedact`/`Block`) and `vg-core/src/keying.rs:219` (`Mask`, the default class).
+      Not reachable today — no shipped detector emits `EntityType::Custom` — but every other
+      layer is wired for it, and the fix is **not retroactive** (`Vault::intern` returns the
+      persisted display), so it must land before any custom detector ships.
+      Three-model-reviewed plan agreed: collapse both to `CUSTOM_NNN` / `[REDACTED:CUSTOM]`,
+      re-key `KeyerState.ordinals` on the rendered display tag, and add a stricter vault unique
+      index collapsing all custom rows into one ordinal domain (the current index at
+      `vg-vault/src/schema.rs:48-49` keys on `COALESCE(entity_custom,'')`, so two concurrent
+      vaults can both mint `CUSTOM_001`). **No migration needed** — verified no `.veilgremlin`
+      state dir or `vault.db` exists on this machine, so no real vault holds custom rows.
+- [ ] **Separate demask correctness bug, fixed by the same work:** duplicate displays make
+      `rehydrate` restore both placeholders to the first secret, and `vg demask`'s partial-restore
+      guard misses it (token count goes 2→0 for both bindings), so it **exits 0 silently**.
+- [ ] **Re-run `vg bench`** and bank the current display-collision measurement. The README
+      deliberately quotes no number for it rather than a stale one.
+- [ ] **Audit-log third path**: `vg-audit/src/record.rs:212` serialises `{"custom":"<name>"}`, and
+      `vg-cli/src/main.rs:476-478` claims in a doc comment that audit events "leak nothing" —
+      false for the `Custom` arm. Local-only today; a hard prerequisite for v1.5 telemetry.
+- [ ] **Phase 1a** — close the six raw-capable `String` surfaces, land the `interface-contracts`
+      v1.4 → v1.5 bump (first bump in the project's history with real downstream callers: 7
+      crates, ~221 tests), then `TelemetryEvent` + `TryFrom` in `vg-core`.
+
+M3 (request masking) remains the standing product priority; the leak fix is small and should not
+displace it for long.

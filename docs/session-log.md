@@ -1529,3 +1529,95 @@ Port-reuse handoff race and binding-store eviction remain open, documented desig
 - [ ] M3: request masking
 - [ ] Anthropic direct
 - [ ] non-streaming (schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream)
+
+---
+
+## Session: VeilGremlin becomes a product family; a latent leak found
+
+**Date:** 2026-07-26
+
+### What Changed
+
+**Renamed the project identity** `veilgremlin` → `veil-proxy`. VeilGremlin is now the name of the
+end-to-end product family; this repo is the masking data plane within it. Scope was deliberately
+narrow — `.hekton/*.yaml`, the build-DAG filename, and the four agent-facing docs. Runtime
+identity (`.veilgremlin/` state dir, `com.veilgremlin.vault` keychain service, policy version
+strings, CLI stderr prefixes) was left untouched: it names the *product*, not the repo, and
+renaming it would orphan existing vault keys and state directories. The GitHub repo rename stays
+deferred.
+
+**Designed the family** (`docs/architecture/product-family.md`, `implementation-plan.md`) and
+**created two sibling repos**, both private, both with merged implementation plans:
+
+- `veil-custodian` — device-pseudonym → user mapping, so a central plane keys on pseudonyms and
+  never holds identity.
+- `veil-foundations` — Terraform codifying Bedrock as an invocation control plane. Renamed from
+  the `veil-walled-garden` concept once inference profiles and cost attribution came into scope.
+
+`veil-observatory` was deliberately **not** created — it is gated behind Phase 1a.
+
+**Resolved the central design tension.** A central plane contradicts "PII never leaves the
+machine." The resolution separates *reversal material* (vault, key, raw values — never leaves,
+unconditionally) from *telemetry* (masked-shape events — may leave, opt-in only), and proposes
+retiring the old claim for weaker wording that is actually true.
+
+**Corrected the record.** The T10 precision NO-GO closed in PR #37 (`vg bench` GO, FP rate 0.0%),
+but `README.md`, `.hekton/project.yaml` and `docs/next-actions.md` had advertised the stale 16.7%
+failure for over a week. All corrected.
+
+### The leak
+
+Two paths interpolate a policy-declared **custom entity class name** into `MaskedPack.text`, the
+artefact sent to the model:
+
+| Path | Handling classes | Renders |
+|---|---|---|
+| `vg-core/src/api.rs:450` | `IrreversibleRedact`, `Block` | `[REDACTED:CUSTOM:{name}]` |
+| `vg-core/src/keying.rs:219` | **`Mask` — the default** | `CUSTOM_{SCREAMING_SNAKE}_001` |
+
+Severity was mis-stated twice before settling: first filed as a footnote, then over-corrected to
+"live in shipped code." The verified position is narrower — **not reachable today**, because no
+shipped detector emits `EntityType::Custom`, but every other layer is wired for it and the fix is
+**not retroactive** (`Vault::intern` returns the persisted display), so it arms on the first
+custom detector.
+
+Three models reviewed the remediation and disagreed productively:
+
+- The **proposal** recommended a salted-HMAC fingerprint for the display tag.
+- **Opus** rejected it — no domain separation over a message space overlapping `placeholder_key`'s
+  would render vault-key-derived bytes into model-bound text; per-vault-random salt makes displays
+  install-nondeterministic. It proposed re-keying ordinals on the rendered tag instead.
+- **Codex** agreed on rejecting HMAC but overruled Opus twice: its "zero `vg-vault` change" version
+  misses that `schema.rs:48-49` keys the unique index on `COALESCE(entity_custom,'')`, so two
+  concurrent vaults can both mint `CUSTOM_001`; and landing `api.rs` alone leaves the *default*
+  `Mask` path leaking.
+
+Also surfaced: a **separate demask correctness bug** — duplicate displays make `rehydrate` restore
+both placeholders to the first secret, and `vg demask`'s partial-restore guard misses it because
+the token count drops 2→0 for both bindings, so it exits **0 silently**.
+
+### Validation status
+
+**Nothing was compiled or tested.** `cargo`/`rustc` are unreachable in this environment. All code
+findings are read-verified with file:line, and the remediation is planned but **not implemented**
+for exactly that reason — it touches SQL indexes, keying ordinals and vault reseeding.
+
+Verified by inspection: no `.veilgremlin` state dir or `vault.db` exists on this machine, so no
+real vault holds `entity_kind='custom'` rows and **no migration is needed**.
+
+### Risks
+
+- The leak arms silently on the first custom detector. Nothing in CI guards it.
+- Crypto-shredding for post-offboarding erasure must now reach S3 and Glacier copies
+  (`veil-custodian` ADR-B) — the main open risk in the retention decision.
+- The Hekton scaffolder has two defects found this session: uncommitted local edits making
+  scaffolds non-reproducible, and a missing newline that swallows `owner:` into a comment. Both
+  outside this repo, untouched.
+
+### Next Actions
+
+See `docs/next-actions.md` — the leak remediation is first and needs a compiler.
+
+### Mind-palace updated
+
+No — proposed. Vault mutation remains disabled for this repo.
