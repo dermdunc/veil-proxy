@@ -26,3 +26,44 @@ build/
 #   public product repo). Both kept locally, synced via scripts.
 .control-tower/
 mind-palace/
+
+# --- Hekton control plane (boundary: never ship in a public repo) ---
+# Untracked 2026-07-31 after the secret-sauce audit found these published.
+# Files remain on disk; local tooling (architecture map, session logging) is unaffected.
+.hekton/
+mind-palace/
+docs/session-log.md
+docs/local-assumptions.md
+docs/depth-decision.md
+docs/human-understanding-check.md
+docs/blog-signals.md
+docs/gremlin-radar.md
+scripts/sync-mirror-to-vault.sh
+scripts/check-mirror-drift.sh
+scripts/setup-hooks.sh
+
+# Agent config: describes the Hekton control plane and machine layout, not the product.
+AGENTS.md
+CLAUDE.md
+CODEX.md
+.env.example
+
+# >>> hekton-boundary (secret-sauce audit 2026-07-31) >>>
+# Control plane, vault mirror and agent config: never ship in a public repo.
+# Files stay on disk; only the published tree changes.
+.hekton/
+mind-palace/
+docs/session-log.md
+docs/local-assumptions.md
+docs/depth-decision.md
+docs/human-understanding-check.md
+docs/blog-signals.md
+docs/gremlin-radar.md
+docs/walkthroughs/
+scripts/sync-mirror-to-vault.sh
+scripts/check-mirror-drift.sh
+scripts/setup-hooks.sh
+AGENTS.md
+CLAUDE.md
+CODEX.md
+# <<< hekton-boundary <<<
