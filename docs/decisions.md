@@ -18,10 +18,10 @@
 | 2026-06-30 | ADR-010 Placeholder key = **salted HMAC over canonicalised value+type+namespace** | Stable consistency without leaking original structure |
 | 2026-06-30 | **Build method = agent factory, contract-first** | Squads own one crate each; interfaces frozen end of Wave A to enable safe parallel agent work (see `architecture/agent-factory-plan.md`) |
 | 2026-07-03 | Build driven through Hekton's task-DAG orchestrator (`agentic-control-tower`), not manual per-task dispatch | `.hekton/veilgremlin-dag.toml` is now the machine source of truth for the T01-T11 DAG (transcribed from `architecture/work-breakdown.md`); `.hekton/build-tasks/*.md` are generated engine-gateway-lab task specs (regenerate via `dag gen-specs`, don't hand-edit). `.control-tower/` tracks each task's lifecycle. All build tasks route through `claude-cli`/`codex-cli` (cloud, V1 scope — no local-model build capability exists yet) at `privacy: vendor-allowed` (this repo's own source isn't privacy-sensitive; see `.hekton/project.yaml`'s `privacy_boundary: internal`). See `agentic-control-tower`'s root `decisions.md` ADR-013 for the full orchestrator design. |
-| 2026-07-04 | Repo made **public** under the **dermdunc** account | VeilGremlin is an enterprise architecture/governance/risk tool, not agentic-engineering tooling — it belongs under the professional-identity account per Hekton's domain-based GitHub routing decision (see `~/hekton/docs/decisions.md`, 2026-07-04). Refines the 2026-06-30 private-scaffold decision above. |
+| 2026-07-04 | Repo made **public** under the **dermdunc** account | VeilGremlin is an enterprise architecture/governance/risk tool, not agentic-engineering tooling — it belongs under the professional-identity account per Hekton's domain-based GitHub routing decision (see `<hekton-machinery>/docs/decisions.md`, 2026-07-04). Refines the 2026-06-30 private-scaffold decision above. |
 | 2026-07-17 | ADR-011 (T05) `vg-vault` = **SQLCipher via `rusqlite` (vendored OpenSSL), OS-keychain-wrapped DB key, per-install salt in an encrypted `meta` table; `Keyer` ordinal counters reseeded from persisted rows at open** | Encrypted-at-rest reversible mapping store; keychain wrap keeps the key off disk; reseed prevents display-ordinal collision/drift across process restarts. Added an additive `Keyer::seed_ordinal` to `vg-core` (not a frozen-contract change). See the 2026-07-17 T05 entry below. |
 | 2026-07-18 | ADR-012 (T07) **`vg-core::scan`/`mask` pipeline wired; contract bumped v1 → v1.1 (`mask` gains `ctx: &Context`)** | `mask` needs the same detectors/parsers `scan` runs but the frozen signature had no `Context`; the sanctioned contract-change fix is an explicit param, not smuggling detectors into `Policy` or pre-computing findings. Also fixed the pipeline order (artefact-Block short-circuit; `Pass` never skips detection; full-buffer detection with spans as enrichment; specific-over-generic overlap resolution; irreversible/entity-Block never interned; one Scan/Block audit event; vault owns demask attribution). See the 2026-07-18 T07 entry below. |
-| 2026-07-25 | New crate **`crates/vg-proxy`**, milestone M1 (transport + routing skeleton) | First implementation milestone of `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1); plain-HTTP `hyper` loopback server + deny-by-default route classifier, zero egress risk by construction (no upstream client exists yet). See the 2026-07-25 entry below. |
+| 2026-07-25 | New crate **`crates/vg-proxy`**, milestone M1 (transport + routing skeleton) | First implementation milestone of `<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1); plain-HTTP `hyper` loopback server + deny-by-default route classifier, zero egress risk by construction (no upstream client exists yet). See the 2026-07-25 entry below. |
 | 2026-07-25 | Milestone M2 (daemon core) — `Daemon` opens `vg-vault` once, H2 session-namespace shim (`session.rs`), registration-not-derivation port fallback | Second implementation milestone of the masking-proxy plan; tested in isolation via direct calls, not yet wired into the HTTP server (M3+ has something schema-aware to route toward). See the 2026-07-25 entry below. |
 
 Full reasoning and the Mermaid-illustrated design are in [`spec/requirements-and-design-spec.md`](spec/requirements-and-design-spec.md).
@@ -35,7 +35,7 @@ account, per the standard factory-output default. On review, that account domain
 for this specific project: VeilGremlin is an enterprise architecture/governance/risk tool (a
 privacy shield for agentic coding workflows), which belongs under the `dermdunc`
 professional-identity account. This prompted a wider Hekton policy addition — see
-`~/hekton/docs/decisions.md`'s 2026-07-04 entry adding a domain heuristic to factory-output
+`<hekton-machinery>/docs/decisions.md`'s 2026-07-04 entry adding a domain heuristic to factory-output
 GitHub routing.
 
 ### Decision
@@ -146,7 +146,7 @@ run, not just the local terminal output this session had already captured.
   PASS." That claim was true for the local Homebrew binary, a different execution path from the
   Docker-based CI job; nobody had checked the real CI run before writing "PASS." Fixed:
   `runs-on: ubuntu-latest` for that job only.
-- **Confirmed, fixed:** this project is explicitly bound to `~/hekton`'s Hekton Documentation
+- **Confirmed, fixed:** this project is explicitly bound to `<hekton-machinery>`'s Hekton Documentation
   Contract (`CLAUDE.md:18`), which requires `.hekton/agent-run-log.yaml` and
   `.hekton/change-log.yaml` updated every session with a structural/build change — T01 is exactly
   that kind of change (a from-scratch build engine), and neither file was touched. Added
@@ -206,7 +206,7 @@ missed rather than re-confirm it.
   Cargo whatsoever — the *exact* gap flagged in `docs/next-actions.md` on 2026-07-04
   ("`check-prereqs.sh` doesn't check for it either... needs: Rust toolchain... and
   `check-prereqs.sh` updated to check for all three so this doesn't get silently rediscovered
-  again") and prepared as an unapplied diff in `~/hekton`'s VeilGremlin dogfood runbook earlier
+  again") and prepared as an unapplied diff in `<hekton-machinery>`'s VeilGremlin dogfood runbook earlier
   this same session — but never actually applied to this repo until this fix. Applied now, to
   all three files, plus made `verify-project.sh` actually run `cargo build --locked && cargo fmt
   --check` rather than only check file presence.
@@ -864,7 +864,7 @@ practice).
 
 ### Vault sync
 
-Backed up the vault (`~/hekton/scripts/backup-obsidian-vault.sh`) before syncing, per Hekton's
+Backed up the vault (`<hekton-machinery>/scripts/backup-obsidian-vault.sh`) before syncing, per Hekton's
 standing policy. Ran `scripts/sync-mirror-to-vault.sh`: it correctly copied the refreshed
 `session-log.md` onto disk, but its own `git add` line staged nothing at all, silently. Root
 cause: the `git add` command listed `index.md`, `decisions.md`, and `session-log.md` — but
@@ -2403,8 +2403,8 @@ still not merged; human review and merge decision are next.
 
 ### Context
 
-`~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1) is the design; both its
-blocking spikes closed 2026-07-24 in the `~/hekton` factory repo, unblocking M1. `docs/next-actions.md`
+`<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` (v3.1) is the design; both its
+blocking spikes closed 2026-07-24 in the `<hekton-machinery>` factory repo, unblocking M1. `docs/next-actions.md`
 already carried the masking proxy as item **#1 — nothing above it**. This session built the
 plan's own §10.3 milestone 1: transport + routing skeleton, no real upstream, no real
 credentials.

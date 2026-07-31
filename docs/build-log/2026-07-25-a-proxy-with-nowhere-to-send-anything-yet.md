@@ -44,4 +44,4 @@ and a blocked route come back `403`. Small milestone, but the point of building 
 to be able to trust it completely before anything gets stacked on it.
 
 See `docs/decisions.md` (2026-07-25) for the two scoping calls, and
-`~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` for the plan this implements.
+`<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` for the plan this implements.

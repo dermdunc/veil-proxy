@@ -14,7 +14,7 @@ summarizing it mechanically. If an entry could have been produced by piping
 `docs/decisions.md` through a formatter, it isn't doing its job.
 
 Convention borrowed from the Hekton Workshop Gremlin's `docs/build-log/YYYY-MM-DD-*.md`
-pattern (see `~/hekton/gremlins/workshop/workshop-gremlin.md`), scaled down: no Astro
+pattern (see `<hekton-machinery>/gremlins/workshop/workshop-gremlin.md`), scaled down: no Astro
 site or Pages deploy for VeilGremlin yet, just the dated files, linked from `README.md`.
 That can grow into a published site later if it earns one — see
 `docs/next-actions.md`.

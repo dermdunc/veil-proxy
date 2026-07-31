@@ -20,7 +20,7 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       `crates/vg-proxy`: plain-HTTP `hyper` loopback server + deny-by-default route classifier,
       no upstream client, no credentials. Hardened by 3 doubt-driven-development rounds (11
       real fixes) before merge. See `docs/session-log.md`/`docs/decisions.md` (2026-07-25) and
-      `~/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.3.
+      `<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.3.
 - [x] **M2 — daemon core (2026-07-25).** `Daemon`: opens `Vault` once (`open`/`open_with_key`,
       mirroring `Vault`'s own two-constructor pattern); H2 session-namespace shim (`session.rs`)
       resolving the `X-VG-Namespace` header or a registered loopback address; the session-scoped
