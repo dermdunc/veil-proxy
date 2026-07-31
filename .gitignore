@@ -41,3 +41,9 @@ docs/gremlin-radar.md
 scripts/sync-mirror-to-vault.sh
 scripts/check-mirror-drift.sh
 scripts/setup-hooks.sh
+
+# Agent config: describes the Hekton control plane and machine layout, not the product.
+AGENTS.md
+CLAUDE.md
+CODEX.md
+.env.example
