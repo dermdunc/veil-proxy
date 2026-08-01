@@ -181,7 +181,10 @@ fn inspect_never_prints_the_matched_text() {
     let inspect = run_vg(&state, &["inspect", note.to_str().unwrap()], None);
     assert!(inspect.status.success(), "{}", stderr(&inspect));
     let out = stdout(&inspect);
-    assert!(out.contains("Email"), "{out}");
+    // "EMAIL" (Display), not "Email" (the old Debug-derived variant name) -- inspect now
+    // renders EntityType via Display (fixed 2026-08-01, docs/decisions.md), which also
+    // collapses a Custom variant's class name instead of leaking it.
+    assert!(out.contains("EMAIL"), "{out}");
     assert!(
         !out.contains("jane.doe@example.com"),
         "inspect leaked a value: {out}"

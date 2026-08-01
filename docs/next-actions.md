@@ -136,11 +136,24 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       measured at 1 of 3 samples corrupted (a different root cause — see the "T11: collision-
       avoiding minting" recommendation in `vg bench`'s own output — not banked as part of this
       item, left for the dedicated unit).
-- [ ] **Audit-log third path**: `vg-audit/src/record.rs:212` serialises `{"custom":"<name>"}`, and
-      `vg-cli/src/main.rs:476-478` claims in a doc comment that audit events "leak nothing" —
-      false for the `Custom` arm. Local-only today (never reaches a remote-model-prompt or
-      observability-sink destination, so out of scope for *this* fix, which was specifically
-      about text reaching the model); a hard prerequisite for v1.5 telemetry. Still open.
+- [ ] **Audit-log third path — reachability corrected 2026-08-01, this is a real gap, not
+      "local-only."** `vg-audit/src/record.rs:212` serialises `EntityType::Custom(name)` as
+      `{"custom":"<name>"}`, and `vg-cli/src/main.rs:476-478` claims in a doc comment that
+      audit events "leak nothing" — false for the `Custom` arm. A same-model + Codex review
+      of the 2026-08-01 leak fix (docs/decisions.md) found this reachable by the *same*
+      mechanism just closed for `vg diff`/`vg inspect`: a wrapped agent invoking `vg audit`
+      as a shell command reads back whatever JSON is in the log — including the raw class
+      name — as `vg audit` pretty-prints already-serialized log lines verbatim
+      (`vg-cli/src/main.rs:~502`) rather than re-deriving safe display text. Not fixed here,
+      deliberately: `EntityTypeV1` (`vg-audit/src/record.rs`) is a *stored, versioned*
+      serialization format historical audit logs may already depend on, and a same-day
+      change to it under this fix's time pressure risks exactly the kind of undercoordinated
+      addition doubt-driven-development's STOP-and-decompose guidance warns against. Needs
+      its own reviewed change: likely a `CUSTOM` collapse in the serialised form itself (not
+      just at print time, matching the vg-core Display fix's approach) plus an explicit
+      decision on backward-compatibility with any already-written `{"custom":"<name>"}` log
+      lines. A hard prerequisite for v1.5 telemetry regardless. Raised as decision packet
+      material for the launching session's compliance loop.
 - [ ] **Phase 1a** — close the six raw-capable `String` surfaces, land the `interface-contracts`
       v1.4 → v1.5 bump (first bump in the project's history with real downstream callers: 7
       crates, ~221 tests), then `TelemetryEvent` + `TryFrom` in `vg-core`.

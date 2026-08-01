@@ -193,39 +193,18 @@ fn type_tag_for_keying(ty: &EntityType) -> String {
 
 /// The `TYPE_TAG` half of a placeholder's `display` string (`EMAIL_001`, `ACCOUNT_ID_014` —
 /// `README.md`'s own example). Cosmetic only — safe to reformat freely, unlike
-/// [`type_tag_for_keying`]. Written as an explicit match (not a generic
-/// CamelCase-to-SCREAMING_SNAKE_CASE converter) so the exact display prefixes are visible in one
-/// place rather than derived indirectly.
+/// [`type_tag_for_keying`].
+///
+/// **Delegates to `EntityType`'s `Display` impl** (`vg-core/src/types.rs`, fixed
+/// 2026-08-01): that impl is now the single source of truth for the safe, class-name-free
+/// tag, after a Codex/same-model review of this function's original leak fix found two
+/// *other* sites (`vg-cli`'s `vg diff` stderr summary, `vg-adapters-claude`'s stored-pack
+/// stats) independently reaching the same leak by Debug-formatting `EntityType` instead of
+/// calling this crate-private function. Centralising in a public `Display` impl means any
+/// future caller reaching for `{ty}` gets the safe behaviour by default, rather than a
+/// fourth site rediscovering the bug by using `{ty:?}`.
 fn type_tag_for_display(ty: &EntityType) -> String {
-    match ty {
-        EntityType::Person => "PERSON".to_string(),
-        EntityType::Email => "EMAIL".to_string(),
-        EntityType::Phone => "PHONE".to_string(),
-        EntityType::Address => "ADDRESS".to_string(),
-        EntityType::Postcode => "POSTCODE".to_string(),
-        EntityType::EmployeeId => "EMPLOYEE_ID".to_string(),
-        EntityType::CustomerId => "CUSTOMER_ID".to_string(),
-        EntityType::AccountId => "ACCOUNT_ID".to_string(),
-        EntityType::Iban => "IBAN".to_string(),
-        EntityType::SortCode => "SORT_CODE".to_string(),
-        EntityType::InternalIp => "INTERNAL_IP".to_string(),
-        EntityType::Hostname => "HOSTNAME".to_string(),
-        EntityType::ApiKey => "API_KEY".to_string(),
-        EntityType::TraceId => "TRACE_ID".to_string(),
-        EntityType::Password => "PASSWORD".to_string(),
-        EntityType::PrivateKey => "PRIVATE_KEY".to_string(),
-        EntityType::Secret => "SECRET".to_string(),
-        EntityType::AccessToken => "ACCESS_TOKEN".to_string(),
-        // Fixed 2026-08-01: previously rendered the policy-declared custom class name
-        // into the display tag (`CUSTOM_{screaming_snake(name)}`). That name is not
-        // vetted the way the fixed variants above are, so it must never reach a
-        // remote-model-prompt destination -- every custom class collapses to the same
-        // fixed "CUSTOM" tag. `type_tag_for_keying` above is unaffected and still embeds
-        // the raw name, since that string only ever feeds an HMAC digest, never rendered
-        // text. See docs/decisions.md, 2026-07-26 "Custom-entity-label leak: remediation
-        // agreed, NOT implemented".
-        EntityType::Custom(_) => "CUSTOM".to_string(),
-    }
+    ty.to_string()
 }
 
 fn namespace_tag(ns: &Namespace) -> String {
