@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: cargo build --locked
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo build --workspace --locked
+
+  test:
+    name: cargo test --locked
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo test --workspace --locked
+
+  deny:
+    name: cargo-deny check
+    # EmbarkStudios/cargo-deny-action is a Docker container action — container actions
+    # only run on Linux-hosted runners, not macos-latest (confirmed failing in CI
+    # 2026-07-14: "Container action is only supported on Linux" before this fix).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo-audit
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  bench:
+    # Promoted 2026-08-01 (veil-compliance-2026-08-01 loop, ci-proposed/README.md) from
+    # compile-only to a real gate. `vg bench`'s own exit code is its Go/No-Go verdict
+    # (see crates/vg-cli/src/main.rs's cmd_bench) — Go succeeds, NoGo/Incomplete fails
+    # the job, so no separate assertion step is needed.
+    name: vg bench (Go/No-Go gate)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo run --locked -p vg-cli --bin vg -- bench

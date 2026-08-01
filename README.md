@@ -52,7 +52,7 @@ Veil Proxy runs its own Go/No-Go eval harness (`vg bench`) over a synthetic seed
 
 **Two honest caveats on the current state:**
 
-- The **display-collision measurement** (previously 1 corrupted round-trip in 3) is a banked measurement rather than a gate, and has not been re-run since the detector fixes landed. Its current value is unknown, and this README will not quote a stale one.
+- The **display-collision measurement** is a banked measurement rather than a gate: **1 of 3 collision samples still corrupted** (re-run 2026-08-01, unchanged from the 2026-07-22 measurement — the false-positive-rate fix did not touch this code path). `vg bench`'s own recommendation stands: collision-avoiding minting at intern time (skip an ordinal whose display already occurs in the raw buffer), not yet implemented. See `docs/next-actions.md`.
 - A **latent leak is open**: two code paths interpolate a policy-declared custom entity class *name* into the text sent to the model (`vg-core/src/api.rs:450`, `vg-core/src/keying.rs:219`). It is not reachable today because no shipped detector produces a `Custom` finding, but every other layer is wired for it, so it arms the moment one is added. A three-model-reviewed remediation is agreed and not yet implemented. See `docs/architecture/implementation-plan.md`.
 
 ## The VeilGremlin product family

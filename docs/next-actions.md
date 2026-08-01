@@ -125,8 +125,11 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 - [ ] **Separate demask correctness bug, fixed by the same work:** duplicate displays make
       `rehydrate` restore both placeholders to the first secret, and `vg demask`'s partial-restore
       guard misses it (token count goes 2→0 for both bindings), so it **exits 0 silently**.
-- [ ] **Re-run `vg bench`** and bank the current display-collision measurement. The README
-      deliberately quotes no number for it rather than a stale one.
+- [x] ~~Re-run `vg bench` and bank the current display-collision measurement.~~ **DONE
+      2026-08-01** — 1 of 3 collision samples still corrupted, unchanged from the
+      2026-07-22 measurement (see `docs/risks.md` RISK-0004, `README.md`). Collision-
+      avoiding minting at intern time is still not implemented — that's the remaining
+      open item, tracked separately below.
 - [ ] **Audit-log third path**: `vg-audit/src/record.rs:212` serialises `{"custom":"<name>"}`, and
       `vg-cli/src/main.rs:476-478` claims in a doc comment that audit events "leak nothing" —
       false for the `Custom` arm. Local-only today; a hard prerequisite for v1.5 telemetry.
