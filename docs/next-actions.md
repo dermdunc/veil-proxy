@@ -164,3 +164,7 @@ displace it for long.
 ## Session Update: 2026-08-01 — Close the custom-entity-label leak
 
 - [ ] Human reviews and merges PR; A3 still needs to bank vg bench's display-collision number; audit-log third path (record.rs:212) remains open
+
+## Session Update: 2026-08-01 — Close the custom-entity-label leak — full doubt-cycle
+
+- [ ] Human reviews and merges PR #45; audit-log serialization fix needs its own scoped session
