@@ -110,29 +110,44 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 
 ### Now open, in priority order
 
-- [ ] **Remediate the custom-entity-label leak — needs a compiler.** Two paths interpolate a
-      policy-declared custom entity class name into `MaskedPack.text`: `vg-core/src/api.rs:450`
-      (`IrreversibleRedact`/`Block`) and `vg-core/src/keying.rs:219` (`Mask`, the default class).
-      Not reachable today — no shipped detector emits `EntityType::Custom` — but every other
-      layer is wired for it, and the fix is **not retroactive** (`Vault::intern` returns the
-      persisted display), so it must land before any custom detector ships.
-      Three-model-reviewed plan agreed: collapse both to `CUSTOM_NNN` / `[REDACTED:CUSTOM]`,
-      re-key `KeyerState.ordinals` on the rendered display tag, and add a stricter vault unique
-      index collapsing all custom rows into one ordinal domain (the current index at
-      `vg-vault/src/schema.rs:48-49` keys on `COALESCE(entity_custom,'')`, so two concurrent
-      vaults can both mint `CUSTOM_001`). **No migration needed** — verified no `.veilgremlin`
-      state dir or `vault.db` exists on this machine, so no real vault holds custom rows.
-- [ ] **Separate demask correctness bug, fixed by the same work:** duplicate displays make
-      `rehydrate` restore both placeholders to the first secret, and `vg demask`'s partial-restore
-      guard misses it (token count goes 2→0 for both bindings), so it **exits 0 silently**.
-- [ ] **Re-run `vg bench`** and bank the current display-collision measurement. The README
-      deliberately quotes no number for it rather than a stale one.
+- [x] ~~Remediate the custom-entity-label leak — needs a compiler.~~ **FIXED 2026-08-01** —
+      `cargo`/`rustc` are installed (1.96.1, matching `rust-toolchain.toml`); that blocker was
+      stale. Implemented exactly the three-model-reviewed plan: `vg-core/src/api.rs`'s
+      `redaction_marker` and `vg-core/src/keying.rs`'s `type_tag_for_display` both collapse
+      `EntityType::Custom(_)` to a fixed tag (`[REDACTED:CUSTOM]` / `CUSTOM`), `KeyerState.ordinals`
+      re-keys on the rendered display tag instead of the full `EntityType`, and
+      `vg-vault/src/schema.rs`'s unique index collapses `entity_custom` to `''` for every
+      `entity_kind = 'custom'` row via a `CASE` expression. `type_tag_for_keying` (the
+      cryptographic HMAC input, a different function) is unchanged and still embeds the raw
+      name — that string only ever feeds a digest, never rendered text. 6 new regression tests
+      (3 vg-core keying, 2 vg-core api, 1 vg-vault DB-level race test) plus 1 corrected test that
+      previously asserted the leaking behaviour as expected (`keyer_display_uses_custom_dictionary_tag`
+      → `keyer_display_never_carries_the_custom_dictionary_name`). No migration needed, per the
+      prior verification that no `.veilgremlin` state dir or `vault.db` exists on this machine —
+      note this remains true only because no real vault predates the fix; `CREATE INDEX IF NOT
+      EXISTS` would not upgrade an already-created index of the same name.
+- [x] ~~Separate demask correctness bug, fixed by the same work~~ **FIXED 2026-08-01** — duplicate
+      displays (the root cause of the silent `vg demask` exit-0) can no longer be created: the
+      vault's unique ordinal index now rejects a second row that would render to an
+      already-used display string, across custom classes as well as within one.
+- [ ] **Re-run `vg bench`** and bank the current display-collision measurement — still open,
+      scoped to a separate unit (ecosystem compliance-loop A3). Ran once here as a post-fix
+      sanity check: verdict remains **GO**, unrelated FP-rate gates unaffected; display-collision
+      measured at 1 of 3 samples corrupted (a different root cause — see the "T11: collision-
+      avoiding minting" recommendation in `vg bench`'s own output — not banked as part of this
+      item, left for the dedicated unit).
 - [ ] **Audit-log third path**: `vg-audit/src/record.rs:212` serialises `{"custom":"<name>"}`, and
       `vg-cli/src/main.rs:476-478` claims in a doc comment that audit events "leak nothing" —
-      false for the `Custom` arm. Local-only today; a hard prerequisite for v1.5 telemetry.
+      false for the `Custom` arm. Local-only today (never reaches a remote-model-prompt or
+      observability-sink destination, so out of scope for *this* fix, which was specifically
+      about text reaching the model); a hard prerequisite for v1.5 telemetry. Still open.
 - [ ] **Phase 1a** — close the six raw-capable `String` surfaces, land the `interface-contracts`
       v1.4 → v1.5 bump (first bump in the project's history with real downstream callers: 7
       crates, ~221 tests), then `TelemetryEvent` + `TryFrom` in `vg-core`.
 
 M3 (request masking) remains the standing product priority; the leak fix is small and should not
 displace it for long.
+
+## Session Update: 2026-08-01 — Close the custom-entity-label leak
+
+- [ ] Human reviews and merges PR; A3 still needs to bank vg bench's display-collision number; audit-log third path (record.rs:212) remains open

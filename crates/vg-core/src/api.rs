@@ -447,7 +447,14 @@ fn redaction_marker(ty: &EntityType) -> String {
         EntityType::PrivateKey => "PRIVATE_KEY",
         EntityType::Secret => "SECRET",
         EntityType::AccessToken => "ACCESS_TOKEN",
-        EntityType::Custom(name) => return format!("[REDACTED:CUSTOM:{name}]"),
+        // Fixed 2026-08-01: previously interpolated the policy-declared custom entity
+        // class *name* into rendered text (`[REDACTED:CUSTOM:{name}]`). That name is not
+        // vetted the way the fixed EntityType tags above are (a policy author could name
+        // a class after the very thing it exists to protect, e.g. "project-nightingale"),
+        // so it must never reach a remote-model-prompt destination -- collapse to the
+        // same fixed marker every other entity type uses. See docs/decisions.md,
+        // 2026-07-26 "Custom-entity-label leak: remediation agreed, NOT implemented".
+        EntityType::Custom(_) => return "[REDACTED:CUSTOM]".to_string(),
     };
     format!("[REDACTED:{tag}]")
 }
@@ -776,5 +783,32 @@ mod tests {
         assert!(!Destination::LocalPatch.is_hard_deny());
         assert!(!Destination::LocalTestFixture.is_hard_deny());
         assert!(!Destination::LocalExplanationBuffer.is_hard_deny());
+    }
+
+    #[test]
+    fn redaction_marker_never_carries_the_custom_dictionary_name() {
+        // Regression for the custom-entity-label leak (docs/decisions.md,
+        // 2026-07-26 "remediation agreed, NOT implemented" entry, closed
+        // here): a policy-declared custom entity class name interpolated
+        // into `MaskedPack.text` for an IrreversibleRedact/Block value is
+        // exactly the kind of text that can reach a remote-model-prompt
+        // destination. It must collapse to the same fixed marker every
+        // fixed EntityType uses, never carrying the class name.
+        let marker = redaction_marker(&EntityType::Custom("internal-project-codename".to_string()));
+        assert_eq!(marker, "[REDACTED:CUSTOM]");
+        assert!(
+            !marker.to_lowercase().contains("codename")
+                && !marker.to_lowercase().contains("internal-project"),
+            "redaction marker must never leak the custom class name: {marker}"
+        );
+    }
+
+    #[test]
+    fn still_flags_fixed_type_redaction_markers_are_unaffected() {
+        assert_eq!(redaction_marker(&EntityType::Email), "[REDACTED:EMAIL]");
+        assert_eq!(
+            redaction_marker(&EntityType::Password),
+            "[REDACTED:PASSWORD]"
+        );
     }
 }

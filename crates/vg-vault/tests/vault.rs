@@ -314,6 +314,45 @@ fn the_ordinal_unique_guard_fires_for_a_fixed_entity_type_null_entity_custom() {
 }
 
 #[test]
+fn the_ordinal_unique_guard_fires_across_different_custom_classes() {
+    // Regression for the custom-entity-label leak fix (docs/decisions.md, 2026-08-01):
+    // the display tag for every `Custom(name)` value now collapses to a shared "CUSTOM"
+    // prefix regardless of `name` (vg-core::keying), so two *different* custom classes in
+    // the same namespace must share one ordinal domain, not one each -- otherwise two
+    // unrelated values could both mint the literally identical display string
+    // "CUSTOM_001". This is the same race-safety pattern as
+    // `the_ordinal_unique_guard_fires_for_a_fixed_entity_type_null_entity_custom` above,
+    // but across `entity_custom` values instead of within one.
+    let dir = TempDir::new().unwrap();
+    let ns = repo("acme/widgets");
+    let v1 = open(&dir);
+    let v2 = open(&dir); // both reseeded from the (empty) DB: both counters start at 0
+
+    let first = v1
+        .intern(
+            &Secret::new("Project Nightingale".into()),
+            EntityType::Custom("internal-project-codename".to_string()),
+            &ns,
+        )
+        .unwrap();
+    assert_eq!(first.display, "CUSTOM_001");
+
+    // v2's independent Keyer also mints CUSTOM_001 (ordinal 1) for a *different* custom
+    // class in the same namespace; the INSERT must be rejected by the UNIQUE ordinal
+    // guard rather than silently creating a second CUSTOM_001 row that collides in
+    // rendered display text with the first, unrelated value.
+    let second = v2.intern(
+        &Secret::new("Q4 financial forecast".into()),
+        EntityType::Custom("board-material".to_string()),
+        &ns,
+    );
+    assert!(
+        second.is_err(),
+        "a duplicate CUSTOM_001 across two different custom classes must be rejected, got {second:?}"
+    );
+}
+
+#[test]
 fn wrong_key_fails_to_open() {
     let dir = TempDir::new().unwrap();
     {
