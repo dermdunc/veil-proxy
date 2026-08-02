@@ -168,3 +168,7 @@ displace it for long.
 ## Session Update: 2026-08-01 — Close the custom-entity-label leak — full doubt-cycle
 
 - [ ] Human reviews and merges PR #45; audit-log serialization fix needs its own scoped session
+
+## Session Update: 2026-08-01 — Bank display-collision measurement, propose vg-bench CI gate
+
+- [ ] Human reviews and merges PR; install ci-proposed/ci.yml when ready (see its README for the exact command)
