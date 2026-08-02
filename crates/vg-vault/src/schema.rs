@@ -33,9 +33,9 @@ CREATE TABLE IF NOT EXISTS mapping (
     expires_at    INTEGER
 );
 
--- Defends the per-(namespace, entity type) ordinal sequence: two different values must
--- never land on the same display ordinal within one namespace/type, even if a second writer
--- raced the in-memory counter.
+-- Defends the per-(namespace, rendered display tag) ordinal sequence: two different values
+-- must never land on the same display ordinal within one namespace/tag, even if a second
+-- writer raced the in-memory counter.
 --
 -- `COALESCE(entity_custom, '')`, not the bare column, is deliberate (Codex critique,
 -- 2026-07-17): SQLite treats NULL as DISTINCT in a UNIQUE index, and every fixed entity type
@@ -43,10 +43,30 @@ CREATE TABLE IF NOT EXISTS mapping (
 -- did NOT fire for any fixed type — two racing writers could both insert EMAIL_001 for
 -- different secrets in the same namespace, exactly the collision this index exists to stop.
 -- COALESCEing NULL to '' makes all fixed-type rows share one key value, so the UNIQUE
--- constraint applies uniformly. (Custom(name) rows already had a non-null value and were
--- always covered.)
+-- constraint applies uniformly.
+--
+-- The `CASE` collapses `entity_custom` to '' for every `entity_kind = 'custom'` row too
+-- (fixed 2026-08-01, closing the custom-entity-label leak alongside the vg-core display/
+-- redaction-marker fixes): `Custom(name)` values used to keep their own per-name
+-- discriminator here, so two *different* custom classes could each independently mint
+-- ordinal 1 in the same namespace. Since vg-core's display tag for Custom now collapses
+-- to a fixed "CUSTOM" prefix regardless of `name` (the class name must never reach
+-- rendered text), those two rows would then both display as the literally identical
+-- "CUSTOM_001" -- this index must enforce uniqueness across custom classes, not just
+-- within one, to match. Fixed-type rows are unaffected: the CASE is a no-op for them
+-- since their entity_custom is always NULL already.
+--
+-- No migration: `docs/decisions.md` (2026-08-01) verified no `.veilgremlin` state dir or
+-- `vault.db` exists on this machine, so no persisted vault holds pre-fix `entity_kind =
+-- 'custom'` rows. `CREATE INDEX IF NOT EXISTS` is a no-op against an already-created index
+-- of the same name — any vault created before this fix ships would need its index dropped
+-- and recreated, not just a reopen, to pick up the new definition.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mapping_ordinal
-    ON mapping (ns_kind, ns_id, entity_kind, COALESCE(entity_custom, ''), ordinal);
+    ON mapping (
+        ns_kind, ns_id, entity_kind,
+        CASE WHEN entity_kind = 'custom' THEN '' ELSE COALESCE(entity_custom, '') END,
+        ordinal
+    );
 
 -- `resolve`/`purge_expired` lookups.
 CREATE INDEX IF NOT EXISTS idx_mapping_ref ON mapping (mapping_ref);

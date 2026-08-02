@@ -38,6 +38,44 @@ pub enum EntityType {
     Custom(String),
 }
 
+impl std::fmt::Display for EntityType {
+    /// The safe tag for rendering an `EntityType` into user-facing or persisted output
+    /// (CLI summaries, stored-pack stats, placeholder display tags). `Custom` collapses
+    /// to a fixed `"CUSTOM"` tag exactly like every other variant is a fixed tag — the
+    /// policy-dictionary class name must never reach rendered text (closing the
+    /// custom-entity-label leak, 2026-08-01: `{ty:?}` reached both `vg diff`'s stderr
+    /// summary and the stored pack's on-disk stats keys, printing the raw name).
+    ///
+    /// Prefer `{}` over `{:?}` for `EntityType` everywhere outside code that is certain
+    /// its output never leaves the process — `{:?}` (`Debug`) is deliberately left
+    /// leaking the name, as the explicit "I know what I'm doing" escape hatch, not the
+    /// default a caller reaches for out of habit.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = match self {
+            EntityType::Person => "PERSON",
+            EntityType::Email => "EMAIL",
+            EntityType::Phone => "PHONE",
+            EntityType::Address => "ADDRESS",
+            EntityType::Postcode => "POSTCODE",
+            EntityType::EmployeeId => "EMPLOYEE_ID",
+            EntityType::CustomerId => "CUSTOMER_ID",
+            EntityType::AccountId => "ACCOUNT_ID",
+            EntityType::Iban => "IBAN",
+            EntityType::SortCode => "SORT_CODE",
+            EntityType::InternalIp => "INTERNAL_IP",
+            EntityType::Hostname => "HOSTNAME",
+            EntityType::ApiKey => "API_KEY",
+            EntityType::TraceId => "TRACE_ID",
+            EntityType::Password => "PASSWORD",
+            EntityType::PrivateKey => "PRIVATE_KEY",
+            EntityType::Secret => "SECRET",
+            EntityType::AccessToken => "ACCESS_TOKEN",
+            EntityType::Custom(_) => "CUSTOM",
+        };
+        write!(f, "{tag}")
+    }
+}
+
 /// What the policy says to do with a class of entity/artefact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlingClass {
@@ -191,5 +229,28 @@ mod tests {
             policy_version: "v1".to_string(),
         };
         assert_masked_pack_excludes_raw_values(&masked, &["jane.doe@example.com"]);
+    }
+
+    #[test]
+    fn entity_type_display_never_carries_the_custom_dictionary_name() {
+        // Regression for the custom-entity-label leak (docs/decisions.md, 2026-08-01):
+        // `{ty:?}` (Debug) on a Custom variant prints the raw policy-dictionary class
+        // name verbatim -- found reachable via `vg diff`'s stderr summary
+        // (vg-cli/src/main.rs) and the stored pack's stats keys
+        // (vg-adapters-claude/src/pack.rs), both outside the original fix's two sites.
+        // `{ty}` (Display) is the safe default every caller should use instead.
+        let ty = EntityType::Custom("internal-project-codename".to_string());
+        assert_eq!(ty.to_string(), "CUSTOM");
+        assert!(!ty.to_string().to_lowercase().contains("codename"));
+        // Debug remains available and does still leak -- that's the point: Debug is the
+        // explicit "I know what I'm doing, this stays in-process" escape hatch, not the
+        // default any caller reaches for by habit.
+        assert!(format!("{ty:?}").contains("codename"));
+    }
+
+    #[test]
+    fn still_flags_fixed_type_display_is_unaffected() {
+        assert_eq!(EntityType::Email.to_string(), "EMAIL");
+        assert_eq!(EntityType::AccountId.to_string(), "ACCOUNT_ID");
     }
 }
