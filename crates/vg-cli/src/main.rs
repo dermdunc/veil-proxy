@@ -317,15 +317,19 @@ fn cmd_inspect(paths: StatePaths, file: &Path) -> Result<ExitCode, Box<dyn std::
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for f in &findings {
         let class = engine.classify_entity(f.entity_type.clone());
+        // `{f.entity_type}` (Display), never `{:?}` (Debug) -- Debug on a Custom variant
+        // prints the raw policy-dictionary class name verbatim, exactly the leak this
+        // repo closed 2026-08-01 (docs/decisions.md). `class` (HandlingClass) has no
+        // string payload, so `{class:?}` here is unaffected.
         println!(
             "{:<14} {:>5}..{:<5} {:<20} {:>4.2}  {class:?}",
-            format!("{:?}", f.entity_type),
+            f.entity_type.to_string(),
             f.span.start,
             f.span.end,
             f.detector.0,
             f.confidence,
         );
-        *counts.entry(format!("{:?}", f.entity_type)).or_insert(0) += 1;
+        *counts.entry(f.entity_type.to_string()).or_insert(0) += 1;
     }
     println!();
     for (ty, n) in counts {
@@ -362,7 +366,12 @@ fn cmd_diff(paths: StatePaths, file: &Path) -> Result<ExitCode, Box<dyn std::err
         pack.text.len()
     );
     for (ty, n) in &pack.stats.counts.0 {
-        eprintln!("masked {n} x {ty:?}");
+        // `{ty}` (Display), never `{ty:?}` (Debug) -- Debug on a Custom variant prints
+        // the raw policy-dictionary class name verbatim to stderr, exactly the leak
+        // this repo closed 2026-08-01 (docs/decisions.md). Found reachable here
+        // specifically because a wrapped agent invoking `vg diff` as a shell command
+        // can read this stderr output back into its own context.
+        eprintln!("masked {n} x {ty}");
     }
     if pack.bindings.is_empty() {
         eprintln!("no reversible mappings (nothing interned)");

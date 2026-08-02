@@ -193,49 +193,18 @@ fn type_tag_for_keying(ty: &EntityType) -> String {
 
 /// The `TYPE_TAG` half of a placeholder's `display` string (`EMAIL_001`, `ACCOUNT_ID_014` —
 /// `README.md`'s own example). Cosmetic only — safe to reformat freely, unlike
-/// [`type_tag_for_keying`]. Written as an explicit match (not a generic
-/// CamelCase-to-SCREAMING_SNAKE_CASE converter) so the exact display prefixes are visible in one
-/// place rather than derived indirectly.
+/// [`type_tag_for_keying`].
+///
+/// **Delegates to `EntityType`'s `Display` impl** (`vg-core/src/types.rs`, fixed
+/// 2026-08-01): that impl is now the single source of truth for the safe, class-name-free
+/// tag, after a Codex/same-model review of this function's original leak fix found two
+/// *other* sites (`vg-cli`'s `vg diff` stderr summary, `vg-adapters-claude`'s stored-pack
+/// stats) independently reaching the same leak by Debug-formatting `EntityType` instead of
+/// calling this crate-private function. Centralising in a public `Display` impl means any
+/// future caller reaching for `{ty}` gets the safe behaviour by default, rather than a
+/// fourth site rediscovering the bug by using `{ty:?}`.
 fn type_tag_for_display(ty: &EntityType) -> String {
-    match ty {
-        EntityType::Person => "PERSON".to_string(),
-        EntityType::Email => "EMAIL".to_string(),
-        EntityType::Phone => "PHONE".to_string(),
-        EntityType::Address => "ADDRESS".to_string(),
-        EntityType::Postcode => "POSTCODE".to_string(),
-        EntityType::EmployeeId => "EMPLOYEE_ID".to_string(),
-        EntityType::CustomerId => "CUSTOMER_ID".to_string(),
-        EntityType::AccountId => "ACCOUNT_ID".to_string(),
-        EntityType::Iban => "IBAN".to_string(),
-        EntityType::SortCode => "SORT_CODE".to_string(),
-        EntityType::InternalIp => "INTERNAL_IP".to_string(),
-        EntityType::Hostname => "HOSTNAME".to_string(),
-        EntityType::ApiKey => "API_KEY".to_string(),
-        EntityType::TraceId => "TRACE_ID".to_string(),
-        EntityType::Password => "PASSWORD".to_string(),
-        EntityType::PrivateKey => "PRIVATE_KEY".to_string(),
-        EntityType::Secret => "SECRET".to_string(),
-        EntityType::AccessToken => "ACCESS_TOKEN".to_string(),
-        EntityType::Custom(name) => format!("CUSTOM_{}", screaming_snake(name)),
-    }
-}
-
-/// Upper-cases `s` and collapses any run of non-alphanumeric characters to a single `_`,
-/// trimming leading/trailing underscores — turns a policy-dictionary class name like
-/// `"internal-project-codename"` into `INTERNAL_PROJECT_CODENAME`.
-fn screaming_snake(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else if !out.ends_with('_') && !out.is_empty() {
-            out.push('_');
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    out
+    ty.to_string()
 }
 
 fn namespace_tag(ns: &Namespace) -> String {
@@ -259,7 +228,15 @@ pub struct Keyed {
 #[derive(Default)]
 struct KeyerState {
     cache: HashMap<(String, EntityType, Namespace), Keyed>,
-    ordinals: HashMap<(Namespace, EntityType), u64>,
+    // Keyed on the *rendered display tag* (`type_tag_for_display`), not the full
+    // `EntityType`. This is deliberate, not incidental: every fixed variant's display
+    // tag already uniquely identifies it, so this is a no-op for them, but it collapses
+    // all `Custom(name)` values onto one shared ordinal domain per namespace regardless
+    // of `name` -- required so the collapsed "CUSTOM" display tag (see
+    // `type_tag_for_display`) can never produce two different values both claiming
+    // "CUSTOM_001" in the same namespace. Fixed 2026-08-01, closing the custom-entity-
+    // label leak alongside the display-tag and redaction-marker fixes.
+    ordinals: HashMap<(Namespace, String), u64>,
 }
 
 /// Session-scoped keyer: wraps [`placeholder_key`] with the ordinal assignment (item 3) and
@@ -294,13 +271,14 @@ impl Keyer {
         }
 
         let key = placeholder_key(&self.salt, &canonical, &ty, ns);
-        let ordinal_key = (ns.clone(), ty.clone());
+        let display_tag = type_tag_for_display(&ty);
+        let ordinal_key = (ns.clone(), display_tag.clone());
         let ordinal = {
             let counter = state.ordinals.entry(ordinal_key).or_insert(0);
             *counter += 1;
             *counter
         };
-        let display = format!("{}_{ordinal:03}", type_tag_for_display(&ty));
+        let display = format!("{display_tag}_{ordinal:03}");
 
         let keyed = Keyed {
             key,
@@ -311,8 +289,8 @@ impl Keyer {
         keyed
     }
 
-    /// Reseeds the per-`(Namespace, EntityType)` ordinal counter so the next ordinal
-    /// [`key_for`](Self::key_for) hands out for `(ns, ty)` is strictly greater than
+    /// Reseeds the per-`(Namespace, rendered display tag)` ordinal counter so the next
+    /// ordinal [`key_for`](Self::key_for) hands out for `(ns, ty)` is strictly greater than
     /// `max_ordinal`.
     ///
     /// A **persistent** `VaultStore` (Task T05, `vg-vault`) calls this at construction for
@@ -332,7 +310,8 @@ impl Keyer {
     /// short-circuit before `key_for` is ever called for it), not re-minted here.
     pub fn seed_ordinal(&self, ns: &Namespace, ty: &EntityType, max_ordinal: u64) {
         let mut state = self.state.lock().expect("Keyer mutex poisoned");
-        let counter = state.ordinals.entry((ns.clone(), ty.clone())).or_insert(0);
+        let key = (ns.clone(), type_tag_for_display(ty));
+        let counter = state.ordinals.entry(key).or_insert(0);
         *counter = (*counter).max(max_ordinal);
     }
 }
@@ -545,7 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn keyer_display_uses_custom_dictionary_tag() {
+    fn keyer_display_never_carries_the_custom_dictionary_name() {
+        // Regression for the custom-entity-label leak (docs/decisions.md,
+        // 2026-07-26 "remediation agreed, NOT implemented" entry, closed
+        // here): a policy-declared custom entity class name (which may
+        // itself be enterprise-sensitive, e.g. a project codename) must
+        // never appear in text that reaches a remote-model-prompt
+        // destination. The display tag collapses to a fixed "CUSTOM" tag
+        // for every custom class, same as every other fixed EntityType.
         let keyer = Keyer::new(b"salt".to_vec());
         let n = ns("acme/widgets");
         let keyed = keyer.key_for(
@@ -553,7 +539,63 @@ mod tests {
             EntityType::Custom("internal-project-codename".to_string()),
             &n,
         );
-        assert_eq!(keyed.display, "CUSTOM_INTERNAL_PROJECT_CODENAME_001");
+        assert_eq!(keyed.display, "CUSTOM_001");
+        assert!(
+            !keyed.display.to_lowercase().contains("nightingale")
+                && !keyed.display.to_lowercase().contains("codename"),
+            "display must never leak the custom class name or the raw value: {}",
+            keyed.display
+        );
+    }
+
+    #[test]
+    fn distinct_custom_classes_share_one_ordinal_domain_in_display() {
+        // Regression for the same leak: before the fix, each distinct
+        // Custom(name) got its own ordinal counter (keyed on the full
+        // EntityType, name included), so two different custom classes in
+        // the same namespace both minted "..._001" -- and once the display
+        // tag collapses to a shared "CUSTOM" prefix, that would have
+        // produced two literally identical, colliding display strings
+        // ("CUSTOM_001" for two different underlying values). Re-keying
+        // KeyerState.ordinals on the rendered display tag instead of the
+        // full EntityType makes the two classes share one ordinal
+        // sequence, so they get CUSTOM_001 and CUSTOM_002 -- distinguishable,
+        // not colliding.
+        let keyer = Keyer::new(b"salt".to_vec());
+        let n = ns("acme/widgets");
+        let a = keyer.key_for(
+            "Project Nightingale",
+            EntityType::Custom("internal-project-codename".to_string()),
+            &n,
+        );
+        let b = keyer.key_for(
+            "Q4 financial forecast",
+            EntityType::Custom("board-material".to_string()),
+            &n,
+        );
+        assert_eq!(a.display, "CUSTOM_001");
+        assert_eq!(b.display, "CUSTOM_002");
+        assert_ne!(
+            a.display, b.display,
+            "two different custom classes must never mint the same display tag"
+        );
+    }
+
+    #[test]
+    fn still_flags_fixed_type_ordinals_stay_independent_after_the_rekey() {
+        // Recall guard paired with the two tests above: re-keying ordinals
+        // on the rendered display tag must not accidentally merge
+        // unrelated fixed entity types into one counter (they already have
+        // distinct, stable display tags, so this should be a no-op for
+        // them -- verifying it explicitly rather than assuming it).
+        let keyer = Keyer::new(b"salt".to_vec());
+        let n = ns("acme/widgets");
+        let email = keyer.key_for("a@example.com", EntityType::Email, &n);
+        let account = keyer.key_for("acct-1", EntityType::AccountId, &n);
+        let email2 = keyer.key_for("b@example.com", EntityType::Email, &n);
+        assert_eq!(email.display, "EMAIL_001");
+        assert_eq!(account.display, "ACCOUNT_ID_001");
+        assert_eq!(email2.display, "EMAIL_002");
     }
 
     #[test]

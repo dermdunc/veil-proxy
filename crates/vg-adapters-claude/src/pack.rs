@@ -132,12 +132,17 @@ impl StoredPack {
                 mapping_ref: b.mapping_ref.0.to_string(),
             })
             .collect();
+        // `{ty}` (Display), never `{ty:?}` (Debug) -- Debug on a Custom variant would
+        // serialise the raw policy-dictionary class name into this on-disk pack JSON,
+        // exactly the leak this repo closed 2026-08-01 (docs/decisions.md). This
+        // struct's own doc comment below claims these stats are "redaction-safe";
+        // that claim was false for Custom until this fix.
         let counts = pack
             .stats
             .counts
             .0
             .iter()
-            .map(|(ty, n)| (format!("{ty:?}"), *n))
+            .map(|(ty, n)| (ty.to_string(), *n))
             .collect();
         Self {
             schema_version: PACK_SCHEMA_VERSION,
