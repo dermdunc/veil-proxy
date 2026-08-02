@@ -140,6 +140,10 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 M3 (request masking) remains the standing product priority; the leak fix is small and should not
 displace it for long.
 
+## Session Update: 2026-08-01 — Cross-link unified regulatory control register
+
+- [ ] Human reviews and merges PR #44; Lane B decision packets B1-B9 follow
+
 ## Session Update: 2026-08-01 — Bank display-collision measurement, propose vg-bench CI gate
 
 - [ ] Human reviews and merges PR; install ci-proposed/ci.yml when ready (see its README for the exact command)
