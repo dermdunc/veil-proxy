@@ -161,9 +161,9 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 M3 (request masking) remains the standing product priority; the leak fix is small and should not
 displace it for long.
 
-## Session Update: 2026-08-01 — Close the custom-entity-label leak
+## Session Update: 2026-08-01 — Cross-link unified regulatory control register
 
-- [ ] Human reviews and merges PR; A3 still needs to bank vg bench's display-collision number; audit-log third path (record.rs:212) remains open
+- [ ] Human reviews and merges PR #44; Lane B decision packets B1-B9 follow
 
 ## Session Update: 2026-08-01 — Close the custom-entity-label leak — full doubt-cycle
 

@@ -2890,3 +2890,4 @@ the reasoning trail stays intact.
 
 - **Attestation is mTLS device certificates** — `veil-custodian` ADR-A. Closes `product-family.md` §10 Q7.
 - **Retention is a 24-hour hot tier feeding S3**, with lifecycle tiering for regulatory hot and cold archive — `veil-custodian` ADR-B.
+- **Unified regulatory control register lives in `veil-observatory`** (`docs/compliance/control-register.md`, 2026-08-01) — merges this repo's GDPR Art. 5/25/32 mapping table (`docs/spec/requirements-and-design-spec.md`) with `veil-observatory`'s traceability map into one register covering EU AI Act, GDPR, and FCA/UK financial services for the whole family. FCA is added as an explicit, near-total gap (SYSC/SS1-23/SMCR/DORA had zero prior occurrences anywhere in the family). Not a compliance claim — RISK-0009 below stays Open.
