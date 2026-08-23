@@ -92,7 +92,19 @@ fn all_audit_variants_currently_reject_with_the_expected_reason() {
             variant: "MappingCreated",
             decision_ref: "Q8",
         },
-        TelemetryReject::RequiresReasonDictionary { variant: "Block" },
+        // The fixture's Block reason ("policy rule prod-secrets-001", below) is
+        // deliberately unrecognized by `telemetry::block_reason`'s registry, so this
+        // arm's own reason-classification check (added as a doubt-driven-development
+        // fix -- see `mod.rs`'s `Block` arm) reports `UnrecognizedReason`, not
+        // `RequiresEnvelopeConstruction`. The latter is only ever returned for a
+        // *recognized* reason -- see
+        // `edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose`
+        // below for that case.
+        TelemetryReject::UnrecognizedReason {
+            variant: "Block",
+            field: "reason",
+            reason: "no registered BlockReason matched this AuditEvent::Block.reason string",
+        },
         TelemetryReject::RequiresActorPseudonymization {
             variant: "DemaskRequest",
         },
@@ -280,23 +292,68 @@ fn artefact_kind_id_collapses_source_code_language_names() {
 /// itself resolve for exactly the same reason `TryFrom<&AuditEvent>` already does — a
 /// direct consistency check between the two entry points, not just independent coverage
 /// of each.
+///
+/// `Block` is excluded from this generic loop, not because the two entry points always
+/// disagree on it (for `one_of_each_audit_variant`'s specific unrecognized-reason
+/// fixture, they actually still match — both now report `UnrecognizedReason`), but
+/// because they diverge for a *recognized* reason specifically (`try_from_audit_event`
+/// resolves it for real; the frozen `TryFrom` still can't, for an unrelated reason —
+/// envelope construction), and coupling this generic loop to which case the shared
+/// fixture happens to exercise would be fragile. See
+/// `edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose`
+/// below for the recognized-reason divergence stated explicitly, and
+/// `edge_event_block_rejects_an_unrecognized_reason_string` for the unrecognized case
+/// (where the two entry points do, in fact, still agree).
 #[test]
 fn edge_event_matches_try_from_reject_reasons_for_variants_it_cannot_resolve() {
     let key = ActorPseudonymKey::from_bytes([9u8; 32]);
     for event in one_of_each_audit_variant() {
         if matches!(
             event,
-            AuditEvent::DemaskRequest { .. } | AuditEvent::DemaskDecision { .. }
+            AuditEvent::DemaskRequest { .. }
+                | AuditEvent::DemaskDecision { .. }
+                | AuditEvent::Block { .. }
         ) {
             continue;
         }
         let want = expect_reject(TelemetryEvent::try_from(&event));
         let got = match EdgeEvent::try_from_audit_event(&event, &key) {
             Err(reject) => reject,
-            Ok(_) => panic!("expected EdgeEvent::try_from_audit_event to reject Scan/PolicyDecision/Block/MappingCreated"),
+            Ok(_) => panic!(
+                "expected EdgeEvent::try_from_audit_event to reject Scan/PolicyDecision/MappingCreated"
+            ),
         };
         assert_eq!(got, want);
     }
+}
+
+/// The asymmetry the test above deliberately carves out, stated explicitly rather than
+/// left implicit: `try_from_audit_event` resolves a *recognized* `Block` reason to
+/// `Ok`, while the frozen, keyless `TryFrom<&AuditEvent>` rejects the identical event —
+/// not because the two disagree about the reason dictionary, but because the frozen
+/// path additionally needs `Envelope`/`Integrity` construction (still custodian-blocked)
+/// that this narrower entry point doesn't attempt to provide either. Both facts true at
+/// once, on the same input.
+#[test]
+fn edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose() {
+    let key = ActorPseudonymKey::from_bytes([9u8; 32]);
+    let event = AuditEvent::Block {
+        artefact: ArtefactKind::EnvFile,
+        // Mirrors `BlockReason::ARTEFACT_POLICY_BLOCK_TEXT` (`telemetry::block_reason`,
+        // `pub(crate)` — not reachable from this integration-test crate). Duplicating
+        // the literal here is an accepted, low-risk trade-off: a drift between the two
+        // would make this specific test fail loudly (`try_from_audit_event` no longer
+        // `Ok`), not silently pass with the wrong behavior, and adding a `pub` test-only
+        // accessor just for this one assertion was judged not worth expanding the
+        // public API surface for.
+        reason: "artefact class is Block in resolved policy".to_string(),
+    };
+
+    assert!(EdgeEvent::try_from_audit_event(&event, &key).is_ok());
+    assert_eq!(
+        expect_reject(TelemetryEvent::try_from(&event)),
+        TelemetryReject::RequiresEnvelopeConstruction { variant: "Block" }
+    );
 }
 
 #[test]
@@ -369,4 +426,43 @@ fn edge_event_demask_decision_rejects_an_invalid_policy_version_even_with_a_vali
             reason: "not a valid VersionToken",
         }
     );
+}
+
+/// `Block.reason` values outside the code-defined registry (`telemetry::block_reason`)
+/// reject with `UnrecognizedReason`, not a silent default or a panic — including the
+/// empty string and a near-miss of the one recognized text (this fixture's own
+/// `one_of_each_audit_variant` deliberately uses a *different*, unrecognized reason —
+/// "policy rule prod-secrets-001" — precisely so this file's other tests exercise the
+/// honest-reject path by default, not the newly-added success path).
+#[test]
+fn edge_event_block_rejects_an_unrecognized_reason_string() {
+    let key = ActorPseudonymKey::from_bytes([9u8; 32]);
+    for reason in [
+        "policy rule prod-secrets-001",
+        "",
+        "artefact class is Block in resolved Policy", // capitalization differs
+    ] {
+        let event = AuditEvent::Block {
+            artefact: ArtefactKind::EnvFile,
+            reason: reason.to_string(),
+        };
+        let got = match EdgeEvent::try_from_audit_event(&event, &key) {
+            Err(reject) => reject,
+            Ok(_) => panic!("expected {reason:?} to be rejected as unrecognized"),
+        };
+        assert_eq!(
+            got,
+            TelemetryReject::UnrecognizedReason {
+                variant: "Block",
+                field: "reason",
+                reason: "no registered BlockReason matched this AuditEvent::Block.reason string",
+            }
+        );
+        // For an *unrecognized* reason specifically, the two entry points agree (both
+        // report `UnrecognizedReason`) -- they only diverge for a recognized one (see
+        // `edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose`).
+        // Backs up the claim in this test's own module-level consistency-check doc
+        // comment above, rather than leaving it asserted only in prose.
+        assert_eq!(expect_reject(TelemetryEvent::try_from(&event)), got);
+    }
 }

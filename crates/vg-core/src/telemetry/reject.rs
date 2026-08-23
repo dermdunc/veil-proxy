@@ -1,9 +1,11 @@
-//! [`TelemetryReject`] — why `TryFrom<&AuditEvent> for TelemetryEvent` declined to
-//! convert a given audit event. `Clone, PartialEq, Eq` like
-//! [`crate::error::RehydrateDenied`] (a `pub struct`, not an enum — an earlier draft of
-//! this doc claimed a shape match that didn't exist); this is a per-cause `enum`
-//! instead, since there are four distinct reasons a conversion currently fails and
-//! callers/tests need to tell them apart.
+//! [`TelemetryReject`] — why `TryFrom<&AuditEvent> for TelemetryEvent` (and, since
+//! Phase 1, `EdgeEvent::try_from_audit_event` too) declined to convert a given audit
+//! event. `Clone, PartialEq, Eq` like [`crate::error::RehydrateDenied`] (a `pub struct`,
+//! not an enum — an earlier draft of this doc claimed a shape match that didn't exist);
+//! this is a per-cause `enum` instead, since callers/tests need to tell distinct
+//! rejection reasons apart. Deliberately not a fixed count in this doc comment (an
+//! earlier version said "four," which drifted stale as soon as a fifth variant landed)
+//! — see the enum's own variant list for the current, authoritative set.
 
 use thiserror::Error;
 
@@ -19,16 +21,6 @@ pub enum TelemetryReject {
     /// `telemetry::mod`'s module doc).
     #[error("{variant} requires trace-scoped aggregation, not yet implemented")]
     RequiresAggregation { variant: &'static str },
-
-    /// `Block` needs its free-text `reason: String` converted to a `ReasonCode` via a
-    /// versioned reason dictionary — not yet built
-    /// (`telemetry::ids::ReasonCode`'s doc, `telemetry-receipt-reconciliation-plan.md`
-    /// §5). **Not an aggregation gap**: every current production `Block` fires pre-send
-    /// (`crates/vg-core/src/api.rs`'s artefact-level block runs before parsing/sending),
-    /// so it maps directly to `EdgeEvent::BlockedAttempt`, which carries no trace
-    /// linkage and needs none — the reason dictionary is the only thing missing.
-    #[error("{variant} requires the reason dictionary, not yet implemented")]
-    RequiresReasonDictionary { variant: &'static str },
 
     /// `DemaskRequest`/`DemaskDecision` need a pseudonymized actor identity to become an
     /// `EdgeEvent::DemaskRequest`/`EdgeEvent::DemaskDecision` — `ActorId` is still a raw
@@ -71,4 +63,41 @@ pub enum TelemetryReject {
         field: &'static str,
         reason: &'static str,
     },
+
+    /// A free-text field that does not match any entry in a code-defined lookup
+    /// registry — e.g. `Block.reason: String` failing to match
+    /// `telemetry::block_reason::BlockReason::classify`'s known set of exact reason
+    /// strings. Distinct from [`InvalidField`](Self::InvalidField): `InvalidField` is
+    /// for a value that fails a *structural* check (a charset, a length bound);
+    /// `UnrecognizedReason` is for a value that is well-formed but simply isn't one of
+    /// the finitely many reasons this crate currently knows how to name — most likely
+    /// because a new `AuditEvent`-producing call site was added without registering its
+    /// reason. `reason` here is a static description of *what kind of thing* failed to
+    /// match, never the raw input string — this boundary refuses free-text pass-through
+    /// by construction, not by checking case-by-case whether a given string happens to
+    /// be safe to echo.
+    #[error("{variant}.{field} did not match a known reason: {reason}")]
+    UnrecognizedReason {
+        variant: &'static str,
+        field: &'static str,
+        reason: &'static str,
+    },
+
+    /// The variant's own payload genuinely *would* resolve — every other check (e.g.
+    /// `Block.reason` matching a registered [`UnrecognizedReason`](Self::UnrecognizedReason)-free
+    /// entry) has already passed — but a full `TelemetryEvent` still can't be built
+    /// because `Envelope`/`Integrity` construction (timestamps, sequence, signing) isn't
+    /// available yet, gated on `veil-custodian`'s device signing key, unbuilt. Only
+    /// returned when the payload-level check truly passed first — a doubt-driven-
+    /// development round caught an earlier draft returning this unconditionally for
+    /// every `Block`, which was false for an unrecognized reason (that case would never
+    /// resolve, envelope construction or not; see `Block`'s own arm in
+    /// `impl TryFrom<&AuditEvent> for TelemetryEvent`, which now checks first and
+    /// returns [`UnrecognizedReason`](Self::UnrecognizedReason) instead when that's the
+    /// real blocker). Exists so the frozen `TryFrom<&AuditEvent>`'s rejects stay
+    /// *accurate* even though its function *signature* itself can never change
+    /// (`docs/decisions.md:2883`) — nothing stops it from returning a different, correct
+    /// `TelemetryReject` variant.
+    #[error("{variant} would resolve, but Envelope/Integrity construction is not available yet")]
+    RequiresEnvelopeConstruction { variant: &'static str },
 }
