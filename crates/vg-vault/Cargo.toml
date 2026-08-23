@@ -34,6 +34,11 @@ keyring = { version = "2", default-features = false, features = [
 ] }
 uuid = { version = "1", features = ["v4"] }
 getrandom = "0.2"
+# Zeroizes the plaintext-hex encode/decode intermediates in keychain.rs (a
+# doubt-driven-development finding: the final [u8; 32] key crosses this crate's boundary
+# unwrapped by design — see keychain.rs's doc comments — but the hex String/Vec<u8> this
+# crate builds along the way had no zeroize coverage at all).
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

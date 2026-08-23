@@ -13,8 +13,9 @@
 
 use uuid::Uuid;
 use vg_core::telemetry::{
-    AlertRuleId, ArtefactKindId, DetectorSetId, DeviceRef, DeviceRefError, EntityClassId,
-    ExceptionRuleId, KeyRef, RegistryRef, TelemetryEvent, TelemetryReject, TenantId, VersionToken,
+    ActorPseudonymKey, AlertRuleId, ArtefactKindId, DetectorSetId, DeviceRef, DeviceRefError,
+    EdgeEvent, EntityClassId, ExceptionRuleId, KeyRef, RegistryRef, TelemetryEvent,
+    TelemetryReject, TenantId, VersionToken,
 };
 use vg_core::{
     conformance::assert_telemetry_token_rejects_raw_value, ActorId, ArtefactKind, AuditEvent,
@@ -270,4 +271,102 @@ fn artefact_kind_id_collapses_source_code_language_names() {
     let kind = ArtefactKind::SourceCode("python".to_string());
     let class = ArtefactKindId::from(&kind);
     assert!(class == ArtefactKindId::SourceCode);
+}
+
+// -- EdgeEvent::try_from_audit_event --
+
+/// `EdgeEvent::try_from_audit_event` is a second conversion entry point (has an actor
+/// key, `TryFrom<&AuditEvent>` never does), but must reject every variant it cannot
+/// itself resolve for exactly the same reason `TryFrom<&AuditEvent>` already does — a
+/// direct consistency check between the two entry points, not just independent coverage
+/// of each.
+#[test]
+fn edge_event_matches_try_from_reject_reasons_for_variants_it_cannot_resolve() {
+    let key = ActorPseudonymKey::from_bytes([9u8; 32]);
+    for event in one_of_each_audit_variant() {
+        if matches!(
+            event,
+            AuditEvent::DemaskRequest { .. } | AuditEvent::DemaskDecision { .. }
+        ) {
+            continue;
+        }
+        let want = expect_reject(TelemetryEvent::try_from(&event));
+        let got = match EdgeEvent::try_from_audit_event(&event, &key) {
+            Err(reject) => reject,
+            Ok(_) => panic!("expected EdgeEvent::try_from_audit_event to reject Scan/PolicyDecision/Block/MappingCreated"),
+        };
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn edge_event_resolves_demask_request_given_an_actor_key() {
+    let key = ActorPseudonymKey::from_bytes([1u8; 32]);
+    let event = AuditEvent::DemaskRequest {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId("jane.doe".to_string()),
+    };
+    assert!(EdgeEvent::try_from_audit_event(&event, &key).is_ok());
+}
+
+#[test]
+fn edge_event_resolves_demask_decision_given_an_actor_key_and_valid_policy_version() {
+    let key = ActorPseudonymKey::from_bytes([1u8; 32]);
+    let event = AuditEvent::DemaskDecision {
+        dest: Destination::ObservabilitySink,
+        actor: ActorId("jane.doe".to_string()),
+        allowed: true,
+        policy_version: "policy-v1".to_string(),
+    };
+    assert!(EdgeEvent::try_from_audit_event(&event, &key).is_ok());
+}
+
+#[test]
+fn edge_event_demask_request_pseudonym_is_deterministic_for_the_same_key_and_actor() {
+    let key = ActorPseudonymKey::from_bytes([1u8; 32]);
+    let event = AuditEvent::DemaskRequest {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId("jane.doe".to_string()),
+    };
+    let a = EdgeEvent::try_from_audit_event(&event, &key).unwrap();
+    let b = EdgeEvent::try_from_audit_event(&event, &key).unwrap();
+    assert!(a == b);
+}
+
+#[test]
+fn edge_event_demask_request_pseudonym_differs_for_a_different_key() {
+    let event = AuditEvent::DemaskRequest {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId("jane.doe".to_string()),
+    };
+    let a =
+        EdgeEvent::try_from_audit_event(&event, &ActorPseudonymKey::from_bytes([1u8; 32])).unwrap();
+    let b =
+        EdgeEvent::try_from_audit_event(&event, &ActorPseudonymKey::from_bytes([2u8; 32])).unwrap();
+    assert!(a != b);
+}
+
+/// `DemaskDecision`'s `policy_version: String -> VersionToken` failure is a distinct,
+/// actor-key-independent reject reason — a valid actor key does not fix it.
+#[test]
+fn edge_event_demask_decision_rejects_an_invalid_policy_version_even_with_a_valid_key() {
+    let key = ActorPseudonymKey::from_bytes([1u8; 32]);
+    let event = AuditEvent::DemaskDecision {
+        dest: Destination::ObservabilitySink,
+        actor: ActorId("jane.doe".to_string()),
+        allowed: true,
+        policy_version: "has spaces".to_string(),
+    };
+    let got = match EdgeEvent::try_from_audit_event(&event, &key) {
+        Err(reject) => reject,
+        Ok(_) => panic!("expected rejection for an invalid policy_version"),
+    };
+    assert_eq!(
+        got,
+        TelemetryReject::InvalidField {
+            variant: "DemaskDecision",
+            field: "policy_version",
+            reason: "not a valid VersionToken",
+        }
+    );
 }

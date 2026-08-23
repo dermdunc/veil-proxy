@@ -76,6 +76,7 @@ mod alert;
 mod edge_event;
 mod envelope;
 mod ids;
+mod pseudonymize;
 mod receipt;
 mod reject;
 
@@ -87,6 +88,7 @@ pub use ids::{
     EntityClassId, ExceptionRuleId, KeyRef, ReasonCode, RecordId, RegistryRef, TenantId,
     TokenError, TraceId, VersionToken,
 };
+pub use pseudonymize::ActorPseudonymKey;
 pub use receipt::{
     Action, Controls, ControlsInvariantError, Detection, Outcome, Receipt, TimingInvariantError,
     TraceLinkage,
@@ -236,6 +238,15 @@ impl TryFrom<&AuditEvent> for TelemetryEvent {
                     variant: "DemaskRequest",
                 })
             }
+            // Known residual (doubt-driven-development finding, not fixable here — this
+            // signature is frozen, `docs/decisions.md:2883`): now that
+            // `EdgeEvent::try_from_audit_event` can distinguish "needs a key"
+            // (`RequiresActorPseudonymization`) from "policy_version is independently
+            // malformed" (`TelemetryReject::InvalidField`), this arm's blanket
+            // `RequiresActorPseudonymization` is a slight overstatement for a
+            // `DemaskDecision` whose `policy_version` would fail conversion regardless
+            // of the actor key. A caller using only this bare `TryFrom` cannot see that
+            // distinction; one using `EdgeEvent::try_from_audit_event` can.
             AuditEvent::DemaskDecision { .. } => {
                 Err(TelemetryReject::RequiresActorPseudonymization {
                     variant: "DemaskDecision",

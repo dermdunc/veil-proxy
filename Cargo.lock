@@ -1434,6 +1434,7 @@ dependencies = [
  "tempfile",
  "uuid",
  "vg-core",
+ "zeroize",
 ]
 
 [[package]]

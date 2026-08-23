@@ -36,7 +36,10 @@
 //! `telemetry::ids`'s module doc for why.
 
 use super::ids::{ActorPseudonym, ArtefactKindId, ReasonCode, VersionToken};
+use super::pseudonymize::{pseudonymize_actor, ActorPseudonymKey};
+use super::reject::TelemetryReject;
 use crate::api::Destination;
+use crate::audit::AuditEvent;
 
 /// Mirrors `AuditEvent::DemaskRequest`'s fields exactly (`dest`, `actor`).
 #[derive(Clone, PartialEq, Eq)]
@@ -133,6 +136,74 @@ impl EdgeEvent {
 
     pub(crate) fn new_blocked_attempt(artefact: ArtefactKindId, reason: ReasonCode) -> Self {
         Self::BlockedAttempt(BlockedAttemptPayload::new(artefact, reason))
+    }
+
+    /// A second conversion entry point, alongside (not replacing)
+    /// `TryFrom<&AuditEvent> for TelemetryEvent` (`telemetry::mod`): that bare `TryFrom`
+    /// can never take a key parameter (its signature is frozen, `docs/decisions.md:2883`),
+    /// so it can never produce `Ok` for `DemaskRequest`/`DemaskDecision` no matter what
+    /// gaps close elsewhere. This function takes the missing ingredient — an
+    /// [`ActorPseudonymKey`] — directly, and so *can* produce those two payloads for
+    /// real. It has strictly more context than `TryFrom`, never less: every other
+    /// `AuditEvent` variant rejects here with exactly the same [`TelemetryReject`] value
+    /// `TryFrom<&AuditEvent>` already returns for it (see
+    /// `crates/vg-core/tests/telemetry.rs` for a direct consistency check between the
+    /// two entry points) — nothing becomes constructible here that `TryFrom` would
+    /// reject for a reason unrelated to the actor key.
+    ///
+    /// Exhaustive over all six `AuditEvent` variants, no wildcard arm — same rule as
+    /// `TryFrom<&AuditEvent>`, for the same reason (`AuditEvent` is `#[non_exhaustive]`;
+    /// a wildcard here would silently swallow a future seventh variant instead of
+    /// forcing a reviewed touchpoint).
+    pub fn try_from_audit_event(
+        event: &AuditEvent,
+        actor_key: &ActorPseudonymKey,
+    ) -> Result<Self, TelemetryReject> {
+        match event {
+            AuditEvent::DemaskRequest { dest, actor } => Ok(Self::new_demask_request(
+                dest.clone(),
+                pseudonymize_actor(actor_key, actor),
+            )),
+            AuditEvent::DemaskDecision {
+                dest,
+                actor,
+                allowed,
+                policy_version,
+            } => {
+                // policy_version: String -> VersionToken can itself fail (bounded-token
+                // charset) -- a distinct, actor-key-independent failure mode, so it gets
+                // its own reject reason (`InvalidField`) rather than being folded into
+                // `RequiresActorPseudonymization`, which would wrongly imply a valid
+                // actor key alone would fix it.
+                let policy_version =
+                    VersionToken::try_from(policy_version.as_str()).map_err(|_| {
+                        TelemetryReject::InvalidField {
+                            variant: "DemaskDecision",
+                            field: "policy_version",
+                            reason: "not a valid VersionToken",
+                        }
+                    })?;
+                Ok(Self::new_demask_decision(
+                    dest.clone(),
+                    pseudonymize_actor(actor_key, actor),
+                    *allowed,
+                    policy_version,
+                ))
+            }
+            AuditEvent::Scan { .. } => {
+                Err(TelemetryReject::RequiresAggregation { variant: "Scan" })
+            }
+            AuditEvent::PolicyDecision { .. } => Err(TelemetryReject::RequiresAggregation {
+                variant: "PolicyDecision",
+            }),
+            AuditEvent::Block { .. } => {
+                Err(TelemetryReject::RequiresReasonDictionary { variant: "Block" })
+            }
+            AuditEvent::MappingCreated { .. } => Err(TelemetryReject::DeferredByDefault {
+                variant: "MappingCreated",
+                decision_ref: "Q8",
+            }),
+        }
     }
 }
 
