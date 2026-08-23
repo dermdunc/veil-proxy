@@ -154,7 +154,9 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       decision on backward-compatibility with any already-written `{"custom":"<name>"}` log
       lines. A hard prerequisite for v1.5 telemetry regardless. Raised as decision packet
       material for the launching session's compliance loop.
-- [x] ~~Phase 1a, `TelemetryEvent` + `TryFrom` in `vg-core`~~ **Built 2026-08-23** —
+- [x] ~~Phase 1a, `TelemetryEvent` + `TryFrom` in `vg-core`~~ **Built 2026-08-23, PR #47
+      (`https://github.com/dermdunc/veilgremlin/pull/47`), not yet merged — awaiting human
+      review, deliberately not self-merged given this is new public `vg-core` surface.** —
       `crates/vg-core/src/telemetry/` (envelope + `Receipt`/`Alert`/`EdgeEvent`, the §3.2a type
       inventory, `TryFrom<&AuditEvent>` exhaustive with no wildcard arm), `interface-contracts.md`
       bumped to v1.5 (§7a), `implementation-plan.md` §3.2-3.4 rewritten to match what was actually
