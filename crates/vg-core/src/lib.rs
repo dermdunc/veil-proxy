@@ -25,6 +25,7 @@ mod traits;
 mod types;
 
 pub mod conformance;
+pub mod telemetry;
 
 pub use api::{
     benchmark, mask, rehydrate, scan, spans_overlap, Actor, Context, Corpus, CorpusSample,
