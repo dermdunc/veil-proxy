@@ -211,6 +211,66 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
         after the window elapses needs a drop/re-mint/queue decision, not made yet).
       - JSON Schema generation (no `serde`/`schemars` dependency exists in `vg-core` yet) —
         needed before the "schema published as a versioned artifact" exit gate is met.
+
+### Telemetry roadmap sequencing (planned 2026-08-23, not yet built)
+
+Sequences the items above by what's genuinely blocking what, not by the order they're listed —
+worked out in a dedicated planning session after PR #47/#48 merged. Full context in that
+session's plan (not committed to this repo; summarised here so it isn't lost).
+
+**Two findings from reading the code, not assumed, that reorder the obvious sequencing:**
+- **Bedrock `requestMetadata` trace stamping is hard-blocked on M3** (the masking proxy actually
+  routing to a real upstream) — `vg-proxy/src/lib.rs`/`server.rs` say outright "no upstream
+  client anywhere in this crate." M3 is this file's own stated **#1 priority**, ahead of
+  everything in this section, and hasn't started. The aggregator's trace-stamping half can't be
+  exercised end-to-end until M3 lands, regardless of how much of the rest of this section is
+  built first.
+- **`AuditEvent::PolicyDecision` is defined but never actually constructed anywhere in
+  production** (grep-verified workspace-wide; `mask()` only ever emits `Scan` or `Block`). The
+  aggregator should be scoped to what's real (`Scan`, `Block`, `DemaskRequest`/`DemaskDecision`),
+  not a `PolicyDecision` case that would currently be dead code.
+
+**Recommended phases** (same-phase items have no hard dependency on each other):
+- **Phase 0 — zero dependencies:** the Q10 privacy write-up (below); the fieldless-enum `Hash`
+  cleanup (below). Cheapest items, no reason to wait.
+- **Phase 1 — the emitter.** Not previously named as its own item, but it's the actual missing
+  piece: nothing calls `TryFrom<&AuditEvent>`/`EdgeEvent::try_from_audit_event` from a real code
+  path today. Recommended: intercept at the same choke point `mask()`'s doc already names —
+  "writing it via `policy.audit`" — buffer `Ok`s locally (transport itself is explicitly out of
+  scope per the reconciliation plan's own §5), count/log `Err`s rather than dropping silently (a
+  silent zero-`Ok` pipeline would look identical to a broken one). Deliberately built against
+  today's mostly-reject-arms type system rather than waiting for every conversion to work first —
+  same build-it-and-see-what-breaks approach the two merged PRs above already used.
+- **Phase 2 — the reason dictionary**, independent and self-contained (its own Plan-Mode session,
+  same shape as the pseudonymization build). The reconciliation plan's §5 already answers "how do
+  dashboards get code→text": "belongs with the policy/detector-pack distribution channel" — i.e.
+  extend or mirror `vg-policy/src/config.rs`'s existing `RawPack` (versioned, 3-layer merge,
+  `serde`-deserialized JSON) rather than invent a new mechanism. `Block.reason: String` needs its
+  lookup/classification step at construction time in `api.rs`, not at telemetry-conversion time —
+  otherwise the free-text reason still leaks upstream of the boundary this effort exists to close.
+- **Phase 3 — the aggregator + trace stamping, partially blocked.** Trace-id threading through
+  `mask()`'s signature (`crates/vg-core/src/api.rs`; three real callers grep-verified —
+  `vg-adapters-claude/src/hook.rs`, `vg-adapters-claude/src/lib.rs`,
+  `vg-core/benches/mask_pipeline.rs` — small blast radius) is buildable now, independent of M3.
+  Bedrock stamping and true end-to-end exercise of the aggregator are not — see the M3 finding
+  above. Recommend splitting into two sessions: trace-id threading + aggregator skeleton now,
+  Bedrock stamping once M3 lands. The Q3 replay-window drop/re-mint/queue decision is still open
+  and blocks writing the aggregator's buffer-eviction policy specifically.
+- **Phase 4 — JSON Schema generation + publish**, sequenced last on purpose: regenerating a
+  published schema after Phase 3 changes `Receipt`'s shape is worse than generating it once after
+  that shape is real. Must emit `additionalProperties: false` at every object boundary as a
+  mechanized generator test (reconciliation plan §3.3 item 4), not a review checklist item.
+- **Not phase-gated:** the six-raw-capable-`String`-surfaces item (below) deserves its own scoping
+  pass, bigger than a cleanup item; the `ActorPseudonymKey::from_bytes` provenance hardening item
+  (below) needs its own design decision before implementation; the env-var cross-device-
+  correlation residual (below) likely stays an accepted, documented risk rather than a plannable
+  item unless the test-seam architecture itself changes.
+
+`veil-custodian` (device enrolment + signing-key issuance, below) blocks `Envelope`/`Integrity`
+construction regardless of how much of the above lands — no `TelemetryEvent` can be fully
+assembled and signed without it. Deliberately not planned in detail here — that's a separate
+repo's own session; what `veil-proxy` needs from it is named in the item below.
+
 - [ ] **Close the six raw-capable `String` surfaces at their source** (`docs/architecture/implementation-plan.md`
       §3.1) — **still open, not done by the `TelemetryEvent` build above.** `ActorId(pub String)`,
       `DetectorId(pub String)`, `Block.reason: String`, `policy_version: String`,
