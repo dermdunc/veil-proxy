@@ -3,12 +3,21 @@
 //! `docs/architecture/telemetry-receipt-reconciliation-plan.md` (2026-08-23) and this
 //! crate's own amended `docs/architecture/implementation-plan.md` §3.2-3.4.
 //!
-//! **Status: type system only, not wired to production.** `TryFrom<&AuditEvent>` below
-//! has an explicit, reviewed arm for all six `AuditEvent` variants — required because
-//! `AuditEvent` is `#[non_exhaustive]` (`crate::audit`) and a wildcard arm outside
-//! `vg-core` would be a silent leak path for future variants (`docs/decisions.md:2883`)
-//! — but **every arm currently returns `Err`**. That is not a placeholder oversight; it
-//! is the honest state of the codebase this type system was built against:
+//! **Status of this specific, frozen `TryFrom<&AuditEvent>` impl: every arm still
+//! returns `Err`, by design, not oversight** — its signature (`docs/decisions.md:2883`)
+//! can never take a key or other external context, so it can never resolve
+//! `DemaskRequest`/`DemaskDecision` (need a pseudonymization key — see
+//! [`EdgeEvent::try_from_audit_event`], a separate, key-carrying entry point that
+//! *can* and does resolve them in production since Phase 1,
+//! `docs/next-actions.md`) or, as of Phase 2, a *recognized* `Block` (needs
+//! `Envelope`/`Integrity` construction this entry point cannot provide either way — see
+//! that arm's own inline comment). This module-level banner predates both phases and
+//! describes only what this one frozen conversion path can do, not the type system's
+//! current overall reach — treat `EdgeEvent::try_from_audit_event`'s own doc as the
+//! more current source for what's actually resolvable today. `TryFrom<&AuditEvent>`
+//! below still has an explicit, reviewed arm for all six `AuditEvent` variants —
+//! required because `AuditEvent` is `#[non_exhaustive]` (`crate::audit`) and a wildcard
+//! arm outside `vg-core` would be a silent leak path for future variants:
 //!
 //! - `Scan`/`PolicyDecision` need trace-scoped aggregation across multiple
 //!   `AuditEvent`s to become a [`Receipt`] (per the reconciliation plan's own §3.2: "an
@@ -18,22 +27,16 @@
 //!   an invocation/trace identifier at all.
 //! - `Block` is a different gap, not an aggregation one: every current production
 //!   `Block` fires pre-send, so it maps to [`EdgeEvent::BlockedAttempt`] (no trace
-//!   linkage needed at all) — the only missing piece is `reason: String` →
-//!   `ReasonCode`, which needs the not-yet-built reason dictionary. (A second
-//!   doubt-driven-development round checked whether `EdgeEvent::BlockedAttempt` secretly
-//!   needed anything else `AuditEvent::Block` doesn't carry — e.g. `policy_version` —
-//!   and confirmed it now doesn't: `BlockedAttempt`'s fields were corrected to match
-//!   `AuditEvent::Block`'s actual shape exactly, so the reason dictionary really is the
-//!   only blocker.)
-//! - `DemaskRequest`/`DemaskDecision` need a pseudonymized actor identity to become
-//!   [`EdgeEvent::DemaskRequest`]/[`EdgeEvent::DemaskDecision`], but `ActorId`
-//!   (`crate::ids`) is still a raw `String` — the ratified "keyed HMAC pseudonym,
-//!   computed locally" fix has not been built yet (`docs/next-actions.md`'s
-//!   six-raw-capable-surfaces item, sequenced *before* this type system and not yet
-//!   done). Same cross-check as `Block` above: both `EdgeEvent` variants' fields were
-//!   corrected to match their source `AuditEvent` variant exactly (no extra
-//!   `policy_version` on `DemaskRequest`, which `AuditEvent::DemaskRequest` doesn't
-//!   carry), so pseudonymization really is the only blocker for each.
+//!   linkage needed at all). As of Phase 2, the reason dictionary
+//!   (`telemetry::block_reason`) resolves `reason: String` → `ReasonCode` for real —
+//!   `EdgeEvent::try_from_audit_event` can produce `Ok` for a recognized `Block` in
+//!   production now. This frozen entry point still can't, for the separate reason named
+//!   in its own `Block` arm (`Envelope`/`Integrity` construction, custodian-blocked).
+//! - `DemaskRequest`/`DemaskDecision` need a pseudonymized actor identity — built in
+//!   Phase 1 (`vg_vault::load_or_create_actor_pseudonym_key`,
+//!   `EdgeEvent::try_from_audit_event`'s actor-key parameter), but this frozen entry
+//!   point's signature has no room for that key, so it stays reject-only here
+//!   permanently, by design, not because the underlying capability is missing.
 //! - `MappingCreated` defaults to excluded from v1 telemetry — this is an **open
 //!   question (Q8), not a ratified exclusion** (`docs/decisions.md`, 2026-08-23: "left
 //!   open as scoped in the plan... defaults to `TelemetryReject` until a concrete
@@ -73,6 +76,7 @@
 #![allow(dead_code)]
 
 mod alert;
+pub(crate) mod block_reason;
 mod edge_event;
 mod envelope;
 mod ids;
@@ -213,9 +217,7 @@ impl TryFrom<&AuditEvent> for TelemetryEvent {
             // module's own `EdgeEvent::BlockedAttempt` design). Every current
             // production `Block` fires pre-send (`api.rs`'s artefact-level block runs
             // before parsing/sending), so it maps directly to `EdgeEvent::BlockedAttempt`
-            // — no `TraceLinkage`, no aggregation needed. The only real blocker is
-            // `reason: String` → `ReasonCode`, which needs the not-yet-built reason
-            // dictionary.
+            // — no `TraceLinkage`, no aggregation needed.
             //
             // Residual assumption, flagged by a fourth adversarial review round: this
             // match receives only `&AuditEvent`, whose fields are all `pub` — nothing
@@ -226,9 +228,30 @@ impl TryFrom<&AuditEvent> for TelemetryEvent {
             // anything `TryFrom`'s own signature can check). If this arm ever becomes
             // `Ok`, that assumption needs to become a real check first — a
             // `RequiresSendStatus` reject, or a flag threaded through construction.
-            AuditEvent::Block { .. } => {
-                Err(TelemetryReject::RequiresReasonDictionary { variant: "Block" })
-            }
+            //
+            // The reason dictionary landed (`telemetry::block_reason`), so `reason` is
+            // resolvable now — but a second, cross-model doubt-driven-development round
+            // caught that unconditionally reporting `RequiresEnvelopeConstruction` here
+            // was itself inaccurate for an *unrecognized* reason: that case would still
+            // never resolve even once envelope construction lands, so it must not claim
+            // "would resolve." This arm now does the same classification
+            // `EdgeEvent::try_from_audit_event` does, and reports the reason that's
+            // actually true for each case: an unrecognized `reason` gets
+            // `UnrecognizedReason` (matching what the other entry point would say for
+            // the identical input); a recognized one gets `RequiresEnvelopeConstruction`
+            // — the one thing genuinely still missing for a payload that resolves,
+            // since building a full `TelemetryEvent` needs `Envelope`/`Integrity`
+            // (still custodian-blocked), which this frozen, keyless entry point cannot
+            // provide regardless of the reason dictionary.
+            AuditEvent::Block { reason, .. } => match block_reason::BlockReason::classify(reason) {
+                Some(_) => Err(TelemetryReject::RequiresEnvelopeConstruction { variant: "Block" }),
+                None => Err(TelemetryReject::UnrecognizedReason {
+                    variant: "Block",
+                    field: "reason",
+                    reason:
+                        "no registered BlockReason matched this AuditEvent::Block.reason string",
+                }),
+            },
             AuditEvent::MappingCreated { .. } => Err(TelemetryReject::DeferredByDefault {
                 variant: "MappingCreated",
                 decision_ref: "Q8",

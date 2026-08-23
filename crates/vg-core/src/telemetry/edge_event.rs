@@ -108,10 +108,12 @@ pub enum EdgeEvent {
     /// From `AuditEvent::DemaskDecision` — see `telemetry::mod`'s module doc for why the
     /// `TryFrom` conversion currently rejects it (actor pseudonymization not yet built).
     DemaskDecision(DemaskDecisionPayload),
-    /// From `AuditEvent::Block` where nothing reached Bedrock (pre-send block) — see
-    /// `telemetry::mod`'s module doc for why the `TryFrom` conversion currently rejects
-    /// `Block` (the reason dictionary that would supply `reason: ReasonCode` doesn't
-    /// exist yet).
+    /// From `AuditEvent::Block` where nothing reached Bedrock (pre-send block). As of
+    /// Phase 2 (`telemetry::block_reason`), `try_from_audit_event` resolves a
+    /// *recognized* reason to this variant for real in production. The frozen bare
+    /// `TryFrom<&AuditEvent>` still rejects `Block` regardless — see that impl's own
+    /// arm — for an unrelated reason (`Envelope`/`Integrity` construction, not the
+    /// reason dictionary).
     BlockedAttempt(BlockedAttemptPayload),
 }
 
@@ -144,12 +146,19 @@ impl EdgeEvent {
     /// so it can never produce `Ok` for `DemaskRequest`/`DemaskDecision` no matter what
     /// gaps close elsewhere. This function takes the missing ingredient — an
     /// [`ActorPseudonymKey`] — directly, and so *can* produce those two payloads for
-    /// real. It has strictly more context than `TryFrom`, never less: every other
-    /// `AuditEvent` variant rejects here with exactly the same [`TelemetryReject`] value
-    /// `TryFrom<&AuditEvent>` already returns for it (see
-    /// `crates/vg-core/tests/telemetry.rs` for a direct consistency check between the
-    /// two entry points) — nothing becomes constructible here that `TryFrom` would
-    /// reject for a reason unrelated to the actor key.
+    /// real. It has strictly more context than `TryFrom`, never less: for
+    /// `Scan`/`PolicyDecision`/`MappingCreated` it rejects here with exactly the same
+    /// [`TelemetryReject`] value `TryFrom<&AuditEvent>` already returns for them (see
+    /// `crates/vg-core/tests/telemetry.rs` for a direct consistency check) — nothing
+    /// becomes constructible here that `TryFrom` would reject for a reason unrelated to
+    /// the actor key. `Block` is the one deliberate exception, not a violation of that
+    /// property: as of Phase 2, a *recognized* reason resolves to `Ok` here, while
+    /// `TryFrom` still rejects the identical input — for the separate,
+    /// unrelated-to-the-reason-dictionary matter of `Envelope`/`Integrity` construction,
+    /// which this narrower entry point was never asked to provide either (see
+    /// `crates/vg-core/tests/telemetry.rs`'s
+    /// `edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose`
+    /// for that asymmetry stated explicitly).
     ///
     /// Exhaustive over all six `AuditEvent` variants, no wildcard arm — same rule as
     /// `TryFrom<&AuditEvent>`, for the same reason (`AuditEvent` is `#[non_exhaustive]`;
@@ -196,8 +205,23 @@ impl EdgeEvent {
             AuditEvent::PolicyDecision { .. } => Err(TelemetryReject::RequiresAggregation {
                 variant: "PolicyDecision",
             }),
-            AuditEvent::Block { .. } => {
-                Err(TelemetryReject::RequiresReasonDictionary { variant: "Block" })
+            AuditEvent::Block { artefact, reason } => {
+                // `reason: String` -> `ReasonCode` via the code-defined reason
+                // dictionary (`telemetry::block_reason`) -- no external context needed
+                // (unlike the Demask variants above), so this is a plain classification,
+                // not another actor-key-shaped gap.
+                match super::block_reason::BlockReason::classify(reason) {
+                    Some(known) => Ok(Self::new_blocked_attempt(
+                        ArtefactKindId::from(artefact),
+                        known.reason_code(),
+                    )),
+                    None => Err(TelemetryReject::UnrecognizedReason {
+                        variant: "Block",
+                        field: "reason",
+                        reason:
+                            "no registered BlockReason matched this AuditEvent::Block.reason string",
+                    }),
+                }
             }
             AuditEvent::MappingCreated { .. } => Err(TelemetryReject::DeferredByDefault {
                 variant: "MappingCreated",

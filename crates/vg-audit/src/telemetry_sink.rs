@@ -263,7 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn all_four_always_reject_variants_count_as_rejected() {
+    fn scan_policy_decision_mapping_created_and_an_unrecognized_block_all_reject() {
+        // Renamed from "all_four_always_reject" (a doubt-driven-development finding):
+        // since Phase 2's reason dictionary landed, `Block` is no longer unconditionally
+        // reject-only -- only an *unrecognized* reason still rejects, which is exactly
+        // what this fixture's reason string is (see
+        // `block_reason_recognized_by_the_registry_counts_ok_through_the_wrapper` below
+        // for the recognized case).
         let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
         sink.write(AuditEvent::Scan {
             counts: EntityCounts::default(),
@@ -296,6 +302,29 @@ mod tests {
                 "expected {variant} to reject exactly once"
             );
         }
+    }
+
+    #[test]
+    fn block_reason_recognized_by_the_registry_counts_ok_through_the_wrapper() {
+        // A doubt-driven-development finding (Codex, round 2): the wrapper's own test
+        // suite never proved a *recognized* Block reason counts `ok` end to end through
+        // `TelemetryCountingAuditSink::write` -- only that unrecognized ones reject
+        // (above). `telemetry::block_reason::BlockReason::ARTEFACT_POLICY_BLOCK_TEXT` is
+        // `pub(crate)` inside `vg-core` and unreachable from this separate crate, so the
+        // literal is duplicated here -- the same accepted, low-risk trade-off used in
+        // `crates/vg-core/tests/telemetry.rs` and `crates/vg-core/tests/pipeline.rs`
+        // (the latter proves the *real* `mask()`-emitted event resolves; this test
+        // proves the wrapper counts it correctly once it does).
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        sink.write(AuditEvent::Block {
+            artefact: ArtefactKind::EnvFile,
+            reason: "artefact class is Block in resolved policy".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            sink.counts().get("Block"),
+            VariantCounts { ok: 1, rejected: 0 }
+        );
     }
 
     #[test]

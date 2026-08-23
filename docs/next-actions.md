@@ -281,19 +281,36 @@ it isn't lost).
   and conversion outcomes), *not* `TelemetryEvent`s — full records stay custodian-blocked (see
   the still-open `veil-custodian` item below), and nothing here transmits anywhere; counts are
   in-memory only, inspectable via `Engine::telemetry_counts()`.
-- **Phase 2 — the reason dictionary**, self-contained but *not* a config-only change (its own
-  Plan-Mode session, same shape as the pseudonymization build). The reconciliation plan's §5
-  already answers "how do dashboards get code→text": "belongs with the policy/detector-pack
-  distribution channel" — i.e. extend or mirror `vg-policy/src/config.rs:21`'s `RawPack`
-  (versioned, 3-layer merge, `serde`-deserialized JSON) rather than invent a new mechanism. But
-  `PolicyEngine` exposes only `classify_artefact`/`classify_entity`/destination gates/`version`
-  (`vg-core/src/traits.rs:155`) — no rule id, reason code, or matched-rule provenance — so this is
-  a **policy contract change** plus a merge-semantics decision about which layer owns a reason
-  code. `Block.reason: String` needs its lookup/classification step at construction time in
-  `api.rs`, not at telemetry-conversion time — otherwise the free-text reason still leaks upstream
-  of the boundary this effort exists to close. **Named risk:** policy-pack signature verification
-  is still a stub that always accepts (`vg-policy/src/config.rs:84`), so routing telemetry reason
-  codes through the pack channel inherits an unverified distribution path until that lands.
+- [x] ~~**Phase 2 — the reason dictionary.**~~ **Built 2026-08-23** —
+  `crates/vg-core/src/telemetry/block_reason.rs` (new: `BlockReason`, a small
+  **code-defined** registry, `ARTEFACT_POLICY_BLOCK_TEXT` constant, `classify()` exact-match
+  lookup). **Scope changed from this entry's own original sketch, by explicit choice made in
+  this session's interview, after checking the actual code first**: there is exactly one
+  production `AuditEvent::Block` construction site in the whole workspace
+  (`crates/vg-core/src/api.rs`'s `mask()`), and `vg-policy`'s `ResolvedPolicy` has no separate
+  "reason text" concept anywhere — building the full policy-pack-distributed mechanism this entry
+  originally sketched (a `PolicyEngine` contract change, merge semantics for reason ownership,
+  inheriting the still-stubbed `verify_signature` risk) for one fixed reason string was judged
+  premature. The registry is versioned like `detector_version`/`policy_version` strings are —
+  shipped with the code — not operator-editable; nothing in `vg-policy` changed.
+  `EdgeEvent::try_from_audit_event`'s `Block` arm now resolves a recognized reason to `Ok` in
+  production for real (`crates/vg-core/tests/pipeline.rs` proves this against the actual
+  `mask()`-emitted event, not a hand-built fixture). New `TelemetryReject::UnrecognizedReason`
+  (an unregistered reason string) and `TelemetryReject::RequiresEnvelopeConstruction` (the frozen,
+  keyless `TryFrom<&AuditEvent>`'s now-accurate reject for a *recognized* `Block` reason, since
+  that entry point still can't build `Envelope`/`Integrity`) — the now-permanently-dead
+  `RequiresReasonDictionary` variant was removed rather than left stale.
+  Two rounds of adversarial doubt-driven-development review (single-model, then Codex
+  cross-model), both offered and accepted — see `docs/decisions.md`'s 2026-08-23 Phase 2 entry
+  for the full findings list. Most notable: round 2 caught that round 1's own fix for the frozen
+  `TryFrom`'s `Block` arm was itself incomplete (it unconditionally claimed "would resolve,"
+  which was false for an unrecognized reason) — fixed by having that arm classify the reason
+  first, the same way the newer entry point does. **Named risk, deliberately not solved:** "every
+  `Block` construction site uses a registered constant" is enforced by review discipline, not the
+  type system — `AuditEvent` being `#[non_exhaustive]` restricts cross-crate matching, not
+  cross-crate *construction* (confirmed: `crates/vg-audit/tests/sink.rs` already constructs
+  `AuditEvent::Block` from a different crate with its own reason strings).
+  `cargo build/clippy -D warnings/fmt --check/test` all clean, workspace-wide.
 - **Phase 3 — the aggregator + trace stamping, partially blocked.** Trace-id threading through
   `mask()`'s signature (`crates/vg-core/src/api.rs:156`; three real callers grep-verified —
   `vg-adapters-claude/src/hook.rs`, `vg-adapters-claude/src/lib.rs`,

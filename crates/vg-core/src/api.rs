@@ -172,7 +172,12 @@ pub fn mask(
     if policy.engine.classify_artefact(&input.hint) == HandlingClass::Block {
         let event = AuditEvent::Block {
             artefact: ArtefactKind::Unknown,
-            reason: "artefact class is Block in resolved policy".to_string(),
+            // The shared constant, not a fresh literal: `telemetry::block_reason`'s
+            // reason-dictionary lookup matches this exact string, so writing anything
+            // else here (even an equivalent-meaning rewording) would silently make this
+            // Block unrecognized by EdgeEvent::try_from_audit_event.
+            reason: crate::telemetry::block_reason::BlockReason::ARTEFACT_POLICY_BLOCK_TEXT
+                .to_string(),
         };
         policy.audit.write(event.clone())?;
         let pack = MaskedPack {

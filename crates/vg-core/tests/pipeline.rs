@@ -253,6 +253,20 @@ fn env_hinted_artefact_is_blocked_with_no_content_and_nothing_interned() {
 
     // Nothing was interned for a blocked artefact.
     assert_eq!(persisted_mapping_count(&db_path), 0);
+
+    // The *real*, production-emitted event (not a hand-constructed fixture) round-trips
+    // through the telemetry reason dictionary — a doubt-driven-development finding: the
+    // integration tests in `crates/vg-core/tests/telemetry.rs` can't reach
+    // `telemetry::block_reason`'s `pub(crate)` text constant, so they necessarily
+    // duplicate the literal by hand. This assertion uses `mask()`'s actual output
+    // instead, so a future drift between `api.rs`'s reason string and the registry
+    // (e.g. from a bad merge) fails here even if a hand-copied fixture elsewhere
+    // happened to still match.
+    let key = vg_core::telemetry::ActorPseudonymKey::from_bytes([9u8; 32]);
+    assert!(
+        vg_core::telemetry::EdgeEvent::try_from_audit_event(&event, &key).is_ok(),
+        "the real AuditEvent::Block mask() just emitted must be a recognized reason"
+    );
 }
 
 #[test]

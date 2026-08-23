@@ -3203,3 +3203,106 @@ remains open per its own entry.
 **Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
 --locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
 clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.
+
+## 2026-08-23 — Telemetry roadmap Phase 2 built (the reason dictionary)
+
+Built the second phase of the telemetry roadmap (Phase 1: the emitter, PR #52, merged same day).
+Unblocks `Block` → `EdgeEvent::BlockedAttempt`: unlike the Demask variants Phase 1 unblocked,
+`Block`'s telemetry conversion needs no external context (no actor key) — everything it needs
+already lives inside `&AuditEvent::Block { artefact, reason: String }`. The only missing piece was
+turning `reason: String` (free text) into a `ReasonCode`.
+
+**Scope changed from the roadmap's original sketch, by explicit choice made in this session's
+interview, after checking the actual code first — not assumed from the reconciliation plan.** The
+roadmap assumed a full policy-pack-distributed dictionary (extend `vg-policy`'s `RawPack`,
+matching the 3-layer global/repo/session merge everything else in that system uses). Investigating
+first found: there is exactly one production `AuditEvent::Block` construction site in the whole
+workspace (`crates/vg-core/src/api.rs`'s `mask()`, the artefact-level policy-Block check), with a
+single hardcoded reason string literal, and `vg-policy`'s `ResolvedPolicy` has no separate "reason
+text" concept anywhere — an artefact is only ever `Block`ed because
+`artefact_default`/`by_extension`/`by_language`/`by_mime` resolved to `HandlingClass::Block`, and
+`classify_artefact` doesn't report *which* of those matched, only the resulting class. Building
+the full pack-distributed mechanism (a `PolicyEngine` contract change, merge semantics for reason
+ownership, inheriting `vg-policy`'s still-stubbed `verify_signature` risk) for one fixed reason
+string would have been premature. Built instead: a small, code-defined registry
+(`crates/vg-core/src/telemetry/block_reason.rs`), versioned the way `detector_version`/
+`policy_version` strings are — shipped with the code, not operator-editable. Nothing in
+`vg-policy` changed.
+
+**Built:** `BlockReason` (one variant today, `ArtefactPolicyBlock`), a shared
+`ARTEFACT_POLICY_BLOCK_TEXT` constant referenced by both `api.rs`'s write site and the lookup (so
+the two can never drift apart), `classify()` doing exact-match lookup (deliberately not fuzzy —
+every current and future `Block` site is expected to use a registered constant verbatim).
+`EdgeEvent::try_from_audit_event`'s `Block` arm now resolves a recognized reason to `Ok` for real
+in production. Two new `TelemetryReject` variants: `UnrecognizedReason` (a reason string outside
+the registry — never echoes the raw input, only a static description) and
+`RequiresEnvelopeConstruction` (what the frozen, keyless `TryFrom<&AuditEvent>` now reports for a
+*recognized* `Block` reason, since that entry point still can't build `Envelope`/`Integrity` —
+signing remains custodian-blocked). The now-permanently-dead `RequiresReasonDictionary` variant
+(nothing could construct it anymore once the dictionary landed) was removed rather than left as
+stale dead code.
+
+Reviewed across two rounds of adversarial doubt-driven-development review (single-model, then
+Codex cross-model), both offered and accepted:
+
+- **Round 1: the frozen `TryFrom`'s `Block` arm was returning a now-false error message.**
+  Before this phase, it returned `RequiresReasonDictionary` unconditionally, whose rendered text
+  says "not yet implemented" — false once the dictionary landed in this same diff. Also caught: my
+  own "can't fix it, the signature is frozen" framing was self-contradictory, since the diff itself
+  proves new `TelemetryReject` variants are addable without touching the frozen `TryFrom` signature
+  (it added `UnrecognizedReason` in the same change). Fixed round 1 by pointing the arm at the new
+  `RequiresEnvelopeConstruction` instead.
+  **Round 2 (Codex) found the round-1 fix itself incomplete**: the arm returned
+  `RequiresEnvelopeConstruction` *unconditionally* for every `Block`, without checking whether
+  `reason` was actually recognized first — for an unrecognized reason, "would resolve" was false
+  regardless of envelope construction. Fixed properly: the frozen arm now runs the same
+  `BlockReason::classify` check `EdgeEvent::try_from_audit_event` does, and reports
+  `UnrecognizedReason` for an unrecognized string, `RequiresEnvelopeConstruction` only for a
+  recognized one — the two entry points now genuinely agree on unrecognized reasons and diverge
+  only where they're supposed to (a recognized reason: `try_from_audit_event` resolves it,
+  `TryFrom` still can't, for the unrelated envelope reason). A new test
+  (`edge_event_block_rejects_an_unrecognized_reason_string`) asserts that agreement explicitly
+  rather than leaving it as an unverified claim in a doc comment.
+- **Round 1: `#[non_exhaustive]` on `BlockReason` was dead weight.** `BlockReason` is `pub(crate)`
+  inside a `pub(crate) mod` — it never crosses `vg-core`'s own boundary, so the attribute (which
+  only restricts cross-crate matching/construction) was inert, and the doc comment implied it was
+  doing enforcement work it wasn't. Removed; doc corrected to say the real guard is ordinary
+  same-crate match-exhaustiveness. **Round 2 (Codex) confirmed this fix is correct** — verified no
+  `pub use` re-exports `BlockReason` beyond `pub(crate)`.
+- **Round 1: no test proved the *real*, production-emitted `AuditEvent::Block` (not a
+  hand-constructed fixture) round-trips through the reason dictionary** — the integration tests in
+  `crates/vg-core/tests/telemetry.rs` can't reach the `pub(crate)` text constant (a separate
+  compiled crate), so they necessarily duplicate the literal string by hand, an accepted drift
+  risk. Fixed by extending an existing `crates/vg-core/tests/pipeline.rs` test
+  (`env_hinted_artefact_is_blocked_with_no_content_and_nothing_interned`, which already calls the
+  real `mask()` and captures the real returned event) with an assertion feeding that real event
+  into `EdgeEvent::try_from_audit_event`. **Round 2 (Codex) confirmed fixed for the stated gap**,
+  and separately flagged that the *wrapper* (`vg-audit`'s `TelemetryCountingAuditSink`, wired into
+  production in Phase 1) still had no test proving a recognized `Block` counts `ok` through it —
+  its own suite only tested the always-reject case. Fixed:
+  `block_reason_recognized_by_the_registry_counts_ok_through_the_wrapper`, new in
+  `crates/vg-audit/src/telemetry_sink.rs`.
+- **Round 1: module doc overclaimed structural enforcement** of "every `Block` site uses a known
+  constant." Fixed with an explicit doc paragraph conceding this is review-discipline-enforced,
+  citing `crates/vg-audit/tests/sink.rs` as a real, already-existing counter-example (constructs
+  `AuditEvent::Block` directly from a different crate with its own reason strings). **Round 2
+  (Codex) confirmed the cited counter-example is real** by reading that file directly.
+- **Round 1: the original `docs/next-actions.md` Phase 2 sketch's "classify at construction time,
+  not conversion time" requirement was never addressed.** Fixed with a doc paragraph arguing the
+  "boundary this effort exists to close" is the telemetry boundary (what may leave the machine),
+  not the local audit log (`AuditEvent::Block.reason: String` is frozen, stays free text
+  regardless of when classification happens). **Round 2 (Codex) pushed back that this understates
+  a real residual**: a future unregistered `Block.reason` still gets written to the local audit
+  log before `try_from_audit_event` ever rejects it for telemetry purposes — construction-time
+  *hard-failure* would close that window, conversion-time classification doesn't. Accepted as a
+  genuine, named trade-off, not fixed: hard-failing `mask()` on a policy-internal naming mismatch
+  is a materially bigger, unscoped behavior change this phase wasn't asked to make. Documented
+  explicitly rather than left implied.
+- Also fixed in round 2: several doc comments in `mod.rs`/`edge_event.rs`/`reject.rs` that had
+  gone stale describing the reason dictionary as unbuilt or the sole `Block` blocker; `reject.rs`'s
+  top doc comment hardcoded a variant count ("four distinct reasons") that had already drifted
+  once before this phase even landed — reworded to not bake in a number that rots.
+
+**Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
+--locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
+clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.
