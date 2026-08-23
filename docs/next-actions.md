@@ -171,7 +171,9 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       an oversight (see `telemetry::mod`'s module doc). What's still needed before any arm can
       return `Ok`, in the order the reject reasons name:
       - [x] ~~**`ActorId` pseudonymization** (keyed HMAC, computed locally)~~ **Built
-        2026-08-23** — `crates/vg-core/src/telemetry/pseudonymize.rs`
+        2026-08-23, PR #48 (`https://github.com/dermdunc/veilgremlin/pull/48`), not yet
+        merged — awaiting human review, same pattern as PR #47.** —
+        `crates/vg-core/src/telemetry/pseudonymize.rs`
         (`ActorPseudonymKey`, `pseudonymize_actor`), `crates/vg-vault/src/keychain.rs`
         (`load_or_create_actor_pseudonym_key`, per-device OS-keychain-backed, fixed
         `account = "default"`), `EdgeEvent::try_from_audit_event` (a **second**,
