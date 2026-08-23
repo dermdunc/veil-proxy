@@ -12,6 +12,11 @@
 //! over SQLite.
 
 mod record;
+mod telemetry_sink;
+
+pub use telemetry_sink::{
+    SharedTelemetrySink, TelemetryConversionCounts, TelemetryCountingAuditSink, VariantCounts,
+};
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

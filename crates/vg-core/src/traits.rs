@@ -161,6 +161,16 @@ pub trait PolicyEngine: Send + Sync {
     fn destination_allows_masked_only(&self, dest: &DestinationId) -> bool;
     fn demask_allowed(&self, dest: Destination, actor: &Actor) -> bool;
     fn version(&self) -> &str;
+    /// Whether opt-in telemetry is enabled per the resolved policy. A **default** method
+    /// (not required), deliberately: adding a required method here would be a breaking
+    /// change for every existing `PolicyEngine` implementer (`vg-policy`'s
+    /// `LayeredPolicyEngine`, and the test stub in `crates/vg-core/tests/conformance_stubs.rs`).
+    /// Defaults to `false` — fail-safe, matching ADR-015's "opt-in, never opt-out" —
+    /// so an implementer that doesn't override this is telemetry-off by construction,
+    /// not by omission.
+    fn telemetry_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Contract: append-only; no raw values in any `AuditEvent` variant.

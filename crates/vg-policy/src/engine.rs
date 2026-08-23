@@ -131,6 +131,10 @@ impl PolicyEngine for LayeredPolicyEngine {
     fn version(&self) -> &str {
         &self.resolved.version
     }
+
+    fn telemetry_enabled(&self) -> bool {
+        self.resolved.telemetry_enabled
+    }
 }
 
 /// True for the [`DestinationId`]s corresponding to the hard-deny destinations. Kept in

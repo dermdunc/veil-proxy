@@ -31,6 +31,13 @@ pub struct RawPack {
     pub artefacts: RawArtefactRules,
     #[serde(default)]
     pub destinations: BTreeMap<String, RawDestinationRule>,
+    /// Whether opt-in telemetry (`vg_core::telemetry`) is enabled for this pack. Absent
+    /// resolves to `false` (fail-safe: ADR-015 ratifies telemetry as opt-in, never
+    /// opt-out — a policy pack that doesn't mention it must not silently turn telemetry
+    /// on). "opt-in, policy-gated" per `docs/architecture/product-family.md`, which is
+    /// why this lives here rather than a separate config surface.
+    #[serde(default)]
+    pub telemetry_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -106,6 +113,7 @@ pub fn merge(base: RawPack, over: RawPack) -> RawPack {
             by_mime: merge_map(base.artefacts.by_mime, over.artefacts.by_mime),
         },
         destinations: merge_destinations(base.destinations, over.destinations),
+        telemetry_enabled: over.telemetry_enabled.or(base.telemetry_enabled),
     }
 }
 
@@ -146,6 +154,7 @@ pub struct ResolvedPolicy {
     pub artefact_by_language: BTreeMap<String, HandlingClass>,
     pub artefact_by_mime: BTreeMap<String, HandlingClass>,
     pub destinations: BTreeMap<String, DestinationSetting>,
+    pub telemetry_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +252,7 @@ impl ResolvedPolicy {
                 .into_iter()
                 .map(|(k, v)| (k, resolve_destination(v)))
                 .collect(),
+            telemetry_enabled: raw.telemetry_enabled.unwrap_or(false),
         })
     }
 }
@@ -418,6 +428,52 @@ mod tests {
             matches!(err, PolicyError::Load(_)),
             "expected Load error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn telemetry_enabled_defaults_to_false_when_absent_from_every_layer() {
+        // ADR-015: opt-in, never opt-out -- a pack that never mentions telemetry must
+        // resolve to disabled, not merely "unspecified."
+        let resolved = ResolvedPolicy::from_raw(RawPack::default()).unwrap();
+        assert!(!resolved.telemetry_enabled);
+    }
+
+    #[test]
+    fn telemetry_enabled_true_resolves_when_set() {
+        let raw = RawPack {
+            telemetry_enabled: Some(true),
+            ..RawPack::default()
+        };
+        let resolved = ResolvedPolicy::from_raw(raw).unwrap();
+        assert!(resolved.telemetry_enabled);
+    }
+
+    #[test]
+    fn telemetry_enabled_merges_over_wins_when_present() {
+        let base = RawPack {
+            telemetry_enabled: Some(true),
+            ..RawPack::default()
+        };
+        let over = RawPack {
+            telemetry_enabled: Some(false),
+            ..RawPack::default()
+        };
+        let merged = merge(base, over);
+        assert_eq!(merged.telemetry_enabled, Some(false));
+    }
+
+    #[test]
+    fn telemetry_enabled_merge_keeps_base_when_over_is_absent() {
+        // Distinguishes "over explicitly disables" (previous test) from "over doesn't
+        // mention it at all" -- an absent field in a repo/session layer must not
+        // silently disable telemetry a stricter global layer turned on.
+        let base = RawPack {
+            telemetry_enabled: Some(true),
+            ..RawPack::default()
+        };
+        let over = RawPack::default();
+        let merged = merge(base, over);
+        assert_eq!(merged.telemetry_enabled, Some(true));
     }
 
     #[test]

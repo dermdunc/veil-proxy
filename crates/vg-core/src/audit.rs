@@ -47,3 +47,25 @@ pub enum AuditEvent {
         policy_version: String,
     },
 }
+
+/// The variant name of `event`, as a stable `&'static str` (`"Scan"`, `"Block"`, ...).
+///
+/// Exhaustive over all six variants with no wildcard arm — deliberately placed *inside*
+/// `vg-core`, not left for each consumer crate to write its own match: `AuditEvent` is
+/// `#[non_exhaustive]`, so a match outside this crate is compiler-*forced* to carry a
+/// wildcard regardless of intent (confirmed the hard way: `vg-audit`'s
+/// `TelemetryCountingAuditSink` originally tried to write this match itself and hit
+/// `E0004` even though its author knew all six current variants). Consumer crates that
+/// need a name-per-variant (logging, counting, telemetry) should call this instead of
+/// re-attempting an exhaustive match they cannot actually enforce — a future seventh
+/// variant is then a forced touchpoint here, in the one place it can be.
+pub fn variant_name(event: &AuditEvent) -> &'static str {
+    match event {
+        AuditEvent::Scan { .. } => "Scan",
+        AuditEvent::PolicyDecision { .. } => "PolicyDecision",
+        AuditEvent::MappingCreated { .. } => "MappingCreated",
+        AuditEvent::Block { .. } => "Block",
+        AuditEvent::DemaskRequest { .. } => "DemaskRequest",
+        AuditEvent::DemaskDecision { .. } => "DemaskDecision",
+    }
+}

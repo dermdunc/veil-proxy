@@ -31,7 +31,7 @@ pub use api::{
     benchmark, mask, rehydrate, scan, spans_overlap, Actor, Context, Corpus, CorpusSample,
     Destination, DestinationId, Input, Metrics, Policy,
 };
-pub use audit::AuditEvent;
+pub use audit::{variant_name as audit_event_variant_name, AuditEvent};
 pub use error::{AuditError, MaskError, PolicyError, RehydrateDenied, VaultError};
 pub use ids::{ActorId, AuditId, DetectorId, OrgId, RepoId, SessionId};
 pub use keying::{

@@ -3097,3 +3097,109 @@ residual; the signature itself is frozen and out of scope to change.
 **Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
 --locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
 clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.
+
+## 2026-08-23 — Telemetry roadmap Phase 1 built (the emitter, wired into `Engine::open`)
+
+Built the first of the 5-phase telemetry roadmap sequenced earlier the same day (a Codex
+critique + Opus reconciliation round against the plan itself, before any code — see that
+roadmap's entry above and `docs/next-actions.md`'s "Telemetry roadmap sequencing"). Phase 1: the
+connective tissue that finally calls `EdgeEvent::try_from_audit_event`
+(`crates/vg-core/src/telemetry/edge_event.rs:158`) from a real code path — nothing did, before
+this.
+
+**Scope grew twice from the roadmap's own sketch, both times by explicit decision, not drift:**
+1. **Wiring, decided in this session's Plan Mode interview.** Unlike `TelemetryEvent` (PR #47)
+   and the pseudonymization entry point (PR #48), which were built fully tested but deliberately
+   never called from production, this phase wires into `Engine::open` for real. Component
+   location: a new decorator in **`vg-audit`**, not `vg-adapters-claude` — rejected the latter on
+   review, since `vg-adapters-claude` is one of several planned adapter crates
+   (`docs/next-actions.md`'s "Later phases") and the wrapper itself references nothing
+   Claude-specific; `vg-audit` already owns `AuditSink`'s real implementation (`JsonlAuditSink`)
+   and is adapter-agnostic, so every future adapter gets it for free.
+2. **A new opt-in config surface, required by the wiring decision, not separately planned.**
+   ADR-015 ratifies telemetry as opt-in-only, but there was zero config surface for it anywhere
+   in the code (grep-verified) before this change. Added `RawPack.telemetry_enabled`
+   (`crates/vg-policy/src/config.rs`, 3-layer-merged like every other policy setting, defaults to
+   `false` — fail-safe), reached via a new **default** (not required) method on
+   `vg_core::PolicyEngine` (`fn telemetry_enabled(&self) -> bool { false }`, so no existing
+   implementer needed changes), overridden by `LayeredPolicyEngine`. "Opt-in, policy-gated" per
+   `docs/architecture/product-family.md` — this uses the mechanism the docs already named, not a
+   new one.
+
+**Built:** `crates/vg-audit/src/telemetry_sink.rs` — `TelemetryCountingAuditSink` (wraps any
+`AuditSink`, attempts the conversion on every write, counts `ok`/`rejected` per `AuditEvent`
+variant in an in-memory `Mutex`-guarded map, always delegates the write itself unchanged),
+`SharedTelemetrySink` (a local newtype working around Rust's orphan rules so one handle can sit
+on `Engine` for inspection while a clone is boxed as the real `Policy::audit` trait object — no
+downcasting), `TelemetryConversionCounts`/`VariantCounts`. A new exhaustive `vg_core::AuditEvent`
+variant-naming helper (`crates/vg-core/src/audit.rs`'s `variant_name`, re-exported as
+`audit_event_variant_name`) — placed inside `vg-core`, not `vg-audit`, because `AuditEvent` is
+`#[non_exhaustive]`: a match outside the defining crate is compiler-*forced* to carry a wildcard
+regardless of author intent (hit `E0004` writing the match directly in `vg-audit` before finding
+this). `Engine::open` (`crates/vg-adapters-claude/src/runtime.rs`) loads the actor-pseudonymization
+key and wraps the audit sink only when telemetry is enabled; `Engine::telemetry_counts()` exposes
+a snapshot.
+
+Reviewed across two rounds of adversarial doubt-driven-development review (single-model, then
+Codex cross-model), both offered and accepted:
+
+- **Round 1: real, high-severity finding — the opt-in flag was reachable from an untrusted state
+  dir.** Policy-pack layering (session-over-repo-over-global) meant `telemetry_enabled` could be
+  set from a state dir *discovered* (F3, `crates/vg-adapters-claude/src/state.rs`'s
+  `Provenance::Discovered`) — adopted wholesale from an ancestor directory during upward
+  discovery, e.g. a `.veilgremlin/` committed into a cloned repo. In that scenario every layer
+  inside it, including what looks like the "global" layer, is attacker-controlled, so a
+  repo/session-only restriction would not have closed it. Before the fix: cloning a hostile repo
+  could silently trigger real OS-keychain secret generation
+  (`vg_vault::load_or_create_actor_pseudonym_key`) with zero operator-facing signal anywhere — the
+  only existing F3 mitigation is a generic stderr warning, easy to miss on `vg hook`, the
+  automatic, non-interactive path Claude Code invokes on every tool call; `vg policy check`, the
+  one command built to let an operator inspect policy before trusting it, already calls
+  `Engine::open` (and so would already have generated the key) before printing anything. Unlike
+  other F3-weakened settings (which only degrade in-process masking and get a warning), this
+  triggers a new, irreversible side effect the first time it fires. **Fixed by treating it as a
+  hard-deny in code**, the same posture already used for the `RemoteModelPrompt`/
+  `ObservabilitySink` hard-deny destinations: `StatePaths` now carries its own `Provenance`
+  (previously computed once in the CLI and discarded before reaching `Engine::open`);
+  `Engine::open` refuses to honor `telemetry_enabled()` when the provenance is `Discovered`, with
+  a loud stderr warning when this actually suppresses an attempted `true`. New regression test
+  (`telemetry_enabled_is_refused_when_the_state_dir_was_discovered_not_pinned`). Confirmed fixed
+  by the round-2 Codex pass, which re-verified the fix closes the gap rather than just existing.
+- **Round 1: mutex-poisoning could silently stop the real audit log from being written.**
+  `TelemetryCountingAuditSink::write` records the conversion-attempt count before delegating to
+  the inner sink (deliberate — survives an inner-sink panic without undercounting), but the
+  original `.expect("counts mutex poisoned")` meant a poisoned counts mutex would panic *before*
+  the real write ran — a telemetry-only fault blocking the source-of-truth audit log. Fixed:
+  `lock_counts()` recovers from poisoning (`unwrap_or_else(|poisoned| poisoned.into_inner())`)
+  instead of panicking — sound because `record()` has no panic path under normal operation, so
+  poisoning could only come from something external, and simple `u64` increments under a
+  `Mutex` can't be left in a torn state a panicking writer would have partially mutated.
+- **Round 1, documented not fixed:** counts are conversion-*attempt* counts, not a strict shadow
+  of the audit log — if the inner sink's write itself fails, the count is still recorded even
+  though the event wasn't durably persisted. Reordering to count only after a confirmed write
+  would reintroduce the panic-safety gap the current ordering exists to avoid. Documented in the
+  module doc, not changed.
+- **Round 2 (Codex): test-hygiene finding.** The env-var test seam (`VG_VAULT_KEY_HEX`/
+  `VG_ACTOR_PSEUDONYM_KEY_HEX`) only cleaned up on the success path — a panic partway through
+  (e.g. `Engine::open(...).expect(...)` failing) would have left both process-global vars set for
+  the rest of the test binary. Fixed with an `EnvVarGuard` (`Drop`-based, runs during unwinding
+  too).
+- **Round 2 (Codex): confirmed no new production issues.** Explicitly checked and cleared: no
+  double-write/double-count path in `SharedTelemetrySink`; no other workspace crate constructs a
+  `Policy`/`AuditSink` that would need the same `Provenance` gating (`vg-bench` uses an isolated,
+  telemetry-absent default policy); the local `telemetry_enabled` binding in `Engine::open`
+  doesn't shadow-conflict with the trait method of the same name.
+
+**Deliberately not fixed, named residual, not a defect:** the second-order chain a first reviewer
+also flagged — `VG_ACTOR_PSEUDONYM_KEY_HEX`'s unconditional-in-production env seam (already
+recorded as a residual risk in the 2026-08-23 pseudonymization entry above) combined with a
+repo-shipped `.envrc` could, independent of this phase's own fix, have let two victims who clone
+the same hostile repo end up with the same actor-pseudonymization key. The `Provenance::Discovered`
+hard-deny added above closes the path that made this reachable from production for the first time
+(both chains require `telemetry_enabled` to fire from an adopted directory), so this residual's
+practical exposure is now gated by the same fix, though the underlying env-seam looseness itself
+remains open per its own entry.
+
+**Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
+--locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
+clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.
