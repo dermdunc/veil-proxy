@@ -41,6 +41,18 @@ pub struct StatePaths {
     /// The directory the state dir lives in — used to key the repo `Namespace` so
     /// placeholders are stable across invocations in the same working tree.
     repo_root: PathBuf,
+    /// How this state dir was chosen — carried on the struct (not just returned
+    /// alongside it from [`StatePaths::resolve`]) so it survives being passed into
+    /// `Engine::open` and beyond. Added for a real, demonstrated reason (a
+    /// doubt-driven-development finding during the telemetry-emitter work, not
+    /// speculative): `Engine::open` needs to know whether the *entire* resolved policy
+    /// — including what looks like the "global" layer — might itself be attacker-
+    /// controlled (F3: a `.veilgremlin/` adopted wholesale from a cloned repo's
+    /// ancestor directory makes every layer inside it, global included, part of the
+    /// untrusted input). Previously this information was computed once in the CLI's
+    /// `dispatch` and discarded after printing a warning — too late for anything
+    /// downstream to act on it.
+    provenance: Provenance,
 }
 
 /// How [`StatePaths::resolve`] chose the state dir — the trust-provenance of the resolution.
@@ -80,17 +92,26 @@ impl StatePaths {
     /// ancestor (an untrusted-input surface — F3) rather than pinned or created here.
     pub fn resolve(explicit: Option<PathBuf>) -> io::Result<(Self, Provenance)> {
         if let Some(dir) = explicit {
-            return Ok((Self::rooted_at(dir), Provenance::Pinned));
+            return Ok((
+                Self::rooted_at(dir).with_provenance(Provenance::Pinned),
+                Provenance::Pinned,
+            ));
         }
         if let Some(dir) = env::var_os(STATE_DIR_ENV) {
-            return Ok((Self::rooted_at(PathBuf::from(dir)), Provenance::Pinned));
+            return Ok((
+                Self::rooted_at(PathBuf::from(dir)).with_provenance(Provenance::Pinned),
+                Provenance::Pinned,
+            ));
         }
         let cwd = env::current_dir()?;
         if let Some(found) = discover_upward(&cwd) {
-            return Ok((Self::rooted_at(found), Provenance::Discovered));
+            return Ok((
+                Self::rooted_at(found).with_provenance(Provenance::Discovered),
+                Provenance::Discovered,
+            ));
         }
         Ok((
-            Self::rooted_at(cwd.join(STATE_DIR_NAME)),
+            Self::rooted_at(cwd.join(STATE_DIR_NAME)).with_provenance(Provenance::CreatedInCwd),
             Provenance::CreatedInCwd,
         ))
     }
@@ -98,13 +119,36 @@ impl StatePaths {
     /// Builds paths rooted at a specific `.veilgremlin` directory (its parent becomes the
     /// repo root). Absolutised best-effort so a persisted pack's repo namespace does not
     /// depend on the cwd a later `vg demask` runs from.
+    ///
+    /// Defaults to [`Provenance::Pinned`] — the trusted case, matching how every existing
+    /// caller uses this constructor (an explicit path, or a test fixture standing in for
+    /// the operator's own directory). [`StatePaths::resolve`] overrides this via
+    /// [`Self::with_provenance`] when it actually discovers rather than pins.
     pub fn rooted_at(root: PathBuf) -> Self {
         let root = absolutise(root);
         let repo_root = root
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| root.clone());
-        Self { root, repo_root }
+        Self {
+            root,
+            repo_root,
+            provenance: Provenance::Pinned,
+        }
+    }
+
+    /// `pub(crate)`, not private: also used by `runtime.rs`'s own tests to construct a
+    /// `Provenance::Discovered` fixture without going through real upward filesystem
+    /// discovery (regression coverage for the telemetry hard-deny gate in
+    /// `Engine::open`).
+    pub(crate) fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// How this state dir was chosen — see [`Provenance`].
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
     }
 
     /// Creates the state directory and its `policy/` and `packs/` subdirectories if absent.

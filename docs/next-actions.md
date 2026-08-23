@@ -253,22 +253,34 @@ it isn't lost).
 **Recommended phases** (same-phase items have no hard dependency on each other):
 - **Phase 0 — zero dependencies:** the Q10 privacy write-up (below); the fieldless-enum `Hash`
   cleanup (below). Cheapest items, no reason to wait.
-- **Phase 1 — the emitter.** Not previously named as its own item, but it's the actual missing
-  piece: nothing calls `TryFrom<&AuditEvent>`/`EdgeEvent::try_from_audit_event`
-  (`telemetry/edge_event.rs:158`) from a real code path today. Intercept at the **`AuditSink`
-  boundary**, not inside `mask()` — `mask()` never sees a `DemaskDecision`, which is written by
-  `rehydrate()`'s denial helper (`api.rs:616`), and that is the *only* variant either conversion
-  entry point currently returns `Ok` for from real traffic (`DemaskRequest` is defined but never
-  emitted). A sink wrapper covers all three write sites at once; a `mask()`-side hook would miss
-  the one path that works today.
-  **Scope, stated plainly:** Phase 1 buffers **unsigned payload candidates** (`EdgeEvent` values
-  and conversion outcomes), *not* `TelemetryEvent`s. Full records are custodian-blocked from day
-  one — `Envelope::new`, `Integrity::new` and the `TelemetryEvent::new_*` constructors are
-  `pub(crate)` (`telemetry/envelope.rs:96`, `envelope.rs:167`, `telemetry/mod.rs:158`) and
-  `device_ref` stays `None` until enrolment exists (`envelope.rs:72`). Count and log `Err`s rather
-  than dropping silently (a silent zero-`Ok` pipeline looks identical to a broken one).
-  Deliberately built against today's mostly-reject-arms type system rather than waiting for every
-  conversion to work first — same build-it-and-see-what-breaks approach the two merged PRs used.
+- [x] ~~**Phase 1 — the emitter.**~~ **Built 2026-08-23** — `crates/vg-audit/src/telemetry_sink.rs`
+  (`TelemetryCountingAuditSink`/`SharedTelemetrySink`/`TelemetryConversionCounts`, a decorator
+  around any `AuditSink`, attempts `EdgeEvent::try_from_audit_event` on every write and counts
+  the outcome per `AuditEvent` variant — intercepts at the `AuditSink` boundary as planned, not
+  inside `mask()`), wired into `Engine::open` (`crates/vg-adapters-claude/src/runtime.rs`) behind
+  a new opt-in policy flag (`RawPack.telemetry_enabled`, `crates/vg-policy/src/config.rs`, reached
+  via a new default `PolicyEngine::telemetry_enabled()` trait method,
+  `crates/vg-core/src/traits.rs`) — **not originally scoped in this phase's sketch above**,
+  added because wiring into real production construction (a scope decision made in this
+  session's interview, since the two earlier telemetry PRs deliberately stayed unwired) meant
+  ADR-015's "opt-in, never opt-out" ratification needed an actual config surface, which
+  previously didn't exist anywhere in the code.
+  **A second, more consequential scope addition, found only during review, not planned going
+  in:** `StatePaths` (`crates/vg-adapters-claude/src/state.rs`) now carries its own
+  `Provenance`, and `Engine::open` refuses to honor `telemetry_enabled()` when the state dir's
+  provenance is `Discovered` (F3 — a `.veilgremlin/` adopted wholesale from a cloned repo's
+  ancestor directory). Before this fix, a hostile repo could silently trigger real OS-keychain
+  secret generation via a committed `repo.policy.json`, with zero operator-facing signal, on the
+  automatic `vg hook` path Claude Code invokes on every tool call. Found by a fresh-context
+  adversarial reviewer during this session's doubt-driven-development pass, confirmed by a
+  second, Codex cross-model round after the fix. See `docs/decisions.md`'s 2026-08-23 Phase 1
+  entry for the full findings list (this and two smaller fixes: mutex-poison recovery so a
+  telemetry-only fault can never block the real audit-log write; an env-var test-cleanup guard).
+  `cargo build/clippy -D warnings/fmt --check/test` all clean, workspace-wide.
+  **Scope, still accurate:** Phase 1 buffers **unsigned payload candidates** (`EdgeEvent` values
+  and conversion outcomes), *not* `TelemetryEvent`s — full records stay custodian-blocked (see
+  the still-open `veil-custodian` item below), and nothing here transmits anywhere; counts are
+  in-memory only, inspectable via `Engine::telemetry_counts()`.
 - **Phase 2 — the reason dictionary**, self-contained but *not* a config-only change (its own
   Plan-Mode session, same shape as the pseudonymization build). The reconciliation plan's §5
   already answers "how do dashboards get code→text": "belongs with the policy/detector-pack
