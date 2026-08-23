@@ -3011,3 +3011,89 @@ JSON Schema generation) and the still-untouched "six raw-capable `String` surfac
 --locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
 clean, uncached build (verified repeatedly through the review rounds, not just once at the end).
 311 tests pass, 0 failures, 0 regressions to any pre-existing test.
+
+## 2026-08-23 — `ActorId` pseudonymization built (keyed HMAC, per-device key)
+
+Built the first concrete unblock for `TelemetryReject::RequiresActorPseudonymization`, per
+`docs/next-actions.md`'s Phase 1a follow-up and this session's own interview (ratified: per-device
+key, no cross-device correlation; OS Keychain, new service entry). Real design correction found
+during planning, before writing code: the ratified `TryFrom<&AuditEvent> for TelemetryEvent`
+(`docs/decisions.md:2883`) takes only `&AuditEvent` — no room for a key — and `vg-core`
+architecturally cannot own OS keychain access, so it can **never** return `Ok` for
+`DemaskRequest`/`DemaskDecision`, key or no key. Built a second, explicitly separate entry point
+instead, `EdgeEvent::try_from_audit_event(event, actor_key)`, alongside (not replacing) the frozen
+`TryFrom`. Scoped to producing an `EdgeEvent` payload only, not a full `TelemetryEvent` —
+`Envelope`/`Integrity` construction (timestamps, sequence, signing) is separate, unbuilt work
+gated on `veil-custodian`'s device key.
+
+**What was built:** `crates/vg-core/src/telemetry/pseudonymize.rs` (`ActorPseudonymKey` —
+security material, redacting `Debug`, zeroize-on-drop, `PartialEq`/`Eq` but never `Hash`;
+`pseudonymize_actor`, keyed HMAC-SHA256 with a fixed domain-separation label); `crates/vg-vault/
+src/keychain.rs` extended with `load_or_create_actor_pseudonym_key` (fixed `service`/`account =
+"default"` — one key per device, not per vault path — plus a `VG_ACTOR_PSEUDONYM_KEY_HEX` test
+seam mirroring `VAULT_KEY_ENV`); `EdgeEvent::try_from_audit_event`, exhaustive over all six
+`AuditEvent` variants with no wildcard, returning the identical `TelemetryReject` the bare
+`TryFrom` already returns for every variant it cannot itself resolve (verified by a direct
+consistency test); a new `TelemetryReject::InvalidField` variant so `DemaskDecision`'s
+`policy_version: String -> VersionToken` failure is distinguishable from "needs a key" (a valid
+key would not fix a bad `policy_version`).
+
+Two rounds of adversarial doubt-driven-development review — single-model, then Codex cross-model
+— found and closed (round labels below match which round found each):
+
+- **Round 1: the env-var test seam was silent** — no warning when `VG_ACTOR_PSEUDONYM_KEY_HEX`
+  was honored, unlike `VAULT_KEY_ENV`'s existing precedent. Added an `eprintln!` WARNING.
+- **Round 1 (confirmed by real evidence, not left as an open question): no `ActorId`
+  canonicalization before hashing, while `crates/vg-cli/src/main.rs`'s `vg demask --actor
+  <STRING>` is free-typed, unvalidated CLI input** — the same real actor typing `"jane.doe"` vs.
+  `"Jane.Doe"` vs. `" jane.doe "` across invocations would pseudonymize differently even on the
+  same device, breaking the property the function exists to provide. Fixed: trim + lowercase.
+  **Round 2 (Codex) found the fix incomplete** — internal whitespace runs (`"jane  doe"`) weren't
+  collapsed. Fixed: reused `crate::keying::canonicalize`'s `split_whitespace().join(" ")` step.
+- **Round 1: `load_or_create_actor_pseudonym_key` returned a bare `[u8; 32]`** — default `Debug`,
+  `Copy`, no forced zeroize. Changed to return the already-wrapped `ActorPseudonymKey`.
+  **Round 2 (Codex) found this reduced, not closed, the exposure window** — the shared
+  `encode_key`/`decode_key` helpers still built unzeroized `String`/`Vec<u8>` hex intermediates
+  underneath. Fixed: both now build `zeroize::Zeroizing<String>`/`Zeroizing<Vec<u8>>` (new direct
+  `vg-vault` dependency on `zeroize`, already used elsewhere in the workspace).
+- **Round 1: `decode_key`'s error text said "stored DB key is..." unconditionally**, wrong once
+  the function started decoding a second secret. Generalized to "stored key is...".
+  **Round 2 (Codex) found the generalization too vague to be actionable.** Threaded a `label: &str`
+  parameter through so the error names which secret failed.
+- **Round 2 (Codex) found a Medium bug: the doc comment claimed the keychain create-race was
+  "tracked as a follow-up in `docs/next-actions.md`," but it wasn't actually there** — a
+  claim/reality mismatch. Fixed by actually adding it (see `docs/next-actions.md`'s 2026-08-23
+  pseudonymization entry).
+
+**Two High findings from round 2 (Codex), deliberately not fixed — real, unresolved, and recorded
+rather than silently accepted or downgraded:**
+1. **The env-var test seam can silently defeat "no cross-device correlation"** if the same value
+   is ever set on two machines. No structural fix exists within this codebase's test-seam
+   architecture (env-var check inside the production function, unconditional, is the same shape
+   `VAULT_KEY_ENV` already uses — downstream crates' integration/CLI tests link this crate without
+   `cfg(test)`, so a compile-time gate isn't available). Strengthened the warning to name the
+   specific consequence; the risk itself stands.
+2. **`ActorPseudonymKey::from_bytes` is unrestricted `pub`**, so nothing in the type system
+   prevents a production caller from fabricating a fixed/weak/shared key instead of using
+   `vg_vault::load_or_create_actor_pseudonym_key`. Required to stay `pub` because
+   `crates/vg-core/tests/telemetry.rs` is a separately-compiled integration-test crate and can
+   only reach `pub` items. A sealed-trait/capability-token redesign could close this properly;
+   judged disproportionate to this slice. Candidate hardening item, `docs/next-actions.md`.
+
+**One Medium finding from round 2 (Codex), out of scope, not fixed here:** several fieldless
+`telemetry::` enums (`SchemaVersion`, `SigningAlgorithm`, `DeploymentStage`, `Action`, `Outcome`,
+`EdgeOutcome`, `Severity`) still derive `Hash`, inconsistent with `telemetry::`'s stated "no
+`Hash`" convention — pre-existing code from the already-merged PR #47, not touched by this change,
+and not an active leak (no fields, so nothing for a derived `Hash` to expose). Tracked in
+`docs/next-actions.md` as a small, self-contained cleanup item.
+
+**Corrected a pre-existing but now-visible inaccuracy, not otherwise fixable:** the frozen
+`TryFrom<&AuditEvent>`'s `DemaskDecision` arm blanket-reports `RequiresActorPseudonymization` even
+for a `DemaskDecision` whose `policy_version` would independently fail conversion — the bare
+`TryFrom` has no way to distinguish this from `EdgeEvent::try_from_audit_event`'s more precise
+`InvalidField`, since its signature can't carry the extra context. Annotated inline with the
+residual; the signature itself is frozen and out of scope to change.
+
+**Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
+--locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
+clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.

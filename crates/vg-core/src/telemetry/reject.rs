@@ -54,4 +54,21 @@ pub enum TelemetryReject {
         variant: &'static str,
         decision_ref: &'static str,
     },
+
+    /// A field that has an actor-pseudonymization-independent conversion failure of its
+    /// own — e.g. `DemaskDecision`'s `policy_version: String` failing
+    /// `VersionToken`'s bounded-charset validation. Distinct from
+    /// [`RequiresActorPseudonymization`](Self::RequiresActorPseudonymization): supplying
+    /// a valid actor key would not fix this rejection, so conflating the two would hide
+    /// a real, independently-actionable data problem behind "pseudonymization isn't
+    /// built yet." Added for [`crate::telemetry::EdgeEvent::try_from_audit_event`],
+    /// which has more context (an actor key) than the bare `TryFrom<&AuditEvent>` and so
+    /// can surface this failure mode instead of always reporting
+    /// `RequiresActorPseudonymization`.
+    #[error("{variant}.{field} failed conversion: {reason}")]
+    InvalidField {
+        variant: &'static str,
+        field: &'static str,
+        reason: &'static str,
+    },
 }

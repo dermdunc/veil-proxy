@@ -52,6 +52,8 @@ use crate::error::{crypto_err, sql_err};
 use crate::keychain::load_or_create_db_key;
 use crate::random::fill_random;
 
+pub use crate::keychain::load_or_create_actor_pseudonym_key;
+
 /// The default OS-keychain service name under which the DB key is stored.
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "com.veilgremlin.vault";
 

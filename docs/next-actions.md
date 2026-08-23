@@ -170,9 +170,36 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       **Every `TryFrom<&AuditEvent>` arm still rejects** — this is the honest, reviewed state, not
       an oversight (see `telemetry::mod`'s module doc). What's still needed before any arm can
       return `Ok`, in the order the reject reasons name:
-      - **`ActorId` pseudonymization** (keyed HMAC, computed locally) — unblocks
-        `DemaskDecision` (the one `AuditEvent` variant actually constructed in production
-        today) and `DemaskRequest`. Still not started.
+      - [x] ~~**`ActorId` pseudonymization** (keyed HMAC, computed locally)~~ **Built
+        2026-08-23** — `crates/vg-core/src/telemetry/pseudonymize.rs`
+        (`ActorPseudonymKey`, `pseudonymize_actor`), `crates/vg-vault/src/keychain.rs`
+        (`load_or_create_actor_pseudonym_key`, per-device OS-keychain-backed, fixed
+        `account = "default"`), `EdgeEvent::try_from_audit_event` (a **second**,
+        key-carrying conversion entry point alongside the frozen, keyless
+        `TryFrom<&AuditEvent>` — the ratified signature at `docs/decisions.md:2883` can
+        never take a key, so it stays reject-only forever; this new function is what
+        actually unblocks `DemaskRequest`/`DemaskDecision` in practice). Two rounds of
+        adversarial review (single-model, then Codex cross-model). See
+        `docs/decisions.md`'s 2026-08-23 pseudonymization entry for the full findings
+        list and the residual risks recorded below, still open:
+        - **Env-var test seam (`VG_ACTOR_PSEUDONYM_KEY_HEX`) can silently defeat the
+          "no cross-device correlation" guarantee** if the same value is ever set on two
+          machines — no structural fix found within this codebase's existing test-seam
+          architecture (same shape as `VAULT_KEY_ENV`); mitigated with a loud stderr
+          warning naming the specific consequence, not solved.
+        - **`ActorPseudonymKey::from_bytes` is unrestricted `pub`** (needed so
+          `crates/vg-core/tests/telemetry.rs`, a separate compiled crate, can construct
+          test keys) — nothing in the type system stops a production caller from
+          fabricating a fixed/weak/shared key instead of using
+          `vg_vault::load_or_create_actor_pseudonym_key`. A sealed-trait/capability-token
+          redesign could close this; not attempted here as disproportionate to this
+          slice. Candidate hardening item for a future session.
+        - **Keychain create-race, inherited from `load_or_create_db_key`, widened for
+          this key**: two `vg-*` processes launched near-simultaneously on a device's
+          first-ever run can each mint a different key (no atomic compare-and-set
+          available via the `keyring` crate). Wider than the DB key's version of the
+          same race because every vault on a device shares one fixed
+          `(service, account)` pair. Not fixed.
       - **The versioned reason dictionary** — unblocks `Block` → `EdgeEvent::BlockedAttempt`.
         Distribution mechanism deliberately unscoped (reconciliation plan §5).
       - **The in-emitter aggregator** (groups `AuditEvent`s by trace before minting a
@@ -188,9 +215,18 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       `DetectorId(pub String)`, `Block.reason: String`, `policy_version: String`,
       `EntityType::Custom(String)`, `ArtefactKind::SourceCode(String)` are all still raw in
       `vg-core`'s own base types; the telemetry layer works around this by rejecting or
-      collapsing at the telemetry boundary (e.g. `EntityClassId::Custom` collapses the name,
-      `ActorPseudonym` has no constructor yet), not by fixing the underlying types. `ActorId`
-      pseudonymization specifically blocks two of the six `TelemetryReject` reasons above.
+      collapsing at the telemetry boundary (e.g. `EntityClassId::Custom` collapses the name).
+      `ActorId` pseudonymization (built 2026-08-23, above) unblocks conversion for
+      `DemaskRequest`/`DemaskDecision` via the second entry point, but does not touch
+      `ActorId`'s own `pub String` field — the underlying type is still raw.
+- [ ] **Minor consistency cleanup: several fieldless `telemetry::` enums still derive `Hash`**
+      (`SchemaVersion`, `SigningAlgorithm`, `DeploymentStage`, `Action`, `Outcome`,
+      `EdgeOutcome`, `Severity`) — found by a Codex cross-model doubt-driven-development
+      round during the 2026-08-23 pseudonymization work, out of scope for that change (all
+      pre-existing, merged in PR #47). Not an active leak (they carry no fields, so a derived
+      `Hash` has no raw bytes to expose) — the concern is purely convention consistency with
+      the rest of `telemetry::`'s "no `Hash`" rule. Small, low-risk, self-contained cleanup for
+      a future session.
 - [ ] **`veil-custodian`: build the device enrolment registry and signing-key issuance** (Q1, Q3
       ratifications). Extends the existing mTLS device-cert issuance (`docs/decisions.md:2894`)
       with: an enrolment registry `veil-observatory` can query for governed-inventory membership
