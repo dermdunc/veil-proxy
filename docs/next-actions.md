@@ -154,9 +154,76 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       decision on backward-compatibility with any already-written `{"custom":"<name>"}` log
       lines. A hard prerequisite for v1.5 telemetry regardless. Raised as decision packet
       material for the launching session's compliance loop.
-- [ ] **Phase 1a** — close the six raw-capable `String` surfaces, land the `interface-contracts`
-      v1.4 → v1.5 bump (first bump in the project's history with real downstream callers: 7
-      crates, ~221 tests), then `TelemetryEvent` + `TryFrom` in `vg-core`.
+- [x] ~~Phase 1a, `TelemetryEvent` + `TryFrom` in `vg-core`~~ **Built 2026-08-23, PR #47
+      (`https://github.com/dermdunc/veilgremlin/pull/47`), not yet merged — awaiting human
+      review, deliberately not self-merged given this is new public `vg-core` surface.** —
+      `crates/vg-core/src/telemetry/` (envelope + `Receipt`/`Alert`/`EdgeEvent`, the §3.2a type
+      inventory, `TryFrom<&AuditEvent>` exhaustive with no wildcard arm), `interface-contracts.md`
+      bumped to v1.5 (§7a), `implementation-plan.md` §3.2-3.4 rewritten to match what was actually
+      built. Reviewed across **four** rounds of adversarial review (single-model → Codex →
+      single-model → Codex+Opus in parallel) — see `docs/decisions.md`'s 2026-08-23 entries for
+      the full findings list; most severe was a **proven** `#[derive(Hash)]` side-channel on the
+      `String`-backed token types (an external-crate exploit recovered raw strings byte-for-byte
+      through a custom `Hasher`), closed by removing `Hash` from every type wrapping variable
+      content. `cargo build/clippy -D warnings/fmt --check/test` all clean, workspace-wide,
+      311 tests passing, zero regressions.
+      **Every `TryFrom<&AuditEvent>` arm still rejects** — this is the honest, reviewed state, not
+      an oversight (see `telemetry::mod`'s module doc). What's still needed before any arm can
+      return `Ok`, in the order the reject reasons name:
+      - **`ActorId` pseudonymization** (keyed HMAC, computed locally) — unblocks
+        `DemaskDecision` (the one `AuditEvent` variant actually constructed in production
+        today) and `DemaskRequest`. Still not started.
+      - **The versioned reason dictionary** — unblocks `Block` → `EdgeEvent::BlockedAttempt`.
+        Distribution mechanism deliberately unscoped (reconciliation plan §5).
+      - **The in-emitter aggregator** (groups `AuditEvent`s by trace before minting a
+        `Receipt`) plus **Bedrock `requestMetadata` trace stamping** — unblocks
+        `Scan`/`PolicyDecision`. No trace id exists anywhere upstream in `vg-core` today; this
+        is the biggest remaining gap. Must also implement the Q3 5-minute replay-window
+        consequence flagged in the reconciliation plan's §4a (an offline device reconnecting
+        after the window elapses needs a drop/re-mint/queue decision, not made yet).
+      - JSON Schema generation (no `serde`/`schemars` dependency exists in `vg-core` yet) —
+        needed before the "schema published as a versioned artifact" exit gate is met.
+- [ ] **Close the six raw-capable `String` surfaces at their source** (`docs/architecture/implementation-plan.md`
+      §3.1) — **still open, not done by the `TelemetryEvent` build above.** `ActorId(pub String)`,
+      `DetectorId(pub String)`, `Block.reason: String`, `policy_version: String`,
+      `EntityType::Custom(String)`, `ArtefactKind::SourceCode(String)` are all still raw in
+      `vg-core`'s own base types; the telemetry layer works around this by rejecting or
+      collapsing at the telemetry boundary (e.g. `EntityClassId::Custom` collapses the name,
+      `ActorPseudonym` has no constructor yet), not by fixing the underlying types. `ActorId`
+      pseudonymization specifically blocks two of the six `TelemetryReject` reasons above.
+- [ ] **`veil-custodian`: build the device enrolment registry and signing-key issuance** (Q1, Q3
+      ratifications). Extends the existing mTLS device-cert issuance (`docs/decisions.md:2894`)
+      with: an enrolment registry `veil-observatory` can query for governed-inventory membership
+      without resolving identity, and a per-device signing keypair minted alongside the mTLS cert.
+      Blocks `veil-proxy`'s receipt-signing work and `veil-observatory`'s bypass-detection rule.
+- [ ] **Write the Q10 telemetry-metadata privacy section** (retention, residency, permitted joins,
+      re-identification path) into the ratification packet, alongside the Q1 registry work — the
+      plan explicitly deferred this write-up, it is not yet done
+      (`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4a).
+- [x] ~~Get the `veil-observatory` ADR-0004 scope note actually accepted on that side.~~
+      **Reviewed and accepted-with-edits 2026-08-23** by a dedicated `veil-observatory`-side
+      session (own judgment, not a rubber stamp — see that repo's `docs/session-log.md`). Marker
+      flipped from "Proposed amendment" to "Amended." Merged to `main` via PR #8
+      (`https://github.com/dermdunc/veil-observatory/pull/8`, fast-forward `835d083..457105c`),
+      branch deleted.
+- [x] ~~New cross-repo decision surfaced by the veil-observatory-side review: should ADR-0014's
+      correlation/determinism suite get the same formal CI-veto status ADR-0012's fuzz test has
+      under Q5?~~ **Resolved by `codex` critique (`xhigh` effort, 2026-08-23): no, not as
+      proposed.** ADR-0012's fuzz test is genuinely schema-shaped (canaries in string fields,
+      checkable against arbitrary schema-conformant instances) and maps cleanly onto a
+      producer-schema veto. ADR-0014's guarantees (exact-match `veil_trace_id` correlation, no
+      fuzzy fallback, replay determinism) live in pipeline/adapter *behavior*
+      (`correlator.py`, `bedrock.py`, `receipt.py`), spread across three test files, not the one
+      suite named in the ADR-0004 scope note — a schema can protect the *fields* correlation
+      needs but can't prove the *behavior*. Wiring the whole existing `test_pipeline.py` in as a
+      schema-level veto would be a category error. **Deferred, not ratified**, until a first
+      generated schema artifact exists. When it does, build a narrow, purpose-built
+      **correlation-contract gate** instead of reusing the broad suite: stable field-name/pointer
+      checks on the `linkage` block, plus a synthetic fixture matrix (valid pair / missing trace /
+      mismatched trace / duplicate trace / account-region mismatch / `bedrock-mantle`
+      unmonitored-path) that `veil-proxy` CI can run against `veil-observatory`'s adapters without
+      needing live pipeline data. Not blocking anything today — no schema artifact exists on
+      either side yet.
 
 M3 (request masking) remains the standing product priority; the leak fix is small and should not
 displace it for long.

@@ -1,6 +1,6 @@
-# VeilGremlin — Interface Contracts (v1.4)
+# VeilGremlin — Interface Contracts (v1.5)
 
-**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
+**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2); v1.5 (2026-08-23 — `TelemetryEvent` added, `vg-core`'s `telemetry::` module; see §1 and §7a). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
 
 These are the seams that let squads build in parallel. They are illustrative Rust signatures — Squad 0 owns the canonical definitions in `vg-core`. Other squads implement against these traits and **do not** depend on each other's internals.
 
@@ -112,6 +112,8 @@ pub struct PlaceholderBinding { pub display: String, pub mapping_ref: MappingRef
 pub struct MappingRef(pub Uuid);      // handle only; never the value
 
 pub struct AuditEvent { /* see vg-audit contract */ }
+
+pub enum TelemetryEvent { /* v1.5 — see §7a; owned by vg-core, telemetry:: module */ }
 ```
 
 **Invariant (tested, not type-enforced):** `MaskedPack` must never contain a raw detected value or a vault key in `.text` or `.policy_version`. This is a testing/convention discipline, not a type-system guarantee — every field is `pub` with no smart constructor, so nothing stops code from hand-constructing one directly. `MappingRef` being an opaque `Uuid` (never a real key) makes the "no vault key" half true by construction; "no raw value" depends on `mask()`'s correctness and test coverage (`vg_core::conformance::assert_masked_pack_excludes_raw_values`). Squad 5/7 add a property test.
@@ -274,6 +276,45 @@ Contract: append-only; **no raw values** in any variant (refs/counts/versions on
 
 ---
 
+## 7a. `TelemetryEvent` (v1.5, owned by `vg-core`, `telemetry::` module)
+
+```rust
+pub enum TelemetryEvent {
+    Receipt(Envelope, Box<Receipt>),   // veil.receipt.v2 — one per governed Bedrock invocation
+    Alert(Envelope, Alert),            // veil.alert.v1 — immediate lane, deliberately minimised
+    EdgeEvent(Envelope, EdgeEvent),    // veil.edge_event.v1 — demask / blocked-before-send
+}
+
+impl TryFrom<&AuditEvent> for TelemetryEvent {
+    type Error = TelemetryReject;
+    // Exhaustive over all six AuditEvent variants, no wildcard arm — enforced by being
+    // defined inside vg-core, where AuditEvent's #[non_exhaustive] doesn't force one.
+}
+```
+
+**Invariant (type-enforced, not merely tested)** — the stronger guarantee `MaskedPack`'s own
+invariant note above (§1) explicitly does not make: every field on every `telemetry::` payload
+type is private, with no public constructor accepting an unvalidated `String`, no
+`serde_json::Value`, and no `Debug` impl on any of them (`vg-core/src/telemetry/ids.rs`'s module
+doc has the full rationale, including a proven `#[derive(Hash)]` side-channel closed in review —
+`Hash` is absent from every type wrapping variable content for the same reason `Debug` is).
+Checked by `vg_core::conformance::assert_telemetry_token_rejects_raw_value` (the mirror image of
+`assert_audit_event_excludes_raw_values`: proves a bounded-token constructor *rejects*
+non-conforming input, since there is no successfully-constructed instance left to inspect via
+`Debug`) and by `crates/vg-core/tests/telemetry.rs`'s exhaustive `TryFrom<&AuditEvent>` reject
+table.
+
+**Status: types built, `TryFrom` conversion currently rejects every `AuditEvent` variant.** Not a
+placeholder — the honest state of the codebase this was built against: no trace id exists upstream
+to aggregate `Scan`/`PolicyDecision` into a `Receipt`; `ActorId` is still raw, blocking
+`DemaskRequest`/`DemaskDecision`; `Block`'s reason dictionary doesn't exist yet;
+`MappingCreated` defaults to excluded pending an open decision (Q8). See
+`docs/architecture/implementation-plan.md` §3.2/§3.2a for the full type inventory and
+`docs/architecture/telemetry-receipt-reconciliation-plan.md` for the ratified design this
+implements. No JSON Schema artifact is published yet — schema generation is separate, later work.
+
+---
+
 ## 8. Adapter contract (implemented by `vg-adapters-claude`, consumes `vg-core`)
 
 - Claude Code hooks map to: `UserPromptSubmit` → `mask(prompt)`; `PreToolUse` → `mask(tool_input)`; `PostToolUse` → `mask(tool_response)`; pre-request → assemble `MaskedPack` only.
@@ -292,4 +333,5 @@ Contract: append-only; **no raw values** in any variant (refs/counts/versions on
 - **v1.2** — 2026-07-18 (Task T09). `MaskedPack` gained `bindings: Vec<PlaceholderBinding>` (additive); `rehydrate` re-signed to `rehydrate(pack, policy, ns, dest, actor)` with the hard-deny gate kept first and substitution only via pack-minted displays. See §1/§2 inline notes and `../decisions.md`'s 2026-07-18 T09 entry.
 - **v1.3** — 2026-07-18 (Task T09 doubt-pass). §8's hook exit-code scheme corrected to the platform's real semantics: transform = exit 0 + JSON (`updatedInput` / `updatedToolOutput` / `decision:block`-with-masked-resubmit), block = exit 2. The frozen `0/2/1` scheme was inverted and failed open. No `vg-core` type changed; this is an adapter-boundary correction.
 - **v1.4** — 2026-07-18 (Task T10). `benchmark` gained a `ctx: &Context` parameter (`benchmark(corpus, ctx, policy)`) so the eval harness can reach the detectors/parsers it scores the corpus against — the same gap and same sanctioned fix as `mask` at v1.1. `Metrics` unchanged. See §2's inline contract-change note and `../decisions.md`'s 2026-07-18 T10 entry. Downstream: no current caller existed.
+- **v1.5** — 2026-08-23. `TelemetryEvent` added: a new public enum in `vg-core`'s `telemetry::` module (`Receipt`/`Alert`/`EdgeEvent` payload kinds plus their supporting types — see §1's forward reference and §7a's full contract, and `docs/architecture/implementation-plan.md` §3.2a for the complete type inventory). Purely additive — no existing public type or trait above changed. Downstream: no current caller existed (`TryFrom<&AuditEvent> for TelemetryEvent` rejects every variant today; nothing in production constructs a `TelemetryEvent`). Built against the ratified `docs/architecture/telemetry-receipt-reconciliation-plan.md`, across four rounds of adversarial review (`../decisions.md`'s 2026-08-23 entries) — the most severe finding was a proven `#[derive(Hash)]` side-channel on `String`-backed token types, closed by removing `Hash` from every type wrapping variable content.
 - Increment on any breaking change to a public type/trait above. Record the bump in `../decisions.md` and notify downstream squads.

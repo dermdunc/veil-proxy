@@ -169,6 +169,29 @@ pub fn assert_audit_event_excludes_raw_values(event: &AuditEvent, raw_values: &[
     }
 }
 
+/// Proves a bounded-token constructor (e.g. `telemetry::VersionToken::try_from`)
+/// actually rejects non-conforming input, rather than that a successfully-constructed
+/// instance hides it.
+///
+/// This is the deliberate mirror image of [`assert_audit_event_excludes_raw_values`]:
+/// `AuditEvent`'s fields are public and string-shaped, so that helper can construct an
+/// event carrying a real raw value and assert it's absent from `Debug` output —
+/// meaningful because the type *could* have carried it. `telemetry::TelemetryEvent`'s
+/// bounded-token types have no public constructor that accepts an unvalidated `String`
+/// at all, so the only property left to check is that the fallible constructor itself
+/// actually enforces its bound.
+pub fn assert_telemetry_token_rejects_raw_value<T, E>(
+    try_from: impl Fn(&str) -> Result<T, E>,
+    raw_values: &[&str],
+) {
+    for raw in raw_values {
+        assert!(
+            try_from(raw).is_err(),
+            "token constructor accepted a raw-looking value {raw:?} — bounding is not enforced"
+        );
+    }
+}
+
 /// `MaskedPack` must never contain a raw detected value or a vault key, in any of its
 /// string-bearing fields (`text`, `policy_version`, and each `bindings[].display`).
 /// `mapping_refs` (and each binding's `mapping_ref`) holds only opaque `MappingRef(Uuid)`

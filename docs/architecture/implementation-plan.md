@@ -105,8 +105,8 @@ All of this is in the existing repo. Nothing central can start until it lands.
 >
 > | Path | Handling classes | Renders |
 > |---|---|---|
-> | `redaction_marker` (`vg-core/src/api.rs:450`) | `IrreversibleRedact`, `Block` | `[REDACTED:CUSTOM:{name}]` |
-> | `type_tag_for_display` (`vg-core/src/keying.rs:219`) | **`Mask` — the default class** | `CUSTOM_{SCREAMING_SNAKE}_001` |
+> | `redaction_marker` (`vg-core/src/api.rs:430`) | `IrreversibleRedact`, `Block` | `[REDACTED:CUSTOM:{name}]` |
+> | `type_tag_for_display` (`vg-core/src/keying.rs:206`) | **`Mask` — the default class** | `CUSTOM_{SCREAMING_SNAKE}_001` |
 >
 > The `api.rs` chain is: `replacements` (`:303`) → spliced into `out` (`:322`) → `text` (`:325`).
 > The `keying.rs` path is the more exposed of the two, since `Mask` is the default.
@@ -114,7 +114,7 @@ All of this is in the existing repo. Nothing central can start until it lands.
 > **Why it is not reachable today:** no shipped detector declares `EntityType::Custom` — zero
 > occurrences in `crates/vg-detectors/` or `crates/vg-adapters-claude/`. Nothing currently
 > *produces* a `Custom` finding. But every other layer is already wired for it
-> (`vg-vault/src/codec.rs:65,95`, `vg-policy/src/config.rs:313`, `keying.rs:219`), so the defect
+> (`vg-vault/src/codec.rs:65,95`, `vg-policy/src/config.rs:313`, `keying.rs:206`), so the defect
 > arms itself the moment a custom detector is added, with nothing guarding the path.
 >
 > **A latent leak in a security control, with all the plumbing already in place and no test
@@ -129,34 +129,144 @@ All of this is in the existing repo. Nothing central can start until it lands.
 > Currently invisible to the suite: `assert_masked_pack_excludes_raw_values` would catch it, but
 > no test supplies a custom label as the raw value.
 
-### 3.2 The `TelemetryEvent` type
+### 3.2 The `TelemetryEvent` type — **built, 2026-08-23**
 
-- Zero `String` columns: enums for kind/entity/artefact/destination/reason, integers for
-  counts/latency/schema version, booleans for decisions, fixed-width hashes where identity is
-  needed.
-- All fields private. No constructor accepting `String`. No `serde_json::Value`, no `Debug`
-  serialisation path.
-- `TryFrom<&AuditEvent>`, **defined inside `vg-core`** so exhaustiveness is enforceable, with an
-  explicit `TelemetryReject` for audit events that are not valid telemetry.
-- Human-readable block explanations move to a **versioned reason dictionary** rendered
-  dashboard-side, not shipped as text.
+**This section is superseded as the design source by
+`docs/architecture/telemetry-receipt-reconciliation-plan.md`** (ratified 2026-08-23, all eleven
+open questions resolved) — that document is the source of truth for the shape; this section
+records what was actually implemented against it, in `crates/vg-core/src/telemetry/`.
 
-### 3.3 Emitter and lanes
+The original single-undifferentiated-type sketch above was wrong: the ratified plan's §3.2
+resolved it into **a signed envelope plus three record kinds**, not one type:
 
-- Two lanes per §4: batched bulk telemetry, and an immediate low-latency alert lane. Alert-lane
-  payloads are *more* minimised than bulk, never less.
-- Local on-device alert-rule evaluator (alerting must not depend on central bulk ingest).
-- Independent opt-ins for the two lanes (§10 Q10), with "alert on, bulk off" as a tested state.
-- Device pseudonym minted at enrolment — never the OS hostname (§6.1).
+- **`Envelope`** (`telemetry/envelope.rs`) — fields common to every record: `schema_version`,
+  `contract_revision`, `record_id`, `issued_at_us`, `device_ref` (nullable — per-laptop v1, no
+  tenant scoping), `tenant_id` (nullable), `sequence`, `valid_until_us`, `integrity`. No `lane`
+  field — the record kind already implies the lane. `Envelope::new` enforces
+  `valid_until_us` is strictly after `issued_at_us` and within a bounded sanity window.
+- **`Receipt`** (`veil.receipt.v2`, boxed inside `TelemetryEvent::Receipt`) — one per governed
+  Bedrock invocation: `linkage` (`TraceLinkage`), `invocation`, `caller`, `controls`, `timing_us`,
+  `edge_outcome`. `Action` (per-entity-class: `Masked | Redacted | Blocked | Allowed`, generated
+  from `HandlingClass` via a compiler-enforced `From` impl) and `Outcome` (per-invocation) are two
+  independent dimensions — the draft's `blocked_with_redaction` idea was a modelling error the
+  ratified plan corrected.
+- **`Alert`** (`veil.alert.v1`) — the immediate lane's own minimal type: `rule`, `severity` only.
+  Not a filtered view of `Receipt`; a structurally separate, deliberately smaller type, so
+  over-sharing on the low-latency path is a compile error, not a runtime discipline.
+- **`EdgeEvent`** (`veil.edge_event.v1`) — non-invocation-scoped local acts:
+  `DemaskRequest`/`DemaskDecision`/`BlockedAttempt`, each wrapping a private-fielded payload
+  struct whose fields mirror their source `AuditEvent` variant exactly (no invented fields the
+  source data can't supply).
+
+Confirmed built:
+
+- **Zero `String` columns** on the closed-enum/fixed-width types (`EntityClassId`,
+  `ArtefactKindId`, `DeviceRef`, `ReasonCode`, `TraceId`, `RecordId`, `ActorPseudonym`, `Action`,
+  `Outcome`, etc.) — see §3.2a. Seven identifier types (`VersionToken`, `DetectorSetId`,
+  `ExceptionRuleId`, `TenantId`, `AlertRuleId`, `KeyRef`, `RegistryRef`) are `String`-backed
+  underneath a private field and a fallible, charset-validated constructor — a **deliberate,
+  documented divergence** from the letter of "zero `String` columns" (see `telemetry::ids`'s
+  module doc): these identifiers are inherently human-legible, variable-content tokens that ops
+  teams need to read, and collapsing them to a fixed-width hash now would trade real information
+  loss for literal compliance, with no registry yet built to resolve a hash back to a string.
+  Flagged repeatedly across independent review rounds, not missed.
+- **All fields private. No constructor accepting an unvalidated `String`. No `serde_json::Value`.
+  No `Debug` serialisation path** — none of the value types in `telemetry::` derive `Debug` (only
+  the `thiserror::Error` types do, whose fields are compile-time-fixed safe labels). An earlier
+  draft derived `Debug` throughout and leaned on it for tests before this requirement was caught.
+  A later review round also found and closed a subtler version of the same leak: `#[derive(Hash)]`
+  on a `String`-backed type is a verbatim recovery channel (a custom `Hasher` records the bytes
+  it's given) — proven by an external-crate exploit, not just suspected. `Hash` is now absent from
+  every type wrapping variable content.
+- **`TryFrom<&AuditEvent>`, defined inside `vg-core`, exhaustive, no wildcard arm** — the six
+  `AuditEvent` variants (`crates/vg-core/src/audit.rs:20-49`) each get an explicit,
+  named `TelemetryReject` reason. As of this writing **every arm rejects**: `Scan`/`PolicyDecision`
+  need trace-scoped aggregation (no trace id exists anywhere upstream in `vg-core` yet); `Block`
+  needs the reason dictionary (§3.2's fourth bullet, below); `DemaskRequest`/`DemaskDecision` need
+  `ActorId` pseudonymization (Phase 1a's first item, §3.1, not yet built). `MappingCreated`
+  defaults to excluded (Q8) — an **open question, not a ratified exclusion**; revisit if a
+  concrete persona query needs mapping-volume metrics.
+- **Human-readable block explanations move to a versioned reason dictionary** — the `ReasonCode`
+  type (an integer index) exists; the dictionary itself is not built (§3.2a, and reconciliation
+  plan §5: "the reason-dictionary distribution mechanism... belongs with the policy/detector-pack
+  distribution channel").
+
+#### 3.2a Type inventory (the reconciliation plan's required §3.2a deliverable)
+
+Every opaque type `TelemetryEvent`'s payloads use, its concrete Rust representation, and its
+fallible constructor. **No JSON form/anchored pattern column** — schema generation (JSON Schema
+output) is separate, not-yet-built work (§3.4); the "generated form" this deliverable also asks
+for does not exist yet, so this table states the Rust side only and says so rather than inventing
+a JSON shape ahead of the generator that would produce it.
+
+| Type | Representation | Constructor | Notes |
+|---|---|---|---|
+| `TraceId` | `Uuid` (private) | `From<Uuid>`, infallible | Correlation id for a Bedrock invocation. UUID-, not ULID-backed — no ULID dependency exists in this crate. |
+| `RecordId` | `Uuid` (private) | `From<Uuid>`, infallible | Identity of one telemetry record. |
+| `VersionToken` | `String` (private) | `TryFrom<&str>`, fallible: charset `[A-Za-z0-9._-]`, ≤64 bytes, **empty allowed** | Matches `crates/vg-policy/src/config.rs:221-224`'s real, shipped `version` validator exactly, including its permissiveness on empty strings. |
+| `DetectorSetId` | `String` (private) | `TryFrom<&str>`, fallible: same charset plus `+`, ≤64 bytes, empty rejected | `+` matches the real producer (`crates/vg-core/src/api.rs:465-469`'s `detector_version`, sorted ids joined with `+`). Charset matches *observed* detector ids, not an enforced bound — `DetectorId(pub String)` itself is still unconstrained (one of the six raw-capable surfaces above, not yet closed). |
+| `ExceptionRuleId` | `String` (private) | `TryFrom<&str>`, fallible: shared base charset | Policy-authored exception-rule identifier. |
+| `TenantId` | `String` (private) | `TryFrom<&str>`, fallible: shared base charset | Always `None` in v1 (ratified Q2: per-laptop enrolment only). |
+| `AlertRuleId` | `String` (private) | `TryFrom<&str>`, fallible: shared base charset | Policy-authored alert-rule identifier. |
+| `KeyRef` | `String` (private) | `TryFrom<&str>`, fallible: shared base charset | Opaque signing-key identifier. |
+| `RegistryRef` | `String` (private) | `TryFrom<&str>`, fallible: shared base charset | Blocks the *shape* of the concrete leak the reconciliation plan §2.4 names (`:`/`/` in a raw repo path) but does not itself enforce hashing — callers are responsible for that. |
+| `DeviceRef` | `[u8; 16]` (private) | `TryFrom<&[u8]>`, fallible: exactly 16 bytes | Matches the reconciliation plan's envelope sketch pattern exactly (`^dev_[a-f0-9]{32}$` = 32 hex chars = 16 bytes). `None` until `veil-custodian`'s enrolment registry exists. |
+| `ReasonCode` | `u16` (private) | `From<u16>`, infallible | Index into the not-yet-built versioned reason dictionary. |
+| `EntityClassId` | Closed enum, `#[non_exhaustive]`, 19 fixed variants + `Custom` (unit, no payload) | `From<&EntityType>`, infallible, exhaustive in-crate | Implements ratified Q6: custom entity-class *names* are structurally unrepresentable (a unit variant, not a validated string) — the fact/count of a custom-class detection still reaches telemetry via the `Custom` tag, only the name never does. |
+| `ArtefactKindId` | Closed enum, `#[non_exhaustive]`, 11 variants, `SourceCode` collapses the language name | `From<&ArtefactKind>`, infallible, exhaustive in-crate | Same discipline as `EntityClassId` — `ArtefactKind::SourceCode(String)` is itself still raw upstream (§3.1), so telemetry must not transit the language name until it closes. |
+| `ActorPseudonym` | `[u8; 32]` (private) | **No public constructor** — `pub(crate) fn from_bytes` only | Requires the keyed-HMAC-over-`ActorId` mechanism (§3.1, first bullet) — not yet built. Defining the shape now avoids inventing a throwaway pseudonymization scheme that would be thrown away again once the real one lands. |
+| `Action` | Closed enum, `#[non_exhaustive]`, 4 variants | `From<HandlingClass>`, infallible, exhaustive in-crate | Per-entity-class handling; 1:1 rename of `HandlingClass`, not an addition. |
+| `Outcome` | Closed enum, `#[non_exhaustive]`, 5 variants | Constructed directly (no fallible conversion needed) | Per-invocation/artefact outcome, independent of `Action`. |
+| `EdgeOutcome` | Closed enum, 2 variants, no `Default` | Constructed directly | `complete`/`incomplete` must be stated explicitly — no fail-open default. |
+| `DeploymentStage` | Closed enum, `#[non_exhaustive]`, 4 variants | Constructed directly | Sole survivor of the `caller.environment`/`deployment_stage` field family (ratified Q9 dropped the free-form `environment`). |
+| `Severity` | Closed enum, `#[non_exhaustive]`, 5 variants, derives `Ord` | Constructed directly | **Hard invariant: append-only** — `Ord` is declaration-order-derived; inserting a variant between existing ones silently changes every downstream `severity >= X` comparison. |
+| `SchemaVersion` | Closed enum, `#[non_exhaustive]`, 3 variants | Constructed directly | Mirrors `TelemetryEvent`'s own variant tag; kept because the eventual generated schema needs a concrete const. Consistency with the actual payload is enforced by `TelemetryEvent::new_receipt`/`new_alert`/`new_edge_event`. |
+| `SigningAlgorithm` | Closed enum, `#[non_exhaustive]`, 2 variants | Constructed directly | Matches `veil-observatory`'s existing schema's algorithm enum. |
+
+### 3.3 Emitter and lanes — **types built, wiring not started**
+
+- **Three record kinds, not two lanes carrying undifferentiated payloads**: `Receipt` and
+  `EdgeEvent` travel on the batched bulk lane; `Alert` travels on the immediate low-latency lane,
+  and is its own minimised type rather than a filtered view of `Receipt` (§3.2). This corrects the
+  original two-lane, one-shape sketch above.
+- Local on-device alert-rule evaluator (alerting must not depend on central bulk ingest) — **not
+  built**. No `TelemetryEvent` is constructed anywhere in production code; the types exist,
+  nothing calls them outside `#[cfg(test)]`.
+- Independent opt-ins for the two lanes (§10 Q10), with "alert on, bulk off" as a tested state —
+  **not built**; this is a runtime/config concern with no code yet to test.
+- Device pseudonym minted at enrolment — never the OS hostname (§6.1) — **not built**; gated on
+  `veil-custodian`'s enrolment registry (reconciliation plan, ratified Q1), which does not exist
+  yet. `Envelope::device_ref` is typed (`Option<DeviceRef>`) and stays `None`.
+- **New, not originally budgeted**: an in-emitter aggregator that groups `AuditEvent`s by trace
+  before minting a `Receipt` (reconciliation plan §3.2's own note: "new machinery... not yet
+  budgeted"). Still not built, and still not scoped in detail — the trace id it would aggregate by
+  doesn't exist upstream yet either (§3.2's `TryFrom` gap list).
 
 ### 3.4 Gates
 
-- Extend `assert_audit_event_excludes_raw_values` to a `TelemetryEvent` equivalent.
-- A test proving `TelemetryEvent` cannot be constructed carrying a raw value.
-- Schema published as a versioned artifact consumed by `veil-observatory`.
+- **Not literally "extend `assert_audit_event_excludes_raw_values` to a `TelemetryEvent`
+  equivalent"** — that helper works because `AuditEvent`'s fields are public and string-shaped, so
+  it can construct an event carrying a real raw value and assert it's absent from `Debug` output.
+  `TelemetryEvent`'s types have no public constructor accepting a raw string and no `Debug` at
+  all, so there's no rendering path left to check at runtime. Built instead:
+  `assert_telemetry_token_rejects_raw_value` (`crates/vg-core/src/conformance.rs`) — proves a
+  bounded-token constructor actually *rejects* non-conforming input, the mirror-image property.
+- **"A test proving `TelemetryEvent` cannot be constructed carrying a raw value"** — satisfied
+  structurally, not by a dedicated runtime test: no public constructor path exists from a raw
+  `String` to any `telemetry::` value type. `crates/vg-core/tests/telemetry.rs` exercises the
+  bounded-token rejection property (above) and locks in the exhaustive `TryFrom<&AuditEvent>`
+  reject table so a change to any arm is a deliberate, reviewed test update.
+- **Schema published as a versioned artifact consumed by `veil-observatory`** — **not built**.
+  No `serde`/`schemars` dependency exists in `vg-core`; JSON Schema generation from the Rust types
+  is separate, later work, matching `AuditEvent`'s own precedent (`vg-audit` maintains a hand-kept
+  mirror schema so a `vg-core` type change is a compile error for persistence, not a silent
+  reinterpretation) rather than deriving `serde` directly on the core type.
 
-**Exit gate:** the emitter is type-level incapable of holding a raw value, and the schema is
-structurally incapable of representing one.
+**Exit gate — partially met.** The type system is type-level incapable of holding a raw value
+(built, tested, reviewed across four independent adversarial rounds — see `docs/decisions.md`).
+The schema is not yet published as an artifact at all, so "structurally incapable of representing
+one" doesn't apply yet — there is no schema, only the Rust types it would eventually be generated
+from.
 
 ---
 

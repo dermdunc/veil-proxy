@@ -2889,8 +2889,125 @@ the reasoning trail stays intact.
 | 2026-08-01 | **Display-collision measurement re-run and banked**, per `docs/next-actions.md`'s standing request. Result unchanged: 1 of 3 collision samples still corrupted. | Confirms the 2026-07-22 measurement — the FP-rate fix (RISK-0004) is a different code path (entropy/phone detector precision) and doesn't touch collision-avoiding minting at intern time, which remains the actual open fix. Landed as part of a cross-repo compliance gap-analysis loop (`veil-compliance-2026-08-01`), scoped separately from the custom-entity-label leak fix (a18a074/443b54b, PR #45) — unrelated root causes, kept as independent reviewable diffs. |
 | 2026-08-01 | **No `vg-bench` corpus samples added for the custom-entity-label leak (PR #45).** Considered and declined for this session. | `crates/vg-bench/src/corpus.rs`'s `parse_entity_type` supports exactly 6 Phase-1 label types (Email, Phone, InternalIp, Iban, SortCode, Secret) — no `Custom` variant, so a manifest sample can't express the leak's entity class at all without first extending the harness's own Rust code, not just adding JSON data. That's a real corpus-harness change deserving its own TDD/review cycle, not a same-day addition riding on an unrelated eval-banking task. Coverage for the fix instead lives in the 7 regression tests added in PR #45 (unit + integration, exercising the real `EntityType::Display`/`Keyer`/vault code directly). Extending `parse_entity_type` to support `Custom:<name>` labels is a legitimate backlog item if/when a custom-dictionary detector ships. |
 
+## 2026-08-23 — RATIFIED: telemetry/receipt schema reconciliation, all eleven open questions
+
+`docs/architecture/telemetry-receipt-reconciliation-plan.md` (draft → adversarial critique →
+verified revision, via a Fable/Codex/Opus pipeline) resolved all five blocking and six
+non-blocking open questions in conversation with the project owner. Full rationale for each is in
+the plan's §4a; summarised here:
+
+| Q | Decision |
+|---|---|
+| Q1 | `veil-custodian` owns the device enrolment registry (extends its existing mTLS device-cert issuance); `veil-observatory` queries it without being able to resolve identity |
+| Q2 | Contract v1 targets per-laptop enrolment only (no near-term SaaS/gateway deployment); `bedrock-mantle` in scope as a flagged unmonitored-path finding, not a bypass signal; receipts carry the full effective region set, not just the caller's home region |
+| Q3 | Records are signed with a custodian-issued device key minted at enrolment (separate from mTLS connection attestation); replay window is a short, fixed 5 minutes for both lanes |
+| Q4 | Signing identity is independent of the bulk-lane opt-out — alert-only devices still sign normally |
+| Q5 | Cross-repo contract-change protocol is lightweight: `veil-observatory` proposes via PR against veil-proxy's type inventory/generator; veil-proxy's fitness gates plus human review decide; veil-proxy retains merge authority |
+| Q6 | Custom entity classes excluded from telemetry entirely (collapsed to a fixed `"custom"` tag) |
+| Q9 | `caller.environment` dropped; `caller.deployment_stage`'s closed enum kept |
+| Q10 | Telemetry-metadata retention/residency/joinability/re-identification to be written into the ratification packet alongside the Q1 registry work, not deferred to a separate DPIA track — **not yet written, tracked in `docs/next-actions.md`** |
+| Q11 | OCSF mapping stays observatory-side, not in the veil-proxy emitter — reversed from an initial emitter-side lean once its tension with the zero-String/closed-enum invariant was named (OCSF's own taxonomy is exactly the externally-owned open domain §2.3 of the plan warns generation doesn't make safe on its own) |
+| Q7, Q8 | Left open as scoped in the plan — Q7 deferred to observatory-side modelling work, Q8 defaults to `TelemetryReject` until a concrete persona query needs `MappingCreated` |
+
+**Not done by this ratification, tracked as next actions:** the §3.2a type inventory, the
+`veil-custodian` enrolment/signing-key build-out, the Q10 write-up, and the paired scope note on
+`veil-observatory`'s ADR-0004 that the plan's §3.1 requires before treating this as ratified on
+both sides (drafting that note was deliberately left for a separate confirmation rather than done
+automatically here, since it edits an accepted decision record in a different repo).
+
 ### Family-level decisions recorded in sibling repos
 
 - **Attestation is mTLS device certificates** — `veil-custodian` ADR-A. Closes `product-family.md` §10 Q7.
 - **Retention is a 24-hour hot tier feeding S3**, with lifecycle tiering for regulatory hot and cold archive — `veil-custodian` ADR-B.
 - **Unified regulatory control register lives in `veil-observatory`** (`docs/compliance/control-register.md`, 2026-08-01) — merges this repo's GDPR Art. 5/25/32 mapping table (`docs/spec/requirements-and-design-spec.md`) with `veil-observatory`'s traceability map into one register covering EU AI Act, GDPR, and FCA/UK financial services for the whole family. FCA is added as an explicit, near-total gap (SYSC/SS1-23/SMCR/DORA had zero prior occurrences anywhere in the family). Not a compliance claim — RISK-0009 below stays Open.
+
+## 2026-08-23 — `TelemetryEvent` built in `vg-core`, `interface-contracts.md` → v1.5
+
+Implements the ratified `telemetry-receipt-reconciliation-plan.md` (this same file, above): the
+envelope + three-record-kind (`Receipt`/`Alert`/`EdgeEvent`) type system, in
+`crates/vg-core/src/telemetry/`. `docs/architecture/implementation-plan.md` §3.2-3.4 rewritten to
+match what was actually built (the original single-undifferentiated-type sketch was superseded);
+§3.2a's required type-inventory table added there. `interface-contracts.md` bumped v1.4 → v1.5
+(§1 forward reference, new §7a contract). Full detail on the intent-driven → doubt-driven build
+loop applied is in `docs/session-log.md`'s matching entry; this record is the decision ledger.
+
+**`TryFrom<&AuditEvent> for TelemetryEvent` is exhaustive (six variants, no wildcard arm, per this
+file's 2026-07-26 entry above) but every arm currently rejects — ratified as the correct, honest
+scope for this build, not an under-delivery.** Verified against production code
+(`crates/vg-core/src/api.rs`): no `AuditEvent` variant carries a trace id, no invocation-issued
+flag exists for `Block`, and `ActorId` is still raw with no pseudonymization mechanism built. Each
+`AuditEvent` variant gets a distinct, named `TelemetryReject` reason (`RequiresAggregation`,
+`RequiresReasonDictionary`, `RequiresActorPseudonymization`, `DeferredByDefault`) rather than a
+placeholder — see `docs/next-actions.md` for what unblocks each.
+
+**Review process — four rounds, in order: single-model (Claude, fresh context) → Codex (`xhigh`
+reasoning) → single-model (Claude, fresh context) → Codex and Opus in parallel.** Each round
+worked against the current code blind to prior rounds' reasoning (artifact + contract only, per
+the doubt-driven-development skill), then findings were reconciled against the actual source
+before any fix — several findings across rounds were investigated and rejected as noise
+(a theoretical `private_interfaces` compiler warning that didn't survive an actual clean,
+uncached build) rather than accepted by default. Findings that *did* survive verification and were
+fixed, most severe first:
+
+- **Round 3/4 (most severe): a `#[derive(Hash)]` side-channel, independently caught by two
+  different reviewers, with round 4 (Opus) proving it by compiling and running an external-crate
+  exploit that recovered `"Veilgremlin-Policy-V1"` and `"acme-corp-backend-repo"` byte-for-byte
+  through a custom `Hasher`.** Removing `Debug` alone (round 2) had not closed this — `Hash` is a
+  strictly more faithful rendering path (exact bytes, no escaping). Fixed by removing `Hash` from
+  every telemetry type wrapping variable content; nothing in the crate used it as a map/set key.
+- **Round 3: `EdgeEvent`'s fields were declared directly on its enum variants, which Rust makes
+  unconditionally public regardless of documentation claims** — `BlockedAttempt` was fully
+  forgeable from outside `vg-core` using only ordinary public constructors
+  (`ArtefactKindId::from`, `ReasonCode::from(u16)`), bypassing the reviewed `TryFrom<&AuditEvent>`
+  path entirely. Fixed by wrapping each variant's fields in a private-fielded payload struct,
+  matching how `Alert`/`Receipt` already worked.
+- **Round 4: `TelemetryReject::ExcludedByPolicy { ratified: "Q8" }` mischaracterised an explicitly
+  open question as a ratified, permanent exclusion** — this file's own 2026-08-23 ratification
+  entry (above) and the reconciliation plan's own disposition table both say Q8 was "left open...
+  defaults to `TelemetryReject`," not settled. Renamed to `DeferredByDefault { decision_ref }`.
+- **Round 4: nothing coupled `Envelope::schema_version` to the `TelemetryEvent` variant it
+  accompanies**, despite the envelope module's own stated design rationale arguing against exactly
+  that kind of drift (its case against a separate `lane` field). Fixed by adding
+  `TelemetryEvent::new_receipt`/`new_alert`/`new_edge_event`, each checking the pairing.
+- **Round 2 (Codex): the bounded-token charset was stricter than reality** — lowercase-only
+  charset would have rejected real uppercase policy versions (`vg-policy/src/config.rs`'s actual
+  shipped validator allows both cases); `DetectorSetId`'s charset didn't allow `+`, which the real
+  `detector_version` producer (`api.rs`'s sorted-ids-joined-with-`+`) requires.
+  **Round 4: `VersionToken` also wrongly rejected empty strings** — the real validator has no
+  `is_empty()` check either.
+- **Round 4: `Detection::count` had no lower bound**, so a zero-count detection satisfied
+  `Controls::new`'s "detections required" invariant while carrying no actual evidence — the exact
+  failure that invariant exists to prevent, reintroduced one layer down. Made `Detection::new`
+  fallible, rejecting `count == 0`.
+- **Round 2 (Codex): `implementation-plan.md` §3.2 explicitly requires no `Debug` serialisation
+  path for `TelemetryEvent`** — an earlier draft derived `Debug` throughout and several tests
+  depended on it to prove non-raw-value properties at runtime. Removed `Debug` from every value
+  type; the exclusion proof is now purely structural (bounded types cannot hold a raw string,
+  full stop) rather than a runtime check on a rendering path that shouldn't exist.
+- Several consistency/documentation-accuracy findings: `#[non_exhaustive]` applied inconsistently
+  across enums likely to grow (now swept across `TelemetryEvent`, `TelemetryReject`, `EdgeEvent`,
+  `Outcome`, `Action`, and the error enums); a vacuous test claiming to prove forgery-resistance
+  while asserting nothing (removed); raw fixture values (`"jane.doe"`, a custom entity-class name)
+  rendered into a test's own CI failure-log output, contradicting that file's stated no-raw-value
+  header; a missing compiler-enforced link between `HandlingClass` and `Action` despite a doc
+  claiming one existed (added, via `From<HandlingClass> for Action`); `Envelope`'s freshness check
+  enforced only the harmless direction, leaving an effectively unbounded replay window open on the
+  dangerous side (added an upper-bound sanity ceiling, distinct from the ratified Q3 window itself
+  which stays the ingest/consumer's job).
+
+**Deliberately not fixed, documented as accepted trade-offs or tracked as follow-ups (not
+silently dropped):** the seven `bounded_token!` types remain `String`-backed underneath a private,
+validated field — a flagged divergence from "zero `String` columns"' literal wording, confirmed
+independently by multiple review rounds and kept because collapsing human-legible identifiers
+(policy/detector versions) to fixed-width hashes now would trade real information loss for
+literal compliance, with no registry yet built to resolve a hash back to a string; export-surface
+inconsistencies for two error types; non-constant-time equality on `Integrity.signature`;
+positional-argument hazards in multi-`u64` constructors; no telemetry-owned mirror of
+`api::Destination`. `docs/next-actions.md` carries the concrete remaining build items (`ActorId`
+pseudonymization, the reason dictionary, the in-emitter aggregator and Bedrock trace stamping,
+JSON Schema generation) and the still-untouched "six raw-capable `String` surfaces" item.
+
+**Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
+--locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
+clean, uncached build (verified repeatedly through the review rounds, not just once at the end).
+311 tests pass, 0 failures, 0 regressions to any pre-existing test.
