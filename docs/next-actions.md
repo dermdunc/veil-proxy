@@ -30,14 +30,35 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       development rounds (single-model + Codex cross-model, 12 real fixes, including a
       cross-session mapping-deletion bug in round 1's own new `unregister_port` primitive). See
       `docs/session-log.md`/`docs/decisions.md` (2026-07-25). **MERGED** as `def856f` (PR #39).
-- [ ] **Local masking proxy + daemon — M3 next.** Intercept the actual request to the model
-      endpoint, mask the entire assembled payload (prompt + context) via the vault, demask the
-      response — invisible to the user. This is what turns the proven mechanism into a product
-      that actually solves the governance/risk/privacy problem. The already-deferred "route
-      masked request to Bedrock" / LiteLLM-gateway warm path. **#1 — nothing above it.** Next up:
-      M3 (request masking, Anthropic direct, non-streaming — `schema/anthropic.rs` +
-      `mask_request.rs` wired end-to-end against a mock upstream), per the plan's §10.3 build
-      order.
+- [x] ~~**Local masking proxy + daemon — M3, request masking (Anthropic direct,
+      non-streaming).**~~ **Built 2026-08-24** — `vg-proxy` now actually does the job: parses a
+      real Anthropic Messages API body (`schema/anthropic.rs`'s `ContentBlockKind` +
+      `mask_request.rs`'s generic-`Value` walk — deliberately not a typed struct, so every field
+      it doesn't name round-trips untouched instead of silently dropping), masks every
+      text-bearing field through the real `vg_core::mask` pipeline (`tool_use.input`/
+      `tool_result.content` recursively; `document`/`image`/anything unrecognized blocks the
+      *whole* request), forwards the masked body to an upstream over plain HTTP
+      (`upstream.rs`, explicit header allow-list), and returns the response verbatim — response
+      *de*masking is M4, not this milestone. `Daemon` (`daemon.rs`) now holds a full `Policy` +
+      detector/parser registries, mirroring `Engine::open`'s assembly, but deliberately **not**
+      real production state-dir/keychain discovery (a real `vg-proxy` daemon binary is separate,
+      unscoped, later work — see below). `vg run` (`vg-cli/src/main.rs`) now injects
+      `CLAUDE_CODE_ATTRIBUTION_HEADER=0` into every launch. Two doubt-driven-development rounds
+      (a stalled-but-still-useful single-model pass, then Codex cross-model) found and fixed
+      five real issues — most notably a present-but-invalid `X-VG-Namespace` header silently
+      falling back to port-resolution instead of failing closed, which M2's own doubt-pass round
+      had explicitly warned "whichever milestone adds header-extraction code" would hit — see
+      `docs/decisions.md`'s 2026-08-24 entry for the full list. `cargo build/clippy -D
+      warnings/fmt --check/test` all clean, workspace-wide.
+      **Named gaps, not solved by this milestone:** response demasking (M4); streaming (M6);
+      real production state-dir/keychain discovery for a `vg-proxy` daemon *binary* (this
+      milestone's `Daemon` constructors take already-resolved config, matching what tests need,
+      not a real running service); reaching the real `https://api.anthropic.com` over TLS
+      (`upstream.rs` is plain-HTTP-only, M5's job); `document` content-block real handling (text
+      vs. base64 vs. url); a block partway through a request doesn't roll back vault interning
+      already done by earlier fields in the same request (not a leak — the vault is local and
+      encrypted — but real audit-trail untidiness, named not fixed). **Next up: M4 — response
+      demask, non-streaming**, per the plan's §10.3 build order.
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`

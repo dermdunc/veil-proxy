@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Local masking-proxy daemon front door (vg-daemon/vg-proxy): a plain-HTTP loopback server Claude Code is pointed at via ANTHROPIC_BASE_URL, masking the assembled request/response instead of a per-invocation hook. M1: transport + routing skeleton. M2: daemon core — vault opened once, H2 session-namespace shim, session-scoped binding store."
+description = "Local masking-proxy daemon front door (vg-daemon/vg-proxy): a plain-HTTP loopback server Claude Code is pointed at via ANTHROPIC_BASE_URL, masking the assembled request/response instead of a per-invocation hook. M1: transport + routing skeleton. M2: daemon core — vault opened once, H2 session-namespace shim, session-scoped binding store. M3: request masking (Anthropic direct, non-streaming) — schema/anthropic.rs + mask_request.rs wired end-to-end against a mock upstream."
 
 [lints]
 workspace = true
@@ -12,12 +12,23 @@ workspace = true
 [dependencies]
 vg-core = { workspace = true }
 vg-vault = { workspace = true }
+# M3: mask_request.rs composes the real pipeline (same shape as vg-adapters-claude's Engine) —
+# detectors + parsers feed vg_core::Context; the vault/policy/audit trait objects populate
+# vg_core::Policy.
+vg-detectors = { workspace = true }
+vg-parsers = { workspace = true }
+vg-policy = { workspace = true }
+vg-audit = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 thiserror = "1"
 uuid = "1"
+# Anthropic Messages API request bodies are JSON; serde/serde_json are already resolved in the
+# workspace lock (vg-policy, vg-audit, vg-adapters-claude), so this adds no new registry crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util", "sync"] }

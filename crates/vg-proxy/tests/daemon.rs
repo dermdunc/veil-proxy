@@ -9,15 +9,29 @@ use std::thread;
 
 use tempfile::TempDir;
 use uuid::Uuid;
-use vg_core::{MappingRef, Namespace, PlaceholderBinding, SessionId};
+use vg_core::{MappingRef, Namespace, PlaceholderBinding, PolicyLayers, SessionId};
 use vg_proxy::{Daemon, ProxyError, SessionConflict, SessionError};
 use vg_vault::VaultConfig;
 
 const TEST_KEY: [u8; 32] = [7u8; 32];
 
+fn global_policy_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../vg-policy/fixtures/global.policy.json")
+}
+
 fn open_daemon(dir: &TempDir) -> Daemon {
-    Daemon::open_with_key(VaultConfig::new(dir.path().join("vault.db")), TEST_KEY)
-        .expect("daemon opens")
+    Daemon::open_with_key(
+        VaultConfig::new(dir.path().join("vault.db")),
+        TEST_KEY,
+        PolicyLayers {
+            global: global_policy_path(),
+            repo: None,
+            session: None,
+        },
+        dir.path().join("audit.jsonl"),
+    )
+    .expect("daemon opens")
 }
 
 /// The milestone's own test description, directly: one `Daemon` opened once (the only
