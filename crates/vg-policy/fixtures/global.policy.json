@@ -30,6 +30,7 @@
     "observability-sink": { "masked_only": true, "demask_allowed": false },
     "local-patch": { "masked_only": false, "demask_allowed": true },
     "local-test-fixture": { "masked_only": false, "demask_allowed": true },
-    "local-explanation-buffer": { "masked_only": false, "demask_allowed": false }
+    "local-explanation-buffer": { "masked_only": false, "demask_allowed": false },
+    "proxy-response": { "masked_only": false, "demask_allowed": true }
   }
 }

@@ -3536,3 +3536,106 @@ invalid-namespace-header regression sending raw non-UTF-8 bytes over the wire), 
   unconditionally.
 - The partial-vault-interning-on-mid-request-block trade-off (named above, not fixed).
 - Bedrock (M8+), OAuth/bearer specifics beyond header pass-through (M7).
+
+## 2026-08-24 — M4 built: response demask, non-streaming
+
+Closes the "mask outbound, demask inbound" loop `vg-proxy` exists for. M3 (merged) made the
+proxy mask requests and forward them for real, but returned the upstream's response completely
+untouched — whatever the model generated, including any echoed placeholder, reached the wrapped
+client as-is. M4 demasks the response before it reaches the client, for the first time real
+end-to-end.
+
+**Built**, per `/Users/hekton/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3
+milestone M4:
+
+- `crates/vg-core/src/api.rs` — new `Destination::ProxyResponse` variant (the enum is
+  `#[non_exhaustive]`, additive-only, the same sanctioned pattern already used for `AuditEvent`/
+  `TelemetryReject` this session): "back to the local wrapped client via the proxy," not hard-deny
+  (the human seeing raw values is the whole point). `crates/vg-policy/fixtures/global.policy.json`
+  gained a matching `"proxy-response": { "masked_only": false, "demask_allowed": true }` entry.
+- `crates/vg-proxy/src/demask_response.rs` (new) — `demask_response(body, bindings, policy, ns)`
+  walks a response's `content[]`, substituting via `vg_core::rehydrate` reused as a black box
+  (confirmed by reading its source: it only ever reads `pack.text`/`pack.bindings`, so a
+  synthetic, single-use `MaskedPack` per leaf is a faithful, zero-`vg_core`-changes reuse of its
+  substitution algorithm). **Deliberately infallible**, the opposite risk shape from request-side
+  masking: a malformed response or a denied/unresolvable binding leaves that leaf's text
+  unchanged and moves on, never blocks a successful response from reaching the client.
+- **Session-store-backed, not pack-backed** — `Daemon::demask_response` demasks against
+  `SessionShim::bindings_for(namespace)`, the full accumulated store, so a placeholder minted by
+  an *earlier* request in the same conversation still resolves in a *later* response (the plan's
+  own "H1" case). `Daemon::mask_request`'s return type grew the resolved `Namespace` so
+  `server.rs` can reuse it for the matching response without re-parsing the header.
+- `server.rs`'s `handle_mask` demasks the upstream response body, rebuilds it, and recomputes
+  `Content-Length` explicitly (a restored raw value is rarely the same byte length as the
+  placeholder it replaced, so the upstream's copied header would go stale).
+
+### Doubt-driven-development, two rounds
+
+**Round 1 (single-model, fresh context)** found four real issues, all fixed:
+- **The module's own doc claim about response shape was factually wrong.** The first version
+  classified content blocks via `schema::anthropic::ContentBlockKind` and only special-cased
+  `text`/`tool_use`, on the assumption that a non-streaming response's `content[]` only ever
+  contains those two kinds. Real responses can also carry `thinking`/`redacted_thinking`
+  (extended thinking) and server-side tool blocks (`server_tool_use`, `web_search_tool_result`,
+  `mcp_tool_use`, `mcp_tool_result`, ...) — none of which `ContentBlockKind` names, so they
+  classified as `Unknown` and were silently left untouched: a placeholder echoed inside a
+  `thinking` block would never resolve. Fixed (round 1) by dropping the classifier: every content
+  block demasked as a whole, unconditionally — a fix round 2 then found was itself too broad
+  (below).
+- **`Content-Length` was recomputed but a stale `Transfer-Encoding` header, copied verbatim from
+  the upstream response, was left in place** — if a real upstream ever answers chunked (legal
+  HTTP/1.1, no `Content-Length` of its own), the client would receive both headers set, an
+  invalid/ambiguous framing per RFC 7230 §3.3.3. Fixed: `Transfer-Encoding` is stripped before
+  the fresh `Content-Length` is set (the rebuilt body is always a single, fully-buffered
+  `Full<Bytes>`, never actually chunked, regardless of what the upstream did).
+- **The new end-to-end round-trip test asserted response *content* correctness but never
+  verified the `Content-Length` header value itself** — it would have passed identically even
+  with a wrong header. Fixed: added an explicit assertion parsing the header and comparing it to
+  the real body byte length.
+- **Minor:** an avoidable full-body clone in the response-rewrite path (cloned only to read
+  `.len()` after the value had already moved into the new `Response`). Fixed by capturing the
+  length before the move.
+- **Documented, not fixed (accepted trade-off):** `SessionShim::record_bindings` appends to a
+  namespace's binding `Vec` with no dedup beyond what the vault already gives a repeated raw
+  value, and `Daemon::demask_response` clones the whole accumulated `Vec` per response, then
+  `demask_response` clones it again per leaf field — real, unbounded clone-and-growth cost for a
+  long conversation, M4 being the first caller to actually trigger it. Not fixed: a proper fix
+  touches `SessionShim`'s already-merged, already-doubt-reviewed M2 code, out of this milestone's
+  scope.
+
+**Round 2 (Codex, cross-model) found one high-severity issue** in round 1's own fix: **the
+"demask every block unconditionally" fix recursed into structural/metadata fields too**
+(`"type"`, `"id"`, `"name"`, `"signature"`), not just payload. A minted placeholder's low-entropy,
+predictable shape (`EMAIL_001`, `PERSON_002`, ...) can plausibly collide with a real tool name or
+block id over a long session — round 1's own doc comment dismissed this as "astronomically
+unlikely," which Codex correctly identified as wrong given how predictable minted displays
+actually are. Concretely: a `tool_use` block literally named `"EMAIL_001"` would have had its
+`name` silently rewritten to the raw email, breaking the wrapped client's ability to dispatch
+that tool call. Fixed: a `BLOCK_METADATA_KEYS` skip-list (`type`/`id`/`name`/`signature`/
+`tool_use_id`) excludes a block's own structural keys from substitution while still recursing
+into everything else unconditionally — still classifier-free and forward-compatible with any
+future block kind's own payload fields, just no longer blind to which top-level keys are
+structural. A regression test constructs the exact collision (a `tool_use` block named
+`"EMAIL_001"` against a real `EMAIL_001` binding) and proves the name survives untouched.
+
+### Validation
+
+`cargo build --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D
+warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean, run after both review
+rounds. New tests across `crates/vg-proxy/src/demask_response.rs` (round-trip, the H1 case at
+this layer — bindings from two separate `mask()` calls both resolving in one response,
+`thinking`-block resolution, the structural-field-collision regression, malformed/no-content
+passthrough, denied-destination graceful degrade, empty-bindings no-op) and
+`crates/vg-proxy/tests/server_smoke.rs` (a real end-to-end round trip through a mock upstream
+proving the client receives the raw value not the placeholder, with an explicit `Content-Length`
+correctness assertion; the H1 case at the HTTP level — two requests over the same
+`X-VG-Namespace` header, the second response echoing the first request's placeholder).
+
+### Still open, not solved by this milestone
+
+- Streaming (M6) — non-streaming only; `stream: true` is neither detected nor specially handled.
+- Real production state-dir/keychain discovery for a `vg-proxy` daemon binary.
+- Reaching the real `https://api.anthropic.com` over TLS (`upstream.rs` is plain-HTTP only, M5).
+- Unbounded binding-store growth/cloning over a long conversation (named above, not fixed).
+- The partial-vault-interning-on-mid-request-block trade-off (named in the M3 entry, still open).
+- Bedrock (M8+), OAuth/bearer specifics beyond header pass-through (M7).

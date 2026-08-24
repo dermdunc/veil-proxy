@@ -11,6 +11,7 @@
 //! throughout: there is still no upstream client anywhere in this crate.
 
 pub mod daemon;
+pub mod demask_response;
 pub mod error;
 pub mod mask_request;
 pub mod route;

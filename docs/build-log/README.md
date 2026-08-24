@@ -58,3 +58,4 @@ That can grow into a published site later if it earns one — see
 - [2026-08-23 — The fix that only moved the window](2026-08-23-the-fix-that-only-moved-the-window.md)
 - [2026-08-24 — The comparison that gave the secret away](2026-08-24-the-comparison-that-gave-the-secret-away.md)
 - [2026-08-24 — The warning nobody was in the room to hear](2026-08-24-the-warning-nobody-was-in-the-room-to-hear.md)
+- [2026-08-24 — A name that looked like a secret](2026-08-24-a-name-that-looked-like-a-secret.md)

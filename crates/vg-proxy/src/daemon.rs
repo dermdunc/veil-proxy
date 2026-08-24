@@ -12,6 +12,7 @@ use vg_parsers::all_parsers;
 use vg_policy::LayeredPolicyEngine;
 use vg_vault::{Vault, VaultConfig};
 
+use crate::demask_response;
 use crate::error::ProxyError;
 use crate::mask_request::{mask_request, MaskedRequest};
 use crate::session::{SessionConflict, SessionShim};
@@ -164,13 +165,15 @@ impl Daemon {
     /// `vg_core::mask` pipeline (see [`crate::mask_request::mask_request`] for how), records
     /// the resulting bindings into that namespace's accumulated session store (H1's fix), and
     /// returns the masked bytes ready to forward alongside summary stats (`server.rs` surfaces
-    /// these as a response header).
+    /// these as a response header) and the resolved [`Namespace`] itself — M4's
+    /// [`Daemon::demask_response`] needs the same namespace for the matching response, without
+    /// re-parsing the header a second time.
     pub fn mask_request(
         &self,
         body: &[u8],
         namespace_header: Option<&str>,
         local_addr: SocketAddr,
-    ) -> Result<(Vec<u8>, MaskStats), ProxyError> {
+    ) -> Result<(Vec<u8>, MaskStats, Namespace), ProxyError> {
         let namespace = self.session_shim.resolve(namespace_header, local_addr)?;
         let MaskedRequest {
             body,
@@ -178,7 +181,29 @@ impl Daemon {
             stats,
         } = self.with_context(|ctx| mask_request(body, ctx, &self.policy, &namespace))?;
         self.session_shim.record_bindings(&namespace, bindings);
-        Ok((body, stats))
+        Ok((body, stats, namespace))
+    }
+
+    /// The real M4 response path: demasks `body` (a model response) against `namespace`'s full
+    /// accumulated binding store — not just the bindings from the request that produced this
+    /// response, since a response can echo a placeholder minted by an *earlier* request in the
+    /// same conversation (the H1 case). Infallible, matching
+    /// [`crate::demask_response::demask_response`]'s own design: a malformed response or an
+    /// unresolvable/denied binding never blocks the response from reaching the client.
+    ///
+    /// **Named, not fixed here (round-2 doubt-pass finding):** [`SessionShim::record_bindings`]
+    /// appends to a namespace's binding `Vec` with no dedup beyond what the vault already gives
+    /// a repeated raw value (the same *display* string, but still a new `Vec` entry each
+    /// request), and this call clones the whole accumulated `Vec` via `bindings_for`, then
+    /// [`crate::demask_response::demask_response`] clones it again per leaf field. For a long
+    /// conversation that repeatedly references the same entities, this is real, unbounded
+    /// clone-and-growth cost this milestone is the first caller to actually trigger — not fixed
+    /// here because a proper fix (dedup at record time, or avoid the per-leaf clone) touches
+    /// `SessionShim`'s already-merged, already-doubt-reviewed M2 code, a larger change than
+    /// this milestone's own scope.
+    pub fn demask_response(&self, body: &[u8], namespace: &Namespace) -> Vec<u8> {
+        let bindings = self.session_shim.bindings_for(namespace);
+        demask_response::demask_response(body, &bindings, &self.policy, namespace)
     }
 
     /// Runs `f` with a fresh [`Context`] over the owned detector/parser registries. Same shape
