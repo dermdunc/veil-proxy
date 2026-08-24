@@ -56,3 +56,4 @@ That can grow into a published site later if it earns one — see
 - [2026-07-25 — A proxy with nowhere to send anything yet](2026-07-25-a-proxy-with-nowhere-to-send-anything-yet.md)
 - [2026-07-25 — The fix that broke what it was fixing](2026-07-25-the-fix-that-broke-what-it-was-fixing.md)
 - [2026-08-23 — The fix that only moved the window](2026-08-23-the-fix-that-only-moved-the-window.md)
+- [2026-08-24 — The comparison that gave the secret away](2026-08-24-the-comparison-that-gave-the-secret-away.md)

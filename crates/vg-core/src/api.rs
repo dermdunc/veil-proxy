@@ -20,9 +20,12 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use uuid::Uuid;
+
 use crate::audit::AuditEvent;
 use crate::error::{MaskError, RehydrateDenied};
 use crate::ids::ActorId;
+use crate::telemetry::TraceId;
 use crate::traits::{
     ArtefactHint, ArtefactKind, AuditSink, Detector, Parser, Placeholder, PolicyEngine, Secret,
     VaultStore,
@@ -153,12 +156,29 @@ pub fn scan(input: &Input, ctx: &Context) -> Vec<Finding> {
 ///
 /// The `ctx` parameter is the T07 contract change (see the module doc): without it `mask`
 /// could not reach the detectors/parsers `scan` composes.
+///
+/// **Also returns a freshly-minted `TraceId`** (telemetry roadmap Phase 3,
+/// `docs/next-actions.md`) — minted here, internally, on every call, not accepted as a
+/// parameter. Verified before choosing that shape: every real call site in the workspace
+/// (`Engine::mask_text` in `vg-adapters-claude`; `crates/vg-core/benches/mask_pipeline.rs`;
+/// `Harness::mask_sample` in `crates/vg-bench/src/report.rs` — a doubt-driven-development
+/// round caught an earlier version of this comment undercounting the third one) has no
+/// other correlation id to supply instead, so accepting one as a parameter would just
+/// push the same `Uuid::new_v4()` call up to the caller for no benefit. Not
+/// invocation-scoped: a single turn that masks multiple artefacts gets multiple distinct
+/// trace ids, one per `mask()` call, not one per invocation — real invocation-level
+/// correlation needs a caller-supplied id from somewhere `mask()` itself has no access to
+/// (e.g. the hook adapter's own event correlation, unverified and out of scope here). Not
+/// a new source of non-determinism in a previously-pure function — `Scan.latency_us`
+/// (wall-clock timing, below) already made this function's output caller-observably
+/// non-deterministic before this change.
 pub fn mask(
     input: &Input,
     ctx: &Context,
     policy: &Policy,
     ns: &Namespace,
-) -> Result<(MaskedPack, Vec<MappingRef>, AuditEvent), MaskError> {
+) -> Result<(MaskedPack, Vec<MappingRef>, AuditEvent, TraceId), MaskError> {
+    let trace_id = TraceId::from(Uuid::new_v4());
     let policy_version = policy.engine.version().to_string();
 
     // 1. Artefact-level Block FIRST, before the content is parsed or touched at all
@@ -190,7 +210,7 @@ pub fn mask(
             },
             policy_version,
         };
-        return Ok((pack, Vec::new(), event));
+        return Ok((pack, Vec::new(), event, trace_id));
     }
 
     // 2. Every non-Block artefact is entity-scanned regardless of its artefact class —
@@ -315,6 +335,15 @@ pub fn mask(
     };
 
     if let Some(err) = intern_error {
+        // Doubt-driven-development finding, not fixed here: `trace_id` (minted above) is
+        // dropped on every `Err` path, including this one — the one case that most wants
+        // it, since the best-effort write just below leaves a *partial* Scan record in
+        // the audit log with no id an operator could grep the log for to find it again.
+        // Not fixed in this slice: `MaskError`'s variants lean on `#[from]` auto-
+        // conversion (`AuditError`/`VaultError`/`PolicyError` via `?`, `crate::error`),
+        // which doesn't compose with also carrying a mandatory `trace_id` field without
+        // hand-rolling every conversion site — a real, separate redesign, not a
+        // trace-id-threading-scoped change. Named here so it isn't silently lost.
         let _ = policy.audit.write(event); // best-effort partial record; original error wins
         return Err(err);
     }
@@ -338,7 +367,7 @@ pub fn mask(
         },
         policy_version,
     };
-    Ok((pack, mapping_refs, event))
+    Ok((pack, mapping_refs, event, trace_id))
 }
 
 /// Spans from the first parser whose `can_parse` claims `input.hint`, or none. Shared by

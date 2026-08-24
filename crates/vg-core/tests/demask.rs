@@ -85,7 +85,7 @@ fn mask_fixture(policy: &Policy, ns: &Namespace) -> MaskedPack {
         buf: fixture().into_bytes(),
         hint: ArtefactHint::default(),
     };
-    let (pack, _refs, _event) =
+    let (pack, _refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, policy, ns)).expect("mask succeeds");
     pack
 }
@@ -231,7 +231,7 @@ fn substitution_respects_token_boundaries_and_never_rescans_restored_values() {
         buf: b"ticket EMAIL_0011 filed by jane.doe@example.com".to_vec(),
         hint: ArtefactHint::default(),
     };
-    let (pack, _refs, _event) =
+    let (pack, _refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
     assert!(
         pack.text.contains("EMAIL_0011"),

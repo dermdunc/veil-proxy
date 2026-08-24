@@ -9,6 +9,7 @@
 
 use std::io;
 
+use vg_core::telemetry::TraceId;
 use vg_core::{
     mask as core_mask, rehydrate as core_rehydrate, scan as core_scan, Actor, ArtefactHint,
     AuditEvent, Context, Destination, Detector, EntityType, Finding, HandlingClass, Input,
@@ -271,7 +272,7 @@ impl Engine {
         &self,
         text: &str,
         hint: ArtefactHint,
-    ) -> Result<(MaskedPack, Vec<MappingRef>, AuditEvent), MaskError> {
+    ) -> Result<(MaskedPack, Vec<MappingRef>, AuditEvent, TraceId), MaskError> {
         let input = Input {
             buf: text.as_bytes().to_vec(),
             hint,

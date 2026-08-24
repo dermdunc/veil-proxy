@@ -3306,3 +3306,112 @@ Codex cross-model), both offered and accepted:
 **Validation:** `cargo build --workspace --locked`, `cargo clippy --workspace --all-targets
 --locked -- -D warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean on a
 clean, uncached build, run after both review rounds. Zero regressions to any pre-existing test.
+
+## 2026-08-24 — Telemetry roadmap Phase 3 (partial) built: trace-id threading + aggregator skeleton
+
+Third of the 5-phase telemetry roadmap. Scoped down from the roadmap's full "aggregator" via this
+session's Plan Mode interview to two things only — a `TraceId` on every `mask()` call, and a
+standalone, tested, **not-yet-wired** buffering data structure — because two real gates on the
+full aggregator are still unresolved and explicitly not attempted here: (1) the receipt data
+source (`AuditEvent`s alone can't build a `Receipt`'s `Controls` — needs `outcome`/per-detection
+`action`/`block_reason`/`exceptions` no current code produces) and (2) the Q3 replay-window policy
+(what happens to a trace that ages out before completing). Bedrock `requestMetadata` trace
+stamping stays out of scope too, blocked on M3 (`vg-proxy` has no upstream client yet).
+
+**`mask()` mints a fresh `TraceId` internally, not as a caller-supplied parameter.** Verified
+before choosing that shape: every real call site in the workspace — `Engine::mask_text`
+(`vg-adapters-claude`), `crates/vg-core/benches/mask_pipeline.rs`, and `Harness::mask_sample`
+(`crates/vg-bench/src/report.rs`) — has no other correlation id available to supply.
+`mask()`'s return type grew a 4th tuple element (`TraceId::from(Uuid::new_v4())`, minted before
+either return path); every real caller and every `vg-core` integration test updated to
+destructure it. **Named plainly, not glossed over:** minting per `mask()` call means one trace per
+masked *artefact*, not one trace per model invocation — a single turn that masks multiple files
+still gets multiple traces. Real invocation-scoped correlation needs a caller-supplied id from the
+hook layer, unverified (Claude Code's hook JSON schema isn't documented anywhere in this repo) and
+explicitly deferred, not solved here.
+
+**Built `TraceBuffer`** (`crates/vg-core/src/telemetry/aggregator.rs`, new, `pub(crate)`): buffers
+`AuditEvent`s by `TraceId`, tracks each trace's first-insert `Instant` as an age baseline, and
+exposes `insert`/`events_for`/`aged_before`/`remove`. Deliberately no completion-detection logic
+and no eviction policy — `aged_before` only *reports* which traces are older than a caller-given
+cutoff; it does not decide what to do about them (the Q3 question). Not wired to anything —
+matching Phase 1/2's own precedent for shipping a real, tested, not-yet-connected piece rather
+than a stub or a placeholder.
+
+### Doubt-driven-development, two rounds
+
+**Round 1 (single-model, fresh context) found two real issues in the first version of this diff:**
+
+- **`TraceId` gaining `derive(Ord, PartialOrd)` was a real, if subtle, security regression.** The
+  first version's own doc comment argued this was safe because a single `Ord::cmp` call "returns
+  only an `Ordering`... never the field bytes" — true per-call, but wrong in aggregate: `Ord`
+  being `pub` on a type any external crate can hold lets that holder run ~128 adaptive `<`/`cmp`
+  calls (a binary search) against self-minted probe `TraceId`s to recover the wrapped `Uuid`
+  bit-for-bit — the same class of channel `telemetry::ids`'s own module doc already treats as
+  serious (its documented reason for removing `Hash` from every type in that module, proven via a
+  compiled, run PoC). The comment's "does not reopen that same risk" conclusion overclaimed what a
+  single-call argument actually demonstrates. Fixed: `TraceId` no longer derives `Ord`/`PartialOrd`
+  at all; it exposes a `pub(crate)`-only `ordering_key() -> u128` instead, and
+  `TraceBuffer` keys its `BTreeMap` by that `u128` (storing the `TraceId` back inside each entry
+  for lookups/removal/reporting) — confining comparison capability to `vg-core` itself rather than
+  exposing it on the public type.
+- **`TraceBuffer::aged_before` returned entries in `BTreeMap` key order (ascending by the new
+  `ordering_key`), not age order, and nothing documented that the order was arbitrary.** `BTreeMap`
+  was chosen only so the map could have a total order at all once `TraceId` withheld `Ord` — its
+  iteration order carries no relationship to `first_inserted_at`. A caller doing prioritized
+  eviction (a natural reading of "reports which traces have gone stale") would reasonably but
+  wrongly assume oldest-first. The existing tests couldn't have caught this: every multi-entry
+  `aged_before` test only ever asserted a single-element result. Fixed: `aged_before` now sorts
+  explicitly by `first_inserted_at` before returning, oldest first; added
+  `aged_before_returns_multiple_aged_traces_oldest_first_not_by_trace_id_value`, which deliberately
+  inserts trace ids whose `u128` value order is the *reverse* of their age order, so a regression
+  back to key-order-only would fail it.
+
+Round 1 also surfaced, and this fix documents rather than addresses (a **valid trade-off**, not a
+gap silently missed): **`mask()`'s freshly-minted `trace_id` is dropped on every `Err` return**,
+including the `intern_error` path that already writes a *best-effort partial* `Scan` audit record
+specifically so a mid-pipeline vault failure still leaves a trail — the one id that could let an
+operator correlate that partial record back to its invocation is exactly what's thrown away on
+that path. Not fixed here: `MaskError`'s variants lean on `#[from]` auto-conversion from
+`AuditError`/`VaultError`/`PolicyError` via `?` (`crate::error`), which doesn't compose with also
+carrying a mandatory `trace_id` field without hand-rolling every conversion site — a real,
+separate redesign, bigger than this trace-id-threading-scoped slice. Named in an inline comment at
+the site so it isn't silently lost.
+
+**Round 2 (Codex) reviewed the round-1-fixed diff fresh** and found one issue: the `mask()` doc
+comment's "only two real callers" claim was itself wrong — the diff it was describing updates
+three real call sites (`Engine::mask_text`, the `vg-core` bench, and `crates/vg-bench`'s
+`Harness::mask_sample`), not two, an undercount that undermined the very verification the comment
+was citing. Fixed: comment corrected to name all three. Codex found no correctness issue in
+`TraceBuffer` itself and confirmed the `ordering_key()` confinement holds — nothing outside
+`vg-core` can reach it, directly or indirectly.
+
+### Validation
+
+`cargo build --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D
+warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean, run after both review
+rounds. New tests: `mask_mints_a_fresh_trace_id_on_every_call`
+(`crates/vg-core/tests/pipeline.rs`); 7 `TraceBuffer` unit tests in
+`crates/vg-core/src/telemetry/aggregator.rs` (accumulation-in-order, trace independence,
+oldest-first `aged_before` ordering under an adversarial trace-id/age mismatch, baseline
+not moved by a later insert, `remove` draining, empty-trace absence from both `events_for` and
+`aged_before`).
+
+### Incidental fix, split into its own PR (#54), not this one
+
+While running the full-workspace test pass for this phase, found `vg-vault`'s
+`keychain::tests::actor_pseudonym_key_env_seam_round_trips`/`actor_pseudonym_key_env_seam_rejects_malformed_hex`
+racing on the same process-global env var under `cargo test`'s default in-binary parallelism
+(confirmed: reliable under `--test-threads=1`, intermittently failing under default parallelism).
+Unrelated to this phase's own changes (never touches `vg-vault`) — fixed separately per explicit
+instruction rather than folded into this diff, merging the two tests into one sequential function
+so the env mutations can't interleave.
+
+### Still open, not solved by this slice
+
+- The receipt data source (what production event carries `Controls`-level detection/outcome data).
+- The Q3 replay-window policy (drop/re-mint/queue for a trace that ages out before completing).
+- Bedrock `requestMetadata` trace stamping (blocked on M3, not started).
+- Real invocation-level trace correlation (needs a caller-supplied id from the hook layer).
+- `TraceBuffer` wiring into any real `AuditSink`/`Engine` — nothing constructs one in production.
+- `mask()`'s `trace_id` being unreachable on its `Err` paths (named above, not fixed).
