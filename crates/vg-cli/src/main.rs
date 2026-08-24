@@ -348,7 +348,7 @@ fn cmd_diff(paths: StatePaths, file: &Path) -> Result<ExitCode, Box<dyn std::err
         language_id: None,
         mime_type: None,
     };
-    let (pack, _refs, _event) = engine.mask_text(&text, hint)?;
+    let (pack, _refs, _event, _trace_id) = engine.mask_text(&text, hint)?;
 
     if pack.stats.blocked_artefacts > 0 {
         eprintln!(

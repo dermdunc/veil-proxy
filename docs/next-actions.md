@@ -311,15 +311,34 @@ it isn't lost).
   cross-crate *construction* (confirmed: `crates/vg-audit/tests/sink.rs` already constructs
   `AuditEvent::Block` from a different crate with its own reason strings).
   `cargo build/clippy -D warnings/fmt --check/test` all clean, workspace-wide.
-- **Phase 3 — the aggregator + trace stamping, partially blocked.** Trace-id threading through
-  `mask()`'s signature (`crates/vg-core/src/api.rs:156`; three real callers grep-verified —
-  `vg-adapters-claude/src/hook.rs`, `vg-adapters-claude/src/lib.rs`,
-  `vg-core/benches/mask_pipeline.rs` — small blast radius) is buildable now, independent of M3.
-  Bedrock stamping and true end-to-end exercise are not — see the first finding above. Split into
-  two sessions: trace-id threading + aggregator skeleton now, Bedrock stamping once a Bedrock
-  request owner exists. **Two open decisions gate the real work, not the skeleton:** the receipt
+- [x] ~~**Phase 3 (partial) — trace-id threading + aggregator skeleton.**~~ **Built 2026-08-24** —
+  `mask()` (`crates/vg-core/src/api.rs`) now mints a fresh `TraceId::from(Uuid::new_v4())`
+  internally on every call and returns it as a 4th tuple element, rather than accepting one as a
+  parameter — verified against every real call site in the workspace (`Engine::mask_text` in
+  `vg-adapters-claude/src/runtime.rs`, `crates/vg-core/benches/mask_pipeline.rs`, and
+  `Harness::mask_sample` in `crates/vg-bench/src/report.rs` — a doubt-driven-development round
+  caught an earlier version of this claim undercounting the third one), none of which has any
+  other correlation id available to supply. New `TraceBuffer`
+  (`crates/vg-core/src/telemetry/aggregator.rs`, `pub(crate)`) buffers `AuditEvent`s by trace,
+  tracks a per-trace age baseline, and exposes `insert`/`events_for`/`aged_before`/`remove` —
+  deliberately no completion detection and no eviction policy, matching Phase 1/2's own precedent
+  for a real, tested, **not-yet-wired** piece. Two rounds of doubt-driven-development review
+  (single-model, then Codex), both accepted — see `docs/decisions.md`'s 2026-08-24 entry for the
+  full findings list, most notably a real security regression caught and fixed: an earlier version
+  derived `Ord`/`PartialOrd` on `TraceId` reasoning a single comparison "only returns an
+  `Ordering`," missing that a *public* `Ord` lets any holder binary-search the wrapped `Uuid` out
+  bit-for-bit via ~128 adaptive comparisons — the same class of channel `telemetry::ids` already
+  treats as serious for `Hash`. Fixed by confining ordering to a `pub(crate)`-only
+  `TraceId::ordering_key() -> u128`, used only inside `TraceBuffer`'s own `BTreeMap`.
+  `cargo build/clippy -D warnings/fmt --check/test` all clean, workspace-wide.
+  **Two open decisions still gate the real aggregator, not the skeleton just built:** the receipt
   data source (third finding above), and the Q3 replay-window drop/re-mint/queue question, which
-  blocks the buffer-eviction policy specifically.
+  blocks the buffer-eviction policy specifically. **Also named, not solved:** `mask()`'s
+  `trace_id` is unreachable on every `Err` return (including the one partial-audit-write path that
+  would most benefit from it) — fixing this means redesigning `MaskError`, which currently leans
+  on `#[from]` auto-conversion incompatible with also carrying a mandatory field; a real, separate
+  change. Bedrock stamping stays split into a future session, blocked on M3 (`vg-proxy` has no
+  upstream client yet).
 - **Phase 4 — JSON Schema generation + publish.** *Publishing* is sequenced last on purpose:
   regenerating a published schema after Phase 3 changes `Receipt`'s shape is worse than
   generating it once after that shape is real. The **generator machinery and its local tests

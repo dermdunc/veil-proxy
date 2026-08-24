@@ -75,6 +75,7 @@
 //! actually constructs a [`Receipt`]/[`Alert`]/[`EdgeEvent`].
 #![allow(dead_code)]
 
+pub(crate) mod aggregator;
 mod alert;
 pub(crate) mod block_reason;
 mod edge_event;

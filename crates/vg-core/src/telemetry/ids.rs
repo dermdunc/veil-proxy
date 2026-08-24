@@ -49,12 +49,34 @@ use crate::types::EntityType;
 /// adding one is a real, deliberate future decision — not made silently here. The final
 /// wire pattern (e.g. a `tr_`-prefixed hex string) is schema-generation's job, a
 /// separate, later deliverable.
+///
+/// **Deliberately does not derive `Ord`/`PartialOrd` (or `Hash`).** A first version of
+/// this type derived `Ord`, reasoned (wrongly) that a single `Ord::cmp` call only ever
+/// returns an `Ordering` and so couldn't reproduce this module doc's `Hash`-based
+/// byte-recovery channel. A doubt-driven-development review round caught the flaw: `Ord`
+/// being `pub` lets any external holder of a `TraceId` run ~128 adaptive `<`/`cmp` calls
+/// (a binary search) against self-minted probe values to recover the wrapped `Uuid`
+/// bit-for-bit — the same class of channel as the `Hash` case, just amortised over many
+/// calls instead of one. `telemetry::aggregator::TraceBuffer` still needs a total order to
+/// key a `BTreeMap` by trace, so it orders by [`TraceId::ordering_key`] instead — a
+/// `pub(crate)` escape hatch that keeps comparison capability inside this crate rather
+/// than exposing it on the public type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TraceId(Uuid);
 
 impl From<Uuid> for TraceId {
     fn from(id: Uuid) -> Self {
         Self(id)
+    }
+}
+
+impl TraceId {
+    /// A `pub(crate)`-only, order-preserving key for keying a `BTreeMap<_, _>` by trace
+    /// (`telemetry::aggregator::TraceBuffer`). Not `pub`: see this type's own doc for why
+    /// exposing an ordering on `TraceId` itself is a comparison-oracle recovery channel
+    /// this module deliberately closes.
+    pub(crate) fn ordering_key(&self) -> u128 {
+        self.0.as_u128()
     }
 }
 

@@ -148,7 +148,7 @@ pub fn run_hook(event: HookEvent, stdin_json: &str, engine: &Engine) -> HookResu
         }
     };
 
-    let (pack, _refs, _event) = match engine.mask_text(&subject, hint) {
+    let (pack, _refs, _event, _trace_id) = match engine.mask_text(&subject, hint) {
         Ok(out) => out,
         Err(e) => {
             return HookResult::block(format!(

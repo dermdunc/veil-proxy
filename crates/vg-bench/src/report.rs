@@ -117,7 +117,7 @@ impl Harness {
 
     fn mask_sample(&self, sample: &LabelledSample) -> Result<MaskedPack, ReportError> {
         self.with_context(|ctx| mask(&sample.input, ctx, &self.policy, &self.ns))
-            .map(|(pack, _, _)| pack)
+            .map(|(pack, _, _, _)| pack)
             .map_err(|e| ReportError::Mask(e.to_string()))
     }
 

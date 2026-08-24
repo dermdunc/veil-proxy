@@ -135,7 +135,7 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
         buf: mixed_fixture().into_bytes(),
         hint: ArtefactHint::default(),
     };
-    let (pack, mapping_refs, event) =
+    let (pack, mapping_refs, event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     // Same value -> same placeholder: three email occurrences collapse to exactly two
@@ -188,6 +188,27 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
     }
 }
 
+#[test]
+fn mask_mints_a_fresh_trace_id_on_every_call() {
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let input = || Input {
+        buf: mixed_fixture().into_bytes(),
+        hint: ArtefactHint::default(),
+    };
+
+    let (_pack, _refs, _event, trace_id_a) =
+        with_real_context(|ctx| mask(&input(), ctx, &policy, &ns)).expect("mask succeeds");
+    let (_pack, _refs, _event, trace_id_b) =
+        with_real_context(|ctx| mask(&input(), ctx, &policy, &ns)).expect("mask succeeds");
+
+    // Same fixture, two separate calls: the trace id must differ each time, proving it's
+    // freshly minted per call rather than a fixed or content-derived value.
+    assert!(trace_id_a != trace_id_b);
+}
+
 /// The masked-pack invariant as a property over every raw value in the fixture: no matter
 /// which values the fixture holds, none may survive into `.text`.
 #[test]
@@ -200,7 +221,7 @@ fn masked_pack_excludes_every_fixture_raw_value_property() {
         buf: mixed_fixture().into_bytes(),
         hint: ArtefactHint::default(),
     };
-    let (pack, _refs, _event) =
+    let (pack, _refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     // Every sensitive value the fixture is built from, asserted absent from the pack.
@@ -234,7 +255,7 @@ fn env_hinted_artefact_is_blocked_with_no_content_and_nothing_interned() {
             mime_type: None,
         },
     };
-    let (pack, mapping_refs, event) =
+    let (pack, mapping_refs, event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     // The artefact's content never reaches the pack.
@@ -279,7 +300,7 @@ fn irreversible_redact_value_is_redacted_and_never_vault_stored() {
         buf: format!("rotate the session token {SECRET_TOKEN} before friday").into_bytes(),
         hint: ArtefactHint::default(),
     };
-    let (pack, mapping_refs, _event) =
+    let (pack, mapping_refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     assert!(
@@ -325,7 +346,7 @@ fn partially_overlapping_findings_leak_no_detected_bytes() {
         "fixture must trigger an Email finding, got {findings:?}"
     );
 
-    let (pack, _refs, _event) =
+    let (pack, _refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     assert!(
@@ -353,7 +374,7 @@ fn ordinals_read_in_document_order_and_mapping_refs_are_deduped() {
         buf: b"first.contact@example.com then second.contact@example.com then first.contact@example.com".to_vec(),
         hint: ArtefactHint::default(),
     };
-    let (pack, mapping_refs, _event) =
+    let (pack, mapping_refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     let pos_1 = pack.text.find("EMAIL_001").expect("EMAIL_001 in text");
@@ -423,7 +444,7 @@ fn scan_event_counts_raw_detections_not_overlap_fragments() {
         parsers: &[],
         detectors: &detectors,
     };
-    let (_pack, _refs, event) = mask(&input, &ctx, &policy, &ns).expect("mask succeeds");
+    let (_pack, _refs, event, _trace_id) = mask(&input, &ctx, &policy, &ns).expect("mask succeeds");
 
     match event {
         AuditEvent::Scan { counts, .. } => {
@@ -452,7 +473,7 @@ fn detection_latency_recorded_in_the_scan_event_is_within_the_25ms_budget() {
         buf: mixed_fixture().repeat(50).into_bytes(),
         hint: ArtefactHint::default(),
     };
-    let (_pack, _refs, event) =
+    let (_pack, _refs, event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
     match event {
