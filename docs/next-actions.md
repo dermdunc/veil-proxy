@@ -50,15 +50,45 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       had explicitly warned "whichever milestone adds header-extraction code" would hit — see
       `docs/decisions.md`'s 2026-08-24 entry for the full list. `cargo build/clippy -D
       warnings/fmt --check/test` all clean, workspace-wide.
-      **Named gaps, not solved by this milestone:** response demasking (M4); streaming (M6);
-      real production state-dir/keychain discovery for a `vg-proxy` daemon *binary* (this
-      milestone's `Daemon` constructors take already-resolved config, matching what tests need,
-      not a real running service); reaching the real `https://api.anthropic.com` over TLS
-      (`upstream.rs` is plain-HTTP-only, M5's job); `document` content-block real handling (text
-      vs. base64 vs. url); a block partway through a request doesn't roll back vault interning
-      already done by earlier fields in the same request (not a leak — the vault is local and
-      encrypted — but real audit-trail untidiness, named not fixed). **Next up: M4 — response
-      demask, non-streaming**, per the plan's §10.3 build order.
+      **Named gaps, not solved by this milestone:** response demasking (M4, now built, see
+      below); streaming (M6); real production state-dir/keychain discovery for a `vg-proxy`
+      daemon *binary* (this milestone's `Daemon` constructors take already-resolved config,
+      matching what tests need, not a real running service); reaching the real
+      `https://api.anthropic.com` over TLS (`upstream.rs` is plain-HTTP-only, M5's job);
+      `document` content-block real handling (text vs. base64 vs. url); a block partway through
+      a request doesn't roll back vault interning already done by earlier fields in the same
+      request (not a leak — the vault is local and encrypted — but real audit-trail untidiness,
+      named not fixed).
+- [x] ~~**Local masking proxy + daemon — M4, response demask (non-streaming).**~~ **Built
+      2026-08-24** — closes the "mask outbound, demask inbound" loop: `vg-proxy` now demasks the
+      model's response before it reaches the wrapped client, real end-to-end for the first time.
+      New `Destination::ProxyResponse` (`vg-core`, additive/`#[non_exhaustive]`) + a matching
+      `proxy-response` policy fixture entry. `demask_response.rs` (new) walks a response's
+      `content[]`, reusing `vg_core::rehydrate` as a black box (one call per leaf, a synthetic
+      `MaskedPack` per call — no `vg_core` internals touched). **Deliberately infallible** (the
+      opposite risk shape from request masking): a malformed response or a denied/unresolvable
+      binding leaves that leaf's placeholder in place rather than blocking a successful response.
+      **Session-store-backed**, not pack-backed — demasks against the namespace's *full*
+      accumulated binding store (`SessionShim::bindings_for`), so a placeholder minted by an
+      earlier request in the same conversation still resolves in a later response (the plan's
+      "H1" case, proven end-to-end with a real two-request HTTP test). `server.rs` recomputes
+      `Content-Length` on the rewritten response (verified by an explicit test assertion, not
+      just body content). Two doubt-driven-development rounds found and fixed five real issues —
+      most notably (round 2, Codex) that round 1's own "demask every content block
+      unconditionally" fix (needed because a non-streaming response can carry `thinking`/
+      server-tool blocks `ContentBlockKind` never named) was itself too broad: it recursed into
+      a block's own structural fields (`type`/`id`/`name`/`signature`) too, and a minted
+      placeholder's low-entropy shape (`EMAIL_001`) can plausibly collide with a real tool name
+      over a long session, silently corrupting it — closed with a structural-key skip-list and a
+      regression test constructing the exact collision. Full findings in `docs/decisions.md`'s
+      2026-08-24 M4 entry. `cargo build/clippy -D warnings/fmt --check/test` all clean,
+      workspace-wide. **Named gaps, not solved:** unbounded binding-store growth/cloning over a
+      long conversation (a real, deferred perf cost — fixing it touches already-merged M2 code);
+      everything M3 already named that M4 doesn't touch (streaming, real TLS upstream, production
+      daemon bootstrap, `document` real handling, the partial-vault-interning trade-off). **Next
+      up: M5 — real Claude Code, Anthropic API-key mode, non-streaming** (first real contact —
+      `ANTHROPIC_BASE_URL` pointing at the daemon, a real API key swap, a real sandboxed session;
+      also where `upstream.rs` needs real TLS support), per the plan's §10.3 build order.
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`

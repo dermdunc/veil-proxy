@@ -167,7 +167,7 @@ async fn handle_mask(
         Err(resp) => return resp,
     };
 
-    let (masked_body, stats) =
+    let (masked_body, stats, namespace) =
         match daemon.mask_request(&body, namespace_header.as_deref(), local_addr) {
             Ok(result) => result,
             Err(ProxyError::MaskRequest(err)) => return mask_blocked_response(&err),
@@ -175,7 +175,39 @@ async fn handle_mask(
         };
 
     match upstream::forward(upstream, method.clone(), target, &headers, masked_body).await {
-        Ok(mut resp) => {
+        Ok(resp) => {
+            // M4: demask the response before it reaches the client — the whole point of the
+            // proxy. Infallible (see `demask_response`'s own doc): a malformed/unexpected
+            // response shape or an unresolvable binding never blocks a successful response.
+            // `upstream::forward` already buffered the body into a `Full<Bytes>`, so
+            // `.collect()` here resolves immediately (no real I/O, matching how
+            // `upstream.rs`'s own `buffer_response` extracts bytes from a `Full` body).
+            let (parts, body) = resp.into_parts();
+            let raw_body = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes().to_vec())
+                .unwrap_or_default();
+            let demasked_body = daemon.demask_response(&raw_body, &namespace);
+            let demasked_len = demasked_body.len();
+            let mut parts = parts;
+            // The demasked body's length is not necessarily the upstream's original length
+            // (a restored raw value is rarely the same byte length as the placeholder it
+            // replaced) — the upstream's own `Content-Length` header, copied verbatim into
+            // `parts`, would now be stale. Recomputed fresh, matching `upstream.rs`'s own
+            // "never trust a copied length/host value" precedent. `Transfer-Encoding` is
+            // removed outright rather than left alone (round-2 doubt-pass finding): the body
+            // below is always a single, fully-buffered `Full<Bytes>` — never actually chunked
+            // — so a `Transfer-Encoding: chunked` header copied from an upstream that *did*
+            // stream its response would leave both headers set on a non-chunked body, an
+            // invalid/ambiguous framing per RFC 7230 §3.3.3.
+            parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+            parts.headers.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&demasked_len.to_string())
+                    .expect("a decimal length is always a valid header value"),
+            );
+            let mut resp = Response::from_parts(parts, Full::new(Bytes::from(demasked_body)));
             resp.headers_mut()
                 .insert("x-vg-proxy-verdict", HeaderValue::from_static("mask"));
             let entities = total_masked_entities(&stats);

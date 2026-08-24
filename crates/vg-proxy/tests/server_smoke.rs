@@ -124,6 +124,76 @@ fn spawn_mock_upstream() -> MockUpstream {
     (addr, captured, shutdown_tx, join)
 }
 
+/// `(addr, the text every response's content[0].text carries — settable between requests,
+/// shutdown sender, server task handle)`.
+type ConfigurableMockUpstream = (
+    SocketAddr,
+    Arc<Mutex<String>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+);
+
+/// A mock upstream whose response text is settable by the test between requests — for the M4
+/// response-demask tests, which need to control exactly what the "model" echoes back (a
+/// placeholder from *this* request, or one from an *earlier* request in the same conversation,
+/// for the H1 case) rather than the fixed empty-content response `spawn_mock_upstream` returns.
+///
+/// **Not safe for concurrent requests** (round-2 doubt-pass note): the single shared
+/// `Arc<Mutex<String>>` isn't correlated to a specific request, so a test that fires two
+/// requests against the same mock without awaiting the first response before setting new text
+/// for the second could race. Both current tests avoid this by fully awaiting each round trip
+/// before changing `response_text` — safe today, but a future test reusing this helper for
+/// concurrent requests would need per-request correlation, not this shared-cell shape.
+fn spawn_configurable_mock_upstream() -> ConfigurableMockUpstream {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock upstream");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let listener = TcpListener::from_std(listener).expect("tokio listener");
+    let addr = listener
+        .local_addr()
+        .expect("mock upstream has a local addr");
+
+    let response_text = Arc::new(Mutex::new(String::new()));
+    let response_text_for_task = Arc::clone(&response_text);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => return,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let io = TokioIo::new(stream);
+                    let response_text = Arc::clone(&response_text_for_task);
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let response_text = Arc::clone(&response_text);
+                            async move {
+                                let _ = req.into_body().collect().await;
+                                let text = response_text.lock().unwrap().clone();
+                                let body = serde_json::json!({
+                                    "id": "msg_mock",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "text", "text": text}]
+                                });
+                                let resp = Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from(body.to_string())))
+                                    .unwrap();
+                                Ok::<_, Infallible>(resp)
+                            }
+                        });
+                        let _ = http1::Builder::new().serve_connection(io, service).await;
+                    });
+                }
+            }
+        }
+    });
+
+    (addr, response_text, shutdown_tx, join)
+}
+
 /// Doubt-pass finding (carried from M1/M2): `route_classification.rs` only ever called
 /// `route::classify` directly — it never proved the real wire path behaves the same way. This
 /// exercises the real `bind`/`run_with_listener`/`handle` chain over real TCP connections for
@@ -353,6 +423,147 @@ async fn a_present_but_invalid_namespace_header_fails_closed_not_silently_absent
     let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
 }
 
+/// M4's own round-trip test: mask a value into a request, have the mock upstream echo the
+/// masked placeholder back in its response, and prove the *client* receives the raw value —
+/// not the placeholder. The whole point of the proxy, real end to end for the first time.
+#[tokio::test]
+async fn the_client_receives_the_raw_value_not_the_placeholder_the_model_echoed_back() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, response_text, upstream_shutdown, upstream_join) =
+        spawn_configurable_mock_upstream();
+    let upstream = UpstreamConfig {
+        addr: upstream_addr,
+    };
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    // The mock "model" echoes back exactly the placeholder a fresh vault mints for the first
+    // masked email in a namespace — deterministic, matching this whole codebase's established
+    // test convention (`EMAIL_001`).
+    *response_text.lock().unwrap() = "Got it, will reach out to EMAIL_001 tomorrow.".to_string();
+
+    let namespace = session_header();
+    let body =
+        br#"{"system":"contact jane.doe@example.com","messages":[{"role":"user","content":"hi"}]}"#;
+    let response =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body, Some(&namespace)).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
+    assert!(
+        response.contains("jane.doe@example.com"),
+        "client must see the raw value, not the placeholder: {response}"
+    );
+    assert!(
+        !response.contains("EMAIL_001"),
+        "the placeholder must not reach the client: {response}"
+    );
+    // Round-2 doubt-pass finding: the earlier version of this test only checked body
+    // *content*, never the `Content-Length` header the M4 diff goes out of its way to
+    // recompute — a wrong header would have passed this test silently. Verified here
+    // directly: the header's value must equal the real body's byte length (`str::len()` is
+    // already byte length in Rust, not char count, so no UTF-8 miscount risk in this check
+    // itself).
+    assert_content_length_matches_body(&response);
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}
+
+/// The H1 regression, at the HTTP level: a placeholder minted by an *earlier* request in the
+/// same conversation (same `X-VG-Namespace` header) still resolves when a *later* response
+/// echoes it — proving response-demask is backed by the session's full accumulated binding
+/// store (`SessionShim`), not just the bindings from the request that produced this response.
+#[tokio::test]
+async fn a_placeholder_from_an_earlier_request_in_the_same_session_still_resolves() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, response_text, upstream_shutdown, upstream_join) =
+        spawn_configurable_mock_upstream();
+    let upstream = UpstreamConfig {
+        addr: upstream_addr,
+    };
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let namespace = session_header();
+
+    // Request 1: masks jane.doe@example.com -> EMAIL_001 (recorded into this namespace's
+    // session store). The mock's response to THIS request doesn't echo anything.
+    *response_text.lock().unwrap() = "Understood.".to_string();
+    let body_1 = br#"{"system":"remember jane.doe@example.com","messages":[{"role":"user","content":"hi"}]}"#;
+    let response_1 =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body_1, Some(&namespace)).await;
+    assert!(
+        response_1.starts_with("HTTP/1.1 200"),
+        "response_1: {response_1}"
+    );
+
+    // Request 2: unrelated content, but the mock's response echoes request 1's placeholder —
+    // simulating the model recalling earlier conversation context. Nothing in request 2's own
+    // pack minted EMAIL_001; only the session's accumulated store has it.
+    *response_text.lock().unwrap() = "As discussed, EMAIL_001 is the right contact.".to_string();
+    let body_2 = br#"{"system":"unrelated follow-up","messages":[{"role":"user","content":"ok"}]}"#;
+    let response_2 =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body_2, Some(&namespace)).await;
+
+    assert!(
+        response_2.starts_with("HTTP/1.1 200"),
+        "response_2: {response_2}"
+    );
+    assert!(
+        response_2.contains("jane.doe@example.com"),
+        "a prior-turn placeholder must still resolve: {response_2}"
+    );
+    assert!(
+        !response_2.contains("EMAIL_001"),
+        "the placeholder must not reach the client: {response_2}"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}
+
 #[tokio::test]
 async fn bind_refuses_non_loopback_address() {
     let err = vg_proxy::server::bind("0.0.0.0:0".parse().unwrap())
@@ -413,6 +624,33 @@ fn session_header() -> String {
 
 async fn send_request(addr: SocketAddr, method: &str, target: &str, body: &[u8]) -> String {
     send_request_with_namespace(addr, method, target, body, None).await
+}
+
+/// Parses `response`'s `Content-Length` header and asserts it equals the real byte length of
+/// whatever follows the header/body separator (`\r\n\r\n`) — the specific claim the M4 diff's
+/// `Content-Length` recomputation makes, which body-content-only assertions can't catch.
+fn assert_content_length_matches_body(response: &str) {
+    let separator = response
+        .find("\r\n\r\n")
+        .expect("response has a header/body separator");
+    let (headers, rest) = response.split_at(separator);
+    let body = &rest[4..];
+    let content_length: usize = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length: ")
+                .or_else(|| line.strip_prefix("Content-Length: "))
+        })
+        .expect("response has a Content-Length header")
+        .trim()
+        .parse()
+        .expect("Content-Length is a valid integer");
+    assert_eq!(
+        content_length,
+        body.len(),
+        "Content-Length header ({content_length}) must match the real body length ({}): {response}",
+        body.len()
+    );
 }
 
 async fn send_request_with_namespace(

@@ -68,6 +68,12 @@ pub enum Destination {
     LocalExplanationBuffer,
     RemoteModelPrompt,
     ObservabilitySink,
+    /// A demasked model response on its way back to the wrapped client via `vg-proxy`
+    /// (masking-proxy plan §10.3 milestone M4) — not hard-deny (it's the whole point of the
+    /// proxy: the human sees raw values, "invisible to the user" per the plan's own framing),
+    /// and distinct from every existing variant, none of which mean "back to the local
+    /// wrapped client that made the original request."
+    ProxyResponse,
 }
 
 impl Destination {
@@ -81,6 +87,7 @@ impl Destination {
             Destination::LocalExplanationBuffer => "local-explanation-buffer",
             Destination::RemoteModelPrompt => "remote-model-prompt",
             Destination::ObservabilitySink => "observability-sink",
+            Destination::ProxyResponse => "proxy-response",
         };
         DestinationId(s.to_string())
     }
