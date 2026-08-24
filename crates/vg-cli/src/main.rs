@@ -256,8 +256,16 @@ fn cmd_run(
         );
     }
 
+    // M3 prerequisite (masking-proxy plan §10.2/§10.3): unconditionally, every launch — not
+    // just for Bedrock. Once a real Anthropic-direct session is proxied (M5), Claude Code must
+    // never generate an attribution-shaped `system` block on its own; asking it not to via this
+    // var is the whole fix (`vg-proxy`'s own masking has no special-case detection for such a
+    // block — see `crates/vg-proxy/src/mask_request.rs`'s module doc). `Command` inherits the
+    // ambient environment by default and `.env()` only adds/overrides this one key, so every
+    // other variable (including `BEDROCK_ENV_VARS`, still pass-through-only) is unaffected.
     let status = std::process::Command::new(&cmd[0])
         .args(&cmd[1..])
+        .env("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
         .status()?;
     Ok(exit_from_status(status))
 }

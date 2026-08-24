@@ -12,9 +12,12 @@
 
 pub mod daemon;
 pub mod error;
+pub mod mask_request;
 pub mod route;
+mod schema;
 pub mod server;
 pub mod session;
+pub mod upstream;
 
 pub use daemon::Daemon;
 pub use error::ProxyError;

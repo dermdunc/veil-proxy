@@ -3415,3 +3415,124 @@ so the env mutations can't interleave.
 - Real invocation-level trace correlation (needs a caller-supplied id from the hook layer).
 - `TraceBuffer` wiring into any real `AuditSink`/`Engine` — nothing constructs one in production.
 - `mask()`'s `trace_id` being unreachable on its `Err` paths (named above, not fixed).
+
+## 2026-08-24 — M3 built: request masking, Anthropic direct, non-streaming
+
+`veil-proxy`'s top-priority milestone (`docs/next-actions.md`: "**#1 — nothing above it**").
+Before this milestone, `vg-proxy` was a routing skeleton (M1) with a daemon that only opened a
+bare `Vault` (M2) — no upstream client, no masking, no real request handling anywhere. M3 makes
+the proxy do the actual job for the first time: parse a real Anthropic Messages API request body,
+mask every text-bearing field through the real `vg_core::mask` pipeline, forward the masked body
+to an upstream, and return its response verbatim (response *de*masking is a separate, later
+milestone, M4, not attempted here).
+
+**Built**, per `/Users/hekton/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3,
+refined against this session's interview (recursive masking inside `tool_use`/`tool_result`;
+`document` blocks unconditionally like `image`; the full milestone in one session):
+
+- `crates/vg-proxy/src/schema/anthropic.rs` (new) — `ContentBlockKind`, classifying a content
+  block's `"type"` discriminant during the walk (`Text`/`ToolUse`/`ToolResult`/`Document`/
+  `Image`/`Unknown`) — not a full-body typed schema; see the round-trip-fidelity decision below.
+- `crates/vg-proxy/src/mask_request.rs` (new) — `mask_request()` parses the body as a generic
+  `serde_json::Value` and mutates only `system`/`messages[].content` text leaves in place;
+  every other field (`max_tokens`, `temperature`, `metadata`, `stream`, `tools[]`, ...) round-trips
+  untouched, because nothing here re-types the body into a narrower struct that could silently
+  drop an unnamed field. `tool_use.input`/`tool_result.content` are masked recursively (every
+  string leaf) — matching what the existing hook-based mechanism already does for tool calls
+  today (stringify-and-mask), done here as a real tree-walk. `document`/`image`/anything
+  unrecognized blocks the *whole* request, fail-closed.
+- `crates/vg-proxy/src/daemon.rs` (extended) — `Daemon` now holds a full `Policy`
+  (engine+vault+audit) plus detector/parser registries, mirroring `vg-adapters-claude::Engine`'s
+  assembly — **deliberately not** real production state-dir/keychain discovery; constructors take
+  already-resolved `PolicyLayers` paths and an audit log path directly (named, explicit gap for a
+  real `vg-proxy` daemon binary, not attempted here). New `SharedVault` newtype wraps the same
+  `Arc<Vault>` `Daemon` already held for M2's own liveness checks, so it can also be boxed as
+  `Policy.vault: Box<dyn VaultStore>` (`Arc<Vault>` can't be boxed directly — the trait isn't
+  implemented for it) — mirrors `vg_audit::SharedTelemetrySink`'s precedent for the same
+  shared-handle problem.
+- `crates/vg-proxy/src/upstream.rs` (new) — forwards to a configurable `SocketAddr` over plain
+  HTTP/1.1 (`hyper::client::conn::http1`'s low-level API, one connection per request, no
+  pooling), with an explicit header ALLOW-list, not a blind copy. Plain-HTTP-only; reaching the
+  real `https://api.anthropic.com` needs a TLS client this module doesn't build (M5's job).
+- `crates/vg-proxy/src/server.rs` — `handle` goes from a stateless test-double responder to a
+  real dispatcher: `Block` unchanged (403, no body read, no upstream contact); `Mask` masks then
+  forwards; `Pass` now also forwards for real (unmasked) rather than staying on the old fake
+  response — a direct, non-extra-scope consequence of a real upstream client existing at all.
+- `crates/vg-cli/src/main.rs`'s `cmd_run` — injects `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+  unconditionally, every launch (the one required "work outside `vg-proxy`" item for M3).
+
+**Round-trip fidelity, decided before writing code, not discovered as a review finding:**
+deserializing into a narrow typed request struct and re-serializing would silently drop every
+field `schema/anthropic.rs` doesn't name — parsing as a generic `Value` and mutating only known
+paths in place avoids that by construction.
+
+### Doubt-driven-development, two rounds
+
+**Round 1** — the dispatched single-model review agent stalled after 40+ minutes (running
+self-directed experimental tests) without delivering full results, but its partial trace named
+two concrete leads, both independently verified and resolved:
+- **Fixed:** `"system": null` (a legal way some client JSON serializers represent an absent
+  optional field) fell into a strict `String`/`Array`-only match and failed the whole request
+  closed. Now treated the same as the key being absent — `mask()` never called for it, nothing
+  else changes.
+- **Documented, not fixed (accepted trade-off):** a block partway through masking a request
+  (e.g. an `image` block in `messages[3]`) does not roll back `vault.intern()` calls already
+  made by earlier, successfully-masked fields in the same request. Not a leak — the vault is
+  local and encrypted, interning something never forwarded is inert — but real audit-trail
+  untidiness (a `Scan` event with no accompanying "the request was blocked" record). Fixing it
+  means transactional multi-call semantics across separate `mask()` calls, out of this
+  milestone's scope.
+
+**Round 2 (Codex, cross-model)** found four real issues, all fixed:
+- **A nested `image`/`document` content block inside `tool_result.content` bypassed the
+  whole-request-block invariant.** `tool_result.content` is schema-legally
+  `string | Array<TextBlockParam | ImageBlockParam>` — a real, structured possibility, not just
+  arbitrary tool JSON. The recursive string-leaf masker treated every object uniformly, so a
+  nested image block's base64 data would be string-masked and forwarded instead of blocking.
+  Fixed: the recursive walker now checks every object node's own `"type"` field for `image`/
+  `document` and blocks the whole request the moment one appears anywhere in the tree, not only
+  at the top-level `messages[].content` position.
+- **A present-but-invalid (non-UTF-8) `X-VG-Namespace` header silently collapsed to "absent"**
+  (`.to_str().ok()`), falling through to the port-fallback resolution path instead of failing
+  closed. This is the *exact* trap `session.rs`'s own module doc named in advance during M2's own
+  doubt-pass round — "whichever milestone adds header-extraction code... must map a
+  present-but-invalid header to `SessionError::InvalidNamespaceHeader`, never to `None`" — and
+  this milestone was that one. Fixed: `header_str` now returns `Result`, distinguishing absent
+  (`Ok(None)`) from present-but-invalid (`Err`, a 400, before `Daemon::mask_request` is ever
+  called).
+- **An unrecognized content-block `"type"` string was echoed raw into the client-facing 400
+  response body.** Nothing stops a malformed/adversarial block from putting sensitive content in
+  `"type"` itself; echoing untrusted request content back in an error response is a real risk a
+  masking proxy shouldn't take on, even for a local-loopback-only service. Fixed: the raw value
+  is discarded, not merely hidden — the response always says a fixed `"unrecognized"`.
+- **A `tool_use` block missing its required `input` field was silently treated as "nothing to
+  mask, fine."** `input` is required by the Anthropic schema; its absence is itself anomalous.
+  Fixed: now fails closed (`MalformedMessage`) instead of passing the block through unmasked.
+
+Codex found no defect in `SharedVault`'s delegation, the upstream header allow-list, `Host`/
+`Content-Length` recomputation, or the `CLAUDE_CODE_ATTRIBUTION_HEADER=0` injection path.
+
+### Validation
+
+`cargo build --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D
+warnings`, `cargo fmt --all --check`, `cargo test --workspace` all clean, run after both review
+rounds. New tests across `crates/vg-proxy/src/mask_request.rs` (recursive masking, nested
+image-block regression, missing-`input` regression, `system: null` regression, structure
+preservation, `tools[]` untouched, unrecognized/document/image blocking, `count_tokens` parity,
+vault-level dedup across fields), `crates/vg-proxy/tests/server_smoke.rs` (a hand-rolled mock
+upstream proving real end-to-end masked forwarding, a malformed-body fail-closed test, and the
+invalid-namespace-header regression sending raw non-UTF-8 bytes over the wire), and
+`crates/vg-cli/tests/run_env_injection.rs` (proves the attribution-header env var reaches the
+*child* process, including overriding a conflicting ambient value).
+
+### Still open, not solved by this milestone
+
+- Response demasking (M4) — a `Mask` route's response is returned exactly as the upstream sent
+  it.
+- Streaming (M6) — non-streaming only; `stream: true` is neither detected nor specially handled.
+- Real production state-dir/keychain discovery for a `vg-proxy` daemon binary.
+- Reaching the real `https://api.anthropic.com` over TLS (`upstream.rs` is plain-HTTP only).
+- `document` content-block real handling (text vs. base64 vs. url sub-cases) — blocks
+  unconditionally.
+- The partial-vault-interning-on-mid-request-block trade-off (named above, not fixed).
+- Bedrock (M8+), OAuth/bearer specifics beyond header pass-through (M7).
