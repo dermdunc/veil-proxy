@@ -183,28 +183,27 @@ mod tests {
         assert!(decode_key("test key", &"zz".repeat(32)).is_err());
     }
 
-    /// `load_or_create_actor_pseudonym_key`'s env-seam round-trip. Uses real
-    /// `std::env::set_var`/`remove_var` (`unsafe` since Rust 1.82: not guaranteed atomic
-    /// against a concurrent read on some platforms) — sound here because
-    /// `ACTOR_PSEUDONYM_KEY_ENV` is a name unique to this function and no other test in
-    /// this crate reads or writes it, so there is no cross-test race in practice despite
-    /// `cargo test`'s default parallelism within one binary.
+    /// `load_or_create_actor_pseudonym_key`'s env-seam round-trip, plus its malformed-hex
+    /// rejection. Both cases live in one test function, not two, and run one after the
+    /// other: `cargo test`'s default in-binary parallelism means two separate `#[test]`
+    /// functions both mutating the same process-global `ACTOR_PSEUDONYM_KEY_ENV` (via
+    /// `std::env::set_var`/`remove_var`, `unsafe` since Rust 1.82) can interleave and read
+    /// each other's value — a real, observed flake, not merely a theoretical one; an
+    /// earlier version of this suite split the two cases into separate tests under a
+    /// comment claiming no cross-test race was possible, which this replaces.
     #[test]
-    fn actor_pseudonym_key_env_seam_round_trips() {
+    fn actor_pseudonym_key_env_seam_round_trips_and_rejects_malformed_hex() {
         let key = [7u8; 32];
         let hex = encode_key(&key);
         unsafe {
             std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, &hex);
         }
-        let result = load_or_create_actor_pseudonym_key();
+        let round_trip_result = load_or_create_actor_pseudonym_key();
         unsafe {
             std::env::remove_var(ACTOR_PSEUDONYM_KEY_ENV);
         }
-        assert!(result.unwrap() == ActorPseudonymKey::from_bytes(key));
-    }
+        assert!(round_trip_result.unwrap() == ActorPseudonymKey::from_bytes(key));
 
-    #[test]
-    fn actor_pseudonym_key_env_seam_rejects_malformed_hex() {
         unsafe {
             std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, "not-hex");
         }
