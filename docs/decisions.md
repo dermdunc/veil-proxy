@@ -3767,3 +3767,35 @@ clean when re-checked" is a claim worth being checked itself, not just believed.
 - This work is on an unmerged, unpushed local branch (`worktree-agent-a9869ec2363020f3e`).
   Nothing fires against a real veil-observatory instance until both `VEIL_RECEIPT_KEY` and
   `VEIL_OBSERVATORY_ENDPOINT` are set on a real deployment, which has not happened.
+
+## 2026-08-29: genuine live end-to-end proof, veil-proxy to a real veil-observatory process
+
+After merging both repos' `edge_event.v1` branches to local `main`, ran a real cross-process
+integration: a live `veil-observatory serve` instance (separate process, separate repo,
+`--store /tmp/veil-live-demo-store`), and a real `TelemetryCountingAuditSink::write` against
+the real production `JsonlAuditSink`, with `VEIL_RECEIPT_KEY`/`VEIL_OBSERVATORY_ENDPOINT` set
+to point at it. Not a mock, not either side's own unit tests re-run — two real, separately
+running processes.
+
+**Result**: the observatory's own log recorded `POST /ingest HTTP/1.1" 202`, and its real
+evidence store persisted the record with `edge_event.actor` as a genuine HMAC pseudonym, not
+the raw actor string the test constructed the `AuditEvent` with. This is direct, run-it-
+yourself evidence that the signer, the emitter, the schema, and the verifier all agree with
+each other for real, not just against each side's own fixtures.
+
+**A genuine cross-repo gotcha found in the process, not assumed away**: veil-proxy's
+`VEIL_RECEIPT_KEY` is hex-decoded (`parse_receipt_signing_key`); veil-observatory's is UTF-8-
+encoded directly (`raw.encode()` in `verifier_from_env`). The same 32-byte key therefore needs
+two different string values, one per process, depending on which repo's convention applies —
+setting the identical string in both environments silently produces two unrelated keys that
+would never verify against each other, with no error on either side to say so. Checked before
+running this test, not discovered by a failure: `parse_receipt_signing_key` was hex-decoded
+against a 32-ASCII-byte value (`veil-live-integration-demo-key!!`) to derive the matching hex
+string used on the veil-proxy side. Recorded in
+`crates/vg-audit/tests/live_edge_event_integration.rs`'s module doc as the exact, repeatable
+invocation, and in `docs/next-actions.md` as worth surfacing in `veil-ecosystem`'s architecture
+doc too.
+
+New checked-in test: `crates/vg-audit/tests/live_edge_event_integration.rs`,
+`#[ignore]`d by default (requires a real running `veil-observatory serve` instance) — `cargo
+test --workspace` behavior is unchanged by adding it.
