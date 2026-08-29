@@ -9,8 +9,11 @@
 //! No `Debug` derives here (`docs/architecture/implementation-plan.md:137`) — see
 //! `telemetry::ids`'s module doc for why.
 
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
+use super::hexutil;
 use super::ids::{DeviceRef, KeyRef, RecordId, TenantId};
 
 /// Which payload kind an envelope wraps, mirrored on the wire as the generated schema's
@@ -25,6 +28,21 @@ pub enum SchemaVersion {
     ReceiptV2,
     AlertV1,
     EdgeEventV1,
+}
+
+impl Serialize for SchemaVersion {
+    /// Fixed wire tags, hand-matched rather than derived: `veil-observatory`'s verifier
+    /// gates on the exact string `"veil.edge_event.v1"` for `EdgeEventV1` (this session's
+    /// scope; the other two variants are given the analogous, so-far-unused tags for
+    /// `Receipt`/`Alert`, kept consistent with this one rather than left unspecified).
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            SchemaVersion::ReceiptV2 => "veil.receipt.v2",
+            SchemaVersion::AlertV1 => "veil.alert.v1",
+            SchemaVersion::EdgeEventV1 => "veil.edge_event.v1",
+        };
+        serializer.serialize_str(s)
+    }
 }
 
 /// Why `Envelope::new` rejected its input.
@@ -140,6 +158,29 @@ impl Envelope {
     }
 }
 
+impl Serialize for Envelope {
+    /// Wire shape (`veil.edge_event.v1`'s envelope object — see `telemetry::signing`'s
+    /// module doc for the full record shape this nests into): every field named above,
+    /// verbatim field names, `device_ref`/`tenant_id` as JSON `null` when absent (the
+    /// blanket `Option<T>: Serialize` impl serde provides). `record_id` renders as its
+    /// UUID string form (`Uuid`'s own `Display`) via `RecordId`'s own `Serialize` impl
+    /// (`telemetry::ids`) — this impl only reaches private fields it already owns, never
+    /// reimplements another type's encoding.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Envelope", 9)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("contract_revision", &self.contract_revision)?;
+        state.serialize_field("record_id", &self.record_id)?;
+        state.serialize_field("issued_at_us", &self.issued_at_us)?;
+        state.serialize_field("device_ref", &self.device_ref)?;
+        state.serialize_field("tenant_id", &self.tenant_id)?;
+        state.serialize_field("sequence", &self.sequence)?;
+        state.serialize_field("valid_until_us", &self.valid_until_us)?;
+        state.serialize_field("integrity", &self.integrity)?;
+        state.end()
+    }
+}
+
 /// Signing algorithm, closed enum — matches `veil-observatory`'s existing
 /// `veil.receipt.v1.schema.json` `integrity.algorithm` enum
 /// (`ECDSA_SHA_256`/`HMAC_SHA_256`).
@@ -148,6 +189,23 @@ impl Envelope {
 pub enum SigningAlgorithm {
     EcdsaSha256,
     HmacSha256,
+}
+
+impl Serialize for SigningAlgorithm {
+    /// Exact strings from this type's own doc comment above, which already names the
+    /// convention this must match: `veil-observatory`'s existing
+    /// `veil.receipt.v1.schema.json` `integrity.algorithm` enum
+    /// (`ECDSA_SHA_256`/`HMAC_SHA_256`) — gated on by that verifier by string alone, no
+    /// access to this repo's source. `HmacSha256` is the only variant this session's
+    /// signer actually produces; `EcdsaSha256`'s tag is included for completeness since
+    /// the type itself is `Serialize` regardless of which variant a given record uses.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            SigningAlgorithm::EcdsaSha256 => "ECDSA_SHA_256",
+            SigningAlgorithm::HmacSha256 => "HMAC_SHA_256",
+        };
+        serializer.serialize_str(s)
+    }
 }
 
 /// The signing block (ratified Q3: custodian-issued device key, minted at enrolment;
@@ -178,6 +236,24 @@ impl Integrity {
             key_ref,
             signature,
         }
+    }
+}
+
+impl Serialize for Integrity {
+    /// `payload_sha256`/`nonce`/`signature` all render as lowercase hex strings, never a
+    /// byte array or base64 (task requirement, and consistent with every other
+    /// fixed-width byte field on the wire — `record_id` aside, which is a UUID string).
+    /// `signature`'s length genuinely varies by `algorithm` (this type's own doc
+    /// comment) — hex, not a fixed-width encoding, is the only representation that's
+    /// correct for both today's `HmacSha256` (32 bytes) and a future `EcdsaSha256`.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Integrity", 5)?;
+        state.serialize_field("payload_sha256", &hexutil::encode(&self.payload_sha256))?;
+        state.serialize_field("nonce", &hexutil::encode(&self.nonce))?;
+        state.serialize_field("algorithm", &self.algorithm)?;
+        state.serialize_field("key_ref", &self.key_ref)?;
+        state.serialize_field("signature", &hexutil::encode(&self.signature))?;
+        state.end()
     }
 }
 
@@ -271,5 +347,66 @@ mod tests {
             sample_integrity(),
         );
         assert!(before_issued.is_err());
+    }
+
+    #[test]
+    fn schema_version_edge_event_v1_serializes_to_the_exact_gated_string() {
+        // `veil-observatory`'s existing verifier gates on this exact literal string —
+        // see this type's `Serialize` impl doc.
+        let v = serde_json::to_value(SchemaVersion::EdgeEventV1).unwrap();
+        assert_eq!(v, serde_json::Value::String("veil.edge_event.v1".to_string()));
+    }
+
+    #[test]
+    fn signing_algorithm_hmac_sha256_serializes_to_the_exact_gated_string() {
+        let v = serde_json::to_value(SigningAlgorithm::HmacSha256).unwrap();
+        assert_eq!(v, serde_json::Value::String("HMAC_SHA_256".to_string()));
+    }
+
+    #[test]
+    fn integrity_serializes_byte_fields_as_lowercase_hex_strings() {
+        let integrity = Integrity::new(
+            [0xabu8; 32],
+            [0xcdu8; 16],
+            SigningAlgorithm::HmacSha256,
+            None,
+            vec![0xefu8; 4],
+        );
+        let v = serde_json::to_value(&integrity).unwrap();
+        assert_eq!(v["payload_sha256"], serde_json::json!("ab".repeat(32)));
+        assert_eq!(v["nonce"], serde_json::json!("cd".repeat(16)));
+        assert_eq!(v["signature"], serde_json::json!("efefefef"));
+        assert_eq!(v["algorithm"], serde_json::json!("HMAC_SHA_256"));
+        assert_eq!(v["key_ref"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn envelope_serializes_all_named_fields_including_nested_integrity() {
+        let record_id = RecordId::from(Uuid::nil());
+        let env = Envelope::new(
+            SchemaVersion::EdgeEventV1,
+            1,
+            record_id,
+            1_000,
+            None,
+            None,
+            5,
+            301_000,
+            sample_integrity(),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["schema_version"], serde_json::json!("veil.edge_event.v1"));
+        assert_eq!(v["contract_revision"], serde_json::json!(1));
+        assert_eq!(
+            v["record_id"],
+            serde_json::json!("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(v["issued_at_us"], serde_json::json!(1_000));
+        assert_eq!(v["device_ref"], serde_json::Value::Null);
+        assert_eq!(v["tenant_id"], serde_json::Value::Null);
+        assert_eq!(v["sequence"], serde_json::json!(5));
+        assert_eq!(v["valid_until_us"], serde_json::json!(301_000));
+        assert!(v["integrity"].is_object());
     }
 }

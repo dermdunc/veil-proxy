@@ -78,12 +78,15 @@
 pub(crate) mod aggregator;
 mod alert;
 pub(crate) mod block_reason;
+mod canonical;
 mod edge_event;
 mod envelope;
+mod hexutil;
 mod ids;
 mod pseudonymize;
 mod receipt;
 mod reject;
+mod signing;
 
 pub use alert::{Alert, Severity};
 pub use edge_event::EdgeEvent;
@@ -99,6 +102,11 @@ pub use receipt::{
     TraceLinkage,
 };
 pub use reject::TelemetryReject;
+pub use signing::{
+    load_receipt_signing_key_from_env, sign_edge_event_record, EdgeEventRecordInput,
+    ReceiptSigningKey, SignedEdgeEventRecord, SigningError, MIN_SIGNING_KEY_LEN,
+    VEIL_RECEIPT_KEY_ENV_VAR,
+};
 
 use crate::audit::AuditEvent;
 

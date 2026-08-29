@@ -484,3 +484,19 @@ displace it for long.
 ## Session Update: 2026-08-01 — Bank display-collision measurement, propose vg-bench CI gate
 
 - [ ] Human reviews and merges PR; install ci-proposed/ci.yml when ready (see its README for the exact command)
+
+## Session Update: 2026-08-29 — `EdgeEvent`/`Envelope`/`Integrity` wire-serialization + HMAC signing contract built
+
+- [ ] Human reviews and merges the PR; hand the golden vector
+      (`crates/vg-core/tests/fixtures/edge_event_v1_golden.json`) to the `veil-observatory` team
+      building the Python-side verifier.
+- [ ] Follow-up session: build the network emitter / HTTP client (`vg-proxy` hyper wiring) that
+      actually POSTs a signed `sign_edge_event_record` output somewhere — out of scope this
+      session by design.
+- [ ] Follow-up session: wire `sign_edge_event_record` into `vg-audit`'s
+      `TelemetryCountingAuditSink::write` once there's a network emitter for it to feed.
+- [ ] Follow-up: source `VEIL_RECEIPT_KEY` from the OS keychain via a `vg-vault`-style loader
+      (`// TODO` left in `crates/vg-core/src/telemetry/signing.rs`'s module doc), matching
+      `load_or_create_actor_pseudonym_key`'s precedent, instead of the env var.
+- [ ] `Receipt`/`Alert` serialization is still unbuilt — deferred until `Receipt` is actually
+      producible (the aggregator, `telemetry::aggregator`, is still a documented skeleton).
