@@ -1330,8 +1330,10 @@ dependencies = [
 name = "vg-audit"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
  "vg-core",
@@ -1373,11 +1375,15 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "uuid",
  "vg-audit",
  "vg-detectors",

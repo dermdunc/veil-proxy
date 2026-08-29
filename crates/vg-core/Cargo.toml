@@ -22,6 +22,19 @@ sha2 = "0.10"
 # is already resolved in the workspace lock via vg-policy/vg-audit/vg-cli/etc.
 serde = "1"
 serde_json = "1"
+# `telemetry::emitter`'s fire-and-forget HTTP POST of a signed `veil.edge_event.v1` record
+# to the (opt-in) `VEIL_OBSERVATORY_ENDPOINT`. Adds no new registry crate to the workspace
+# lock: `crates/vg-proxy/Cargo.toml` already depends on `tokio` (rt-multi-thread, net) and
+# `hyper` (server, client, http1) at these exact major versions, so this is a new
+# dependency *edge* onto already-resolved crates, not a new version to fetch. Feature set
+# kept to the minimum this module actually calls -- no "rt-multi-thread" (the emitter owns
+# one dedicated background OS thread with a single-threaded runtime, not a pool: see
+# `emitter.rs`'s own doc for why), no "server" on `hyper` (this crate only ever originates
+# requests, never accepts them -- that's `vg-proxy`'s job).
+tokio = { version = "1", features = ["rt", "net", "time"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 # Dev-only: lets keying's tests exercise real `Finding`s from `vg-detectors::all_detectors()`

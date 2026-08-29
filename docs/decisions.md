@@ -3723,3 +3723,47 @@ pipeline + 1 pipeline_latency_gate + 19 telemetry, up from 96/16 respectively be
   more broadly) is still caller-supplied, unchanged from before this session — this session signs
   `integrity.signature` over the full canonical record, a separate, narrower thing.
 - `Receipt`/`Alert` serialization — untouched, `EdgeEvent` only.
+
+## 2026-08-29: network emitter + audit-sink wiring (session 2, same MVP)
+
+Closed the two items the previous session's entry above listed as "still open": built the
+HTTP client (`crates/vg-core/src/telemetry/emitter.rs`) and wired it into `vg-audit`'s
+`TelemetryCountingAuditSink::write`.
+
+**Design**: fire-and-forget, fail-open, structurally opt-in. `edge_event_emitter_from_env`
+reads both `VEIL_RECEIPT_KEY` and a new `VEIL_OBSERVATORY_ENDPOINT` env var; either absent is
+a documented `Ok(None)` no-op with a test proving the channel/thread/client are never
+constructed in that case, not merely that nothing gets sent. When both are set,
+`EdgeEventEmitterHandle::connect` spawns a dedicated OS thread running its own
+single-threaded Tokio runtime (not `tokio::spawn` onto an ambient runtime — this sink is
+called from both `vg-proxy`'s async daemon and a fully synchronous CLI hook path with no
+ambient runtime at all) that drains a bounded `mpsc` channel (capacity 256) and POSTs each
+record with a 3-second timeout, one at a time, no retry. `try_emit` never blocks: a full
+channel or a dead worker both count and drop.
+
+**Validation, independently re-run after this session's own stall/recovery** (see below):
+`cargo build --workspace`, `cargo clippy --workspace --all-targets` (clean), and
+`cargo test --workspace` — every test binary in the workspace, zero failures. The new
+`telemetry::emitter` module alone: 10 tests (structural no-op gating in all four
+present/absent combinations, a real local-TCP-server end-to-end POST asserting the exact
+bytes received, an unreachable-endpoint test proving `try_emit` returns in under 500ms
+regardless of the endpoint's reachability, and a full-channel test proving drop-not-block
+under load).
+
+**A process note, not a code note**: the agent session that built this stalled for 10
+minutes mid-run with no output, right as it began the full build/clippy/test cycle, and was
+reported as failed by the orchestrating session's watchdog. Independently re-running the
+exact same build/clippy/test commands afterward found zero issues — full workspace suite
+green, sub-second runtime everywhere, no hang reproduced. Treated as an infrastructure
+stall, not a defect in the code, but recorded here rather than silently assumed, since "ran
+clean when re-checked" is a claim worth being checked itself, not just believed.
+
+### Still open
+
+- `Receipt`/`Alert` emission — `EdgeEvent` only, unchanged from the previous session.
+- OS-keychain sourcing for `VEIL_RECEIPT_KEY` — still an env var, `// TODO` left in place.
+- TLS on the emitter's HTTP client — plain `http://` only, matching the receiver's own
+  loopback-only MVP scope on the veil-observatory side.
+- This work is on an unmerged, unpushed local branch (`worktree-agent-a9869ec2363020f3e`).
+  Nothing fires against a real veil-observatory instance until both `VEIL_RECEIPT_KEY` and
+  `VEIL_OBSERVATORY_ENDPOINT` are set on a real deployment, which has not happened.

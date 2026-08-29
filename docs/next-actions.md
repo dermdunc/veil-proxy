@@ -490,11 +490,14 @@ displace it for long.
 - [ ] Human reviews and merges the PR; hand the golden vector
       (`crates/vg-core/tests/fixtures/edge_event_v1_golden.json`) to the `veil-observatory` team
       building the Python-side verifier.
-- [ ] Follow-up session: build the network emitter / HTTP client (`vg-proxy` hyper wiring) that
-      actually POSTs a signed `sign_edge_event_record` output somewhere — out of scope this
-      session by design.
-- [ ] Follow-up session: wire `sign_edge_event_record` into `vg-audit`'s
-      `TelemetryCountingAuditSink::write` once there's a network emitter for it to feed.
+- [x] ~~Build the network emitter / HTTP client~~ — done: `crates/vg-core/src/telemetry/emitter.rs`,
+      fire-and-forget over a dedicated thread + single-threaded Tokio runtime, structurally
+      opt-in on both `VEIL_RECEIPT_KEY` and a new `VEIL_OBSERVATORY_ENDPOINT` env var.
+- [x] ~~Wire the signer into `TelemetryCountingAuditSink::write`~~ — done, same session.
+- [ ] Merge and push this branch (and veil-observatory's ingestion branch) once a human
+      reviews both — nothing fires against a real instance until then.
+- [ ] Point a real `VEIL_OBSERVATORY_ENDPOINT` at a running `veil-observatory serve` instance
+      and confirm one genuine end-to-end delivery outside of tests.
 - [ ] Follow-up: source `VEIL_RECEIPT_KEY` from the OS keychain via a `vg-vault`-style loader
       (`// TODO` left in `crates/vg-core/src/telemetry/signing.rs`'s module doc), matching
       `load_or_create_actor_pseudonym_key`'s precedent, instead of the env var.

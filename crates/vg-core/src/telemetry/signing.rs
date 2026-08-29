@@ -115,7 +115,14 @@ pub fn load_receipt_signing_key_from_env() -> Result<ReceiptSigningKey, SigningE
 
 /// The testable core of [`load_receipt_signing_key_from_env`]: given the raw env var
 /// value (or `None` if unset), hex-decodes and length-checks it.
-fn parse_receipt_signing_key(raw: Option<String>) -> Result<ReceiptSigningKey, SigningError> {
+///
+/// `pub(super)`, not private: `telemetry::emitter`'s own env-gating logic needs to parse
+/// an already-read `VEIL_RECEIPT_KEY` value without re-reading the process environment
+/// itself (the same parallel-`cargo test` flakiness reason this function was split out
+/// from [`load_receipt_signing_key_from_env`] in the first place) -- kept `pub(super)`
+/// rather than `pub` so no crate outside `vg-core` can call it directly, only siblings
+/// inside `telemetry`.
+pub(super) fn parse_receipt_signing_key(raw: Option<String>) -> Result<ReceiptSigningKey, SigningError> {
     let raw = raw.ok_or(SigningError::KeyEnvVarMissing)?;
     let bytes = super::hexutil::decode(raw.trim()).map_err(|_| SigningError::KeyNotHex)?;
     ReceiptSigningKey::from_bytes(bytes)
