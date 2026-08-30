@@ -60,3 +60,4 @@ That can grow into a published site later if it earns one — see
 - [2026-08-24 — The warning nobody was in the room to hear](2026-08-24-the-warning-nobody-was-in-the-room-to-hear.md)
 - [2026-08-24 — A name that looked like a secret](2026-08-24-a-name-that-looked-like-a-secret.md)
 - [2026-08-29 — The same string, two different keys](2026-08-29-the-same-string-two-different-keys.md)
+- [2026-08-30 — A guarantee the tests never tested](2026-08-30-a-guarantee-the-tests-never-tested.md)
