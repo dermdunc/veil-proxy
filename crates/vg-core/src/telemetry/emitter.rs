@@ -76,6 +76,25 @@ const CHANNEL_CAPACITY: usize = 256;
 /// configurable — retry/backoff tuning is explicitly out of scope for this MVP.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long [`EdgeEventEmitterHandle`]'s `Drop` impl waits for already-`try_emit`ted
+/// records to actually be sent before giving up. Exists specifically for the short-lived
+/// CLI hook process this module's doc names as one of two call contexts: with no explicit
+/// flush, that process's `main` can return and exit before the background thread's own
+/// connect+handshake+POST sequence ever gets scheduled, silently dropping telemetry despite
+/// every existing test passing (they all run inside a long-lived `cargo test` process and
+/// poll for the outcome, which has no analogue in the real short-lived binary). Short enough
+/// that a healthy loopback delivery (the common case) finishes well within it and a hung one
+/// doesn't meaningfully delay a CLI process's own exit.
+const FLUSH_ON_DROP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Extra grace period, after [`FLUSH_ON_DROP_TIMEOUT`], for the background thread to
+/// actually finish and be joined once its channel is closed. If it still hasn't finished
+/// after this, the thread is abandoned rather than joined — `std::thread::JoinHandle` has
+/// no timed join in `std`, and blocking a caller's shutdown path indefinitely would be
+/// worse than leaking one thread that will still run to completion (or be killed by the
+/// process's own exit) on its own.
+const JOIN_GRACE_PERIOD: Duration = Duration::from_millis(200);
+
 /// The observatory's full POST target, as configured via [`VEIL_OBSERVATORY_ENDPOINT_ENV_VAR`].
 /// A type alias, not a newtype: this is `vg-core`'s only HTTP-client-facing surface, and
 /// wrapping `hyper::Uri` further would add ceremony without adding any validation this
@@ -103,6 +122,8 @@ pub enum EmitterInitError {
     EndpointNotHttp,
     #[error("{VEIL_OBSERVATORY_ENDPOINT_ENV_VAR} must include a host")]
     EndpointMissingHost,
+    #[error("failed to spawn the edge-event emitter's background thread: {0}")]
+    ThreadSpawnFailed(std::io::Error),
 }
 
 /// A snapshot of one [`EdgeEventEmitterHandle`]'s outcome counters. Cheap to read
@@ -137,8 +158,17 @@ struct EmitterStatsInner {
 /// `Box<dyn AuditSink>` (`AuditSink: Send + Sync`, `crate::traits`).
 pub struct EdgeEventEmitterHandle {
     key: ReceiptSigningKey,
-    sender: mpsc::SyncSender<String>,
+    // `Option` so `Drop` can close the channel (by taking and dropping the sender) before
+    // joining the background thread -- the thread's `recv()` loop only returns `Err` and
+    // exits once every sender side is gone, so joining first would hang forever.
+    sender: Option<mpsc::SyncSender<String>>,
     stats: Arc<EmitterStatsInner>,
+    // How many `try_emit` calls this handle has successfully enqueued (queue-full drops
+    // excluded) -- what `flush` waits for `stats.sent_ok + stats.send_failed` to catch up
+    // to. Plain, not `Arc`: only ever read/written from calls on this same handle (never
+    // shared with the background thread directly), so no cross-thread ownership is needed.
+    enqueued: AtomicU64,
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EdgeEventEmitterHandle {
@@ -146,17 +176,32 @@ impl EdgeEventEmitterHandle {
     /// Intended for [`edge_event_emitter_from_env`]'s Some/Some branch and for tests that
     /// want to construct a handle explicitly (a real local test server, an unreachable
     /// port, ...) without mutating real process environment variables.
-    pub fn connect(key: ReceiptSigningKey, endpoint: ObservatoryEndpoint) -> Self {
+    ///
+    /// Fallible, deliberately: under OS thread exhaustion (`ulimit` hit, `ENOMEM`/`EAGAIN`
+    /// from `pthread_create` -- realistic under load on a busy `vg-proxy` host), spawning
+    /// can fail. This module's whole reason to exist is "fail open, never panic" for a
+    /// telemetry-only condition; the caller (`edge_event_emitter_from_env`, ultimately
+    /// `vg-audit`'s `TelemetryCountingAuditSink::new`) already has a real error path for
+    /// "this opted-in feature is misconfigured, disable it and keep going" -- panicking here
+    /// instead of returning into that path would let a telemetry-only failure crash an
+    /// entire hook invocation or daemon startup, precisely under the resource pressure where
+    /// inert-by-default matters most.
+    pub fn connect(key: ReceiptSigningKey, endpoint: ObservatoryEndpoint) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<String>(CHANNEL_CAPACITY);
         let stats = Arc::new(EmitterStatsInner::default());
         let worker_stats = Arc::clone(&stats);
         // Deliberately not `tokio::spawn` onto an ambient runtime -- see this module's
         // own doc for why a caller-supplied runtime cannot be assumed to exist.
-        std::thread::Builder::new()
+        let join_handle = std::thread::Builder::new()
             .name("veil-edge-event-emitter".to_string())
-            .spawn(move || run_poster_loop(endpoint, receiver, worker_stats))
-            .expect("failed to spawn veil-edge-event-emitter background thread");
-        Self { key, sender, stats }
+            .spawn(move || run_poster_loop(endpoint, receiver, worker_stats))?;
+        Ok(Self {
+            key,
+            sender: Some(sender),
+            stats,
+            enqueued: AtomicU64::new(0),
+            join_handle: Some(join_handle),
+        })
     }
 
     /// The signing key this handle was built from, so the caller (`vg-audit`) can sign an
@@ -172,8 +217,20 @@ impl EdgeEventEmitterHandle {
     /// successfully enqueued — delivery is still not guaranteed even then (the background
     /// worker may yet fail to send it; see [`EmitterStats::send_failed`]).
     pub fn try_emit(&self, canonical_json: String) -> bool {
-        match self.sender.try_send(canonical_json) {
-            Ok(()) => true,
+        // `None` only once `Drop` has started, which only happens once this handle's last
+        // owning reference is gone (it lives behind one `Arc`, via `vg-audit`'s
+        // `SharedTelemetrySink`) -- so no other call can race a `try_emit` against that.
+        // Guarded rather than assumed anyway: failing open (report "dropped", same as a
+        // full channel) is the correct degradation for a call that somehow still happens.
+        let Some(sender) = self.sender.as_ref() else {
+            self.stats.queue_full_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        match sender.try_send(canonical_json) {
+            Ok(()) => {
+                self.enqueued.fetch_add(1, Ordering::Relaxed);
+                true
+            }
             Err(_) => {
                 self.stats.queue_full_dropped.fetch_add(1, Ordering::Relaxed);
                 false
@@ -188,6 +245,63 @@ impl EdgeEventEmitterHandle {
             sent_ok: self.stats.sent_ok.load(Ordering::Relaxed),
             send_failed: self.stats.send_failed.load(Ordering::Relaxed),
         }
+    }
+
+    /// Waits, up to `timeout`, for every record already handed to [`try_emit`] to be either
+    /// sent or given up on. Does not stop `try_emit` from enqueueing further work in the
+    /// meantime -- this is a best-effort drain, not a barrier. Exposed mainly so `Drop` can
+    /// call it with a short, fixed bound; `pub(crate)` since no caller outside this crate
+    /// should need to reach for it directly (dropping the handle is the intended trigger).
+    pub(crate) fn flush(&self, timeout: Duration) {
+        let target = self.enqueued.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        loop {
+            let stats = self.stats();
+            if stats.sent_ok + stats.send_failed >= target {
+                return;
+            }
+            if started.elapsed() >= timeout {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for EdgeEventEmitterHandle {
+    /// Best-effort, bounded drain on drop — see [`FLUSH_ON_DROP_TIMEOUT`]'s own doc for why
+    /// this exists (the short-lived CLI hook process is one of this module's two designed-for
+    /// call contexts, and without this, its `main` can return and exit before the background
+    /// thread's connect+handshake+POST ever gets scheduled, silently dropping telemetry).
+    ///
+    /// Still fire-and-forget in spirit: this is a best effort to WIN the race against process
+    /// exit within a short, bounded window, not a durability guarantee for an arbitrarily
+    /// large burst queued right before shutdown.
+    fn drop(&mut self) {
+        self.flush(FLUSH_ON_DROP_TIMEOUT);
+        // Close the channel so the background loop's `recv()` returns `Err` and the thread
+        // exits, once whatever's already queued (if `flush` timed out before it all drained)
+        // is done. Must happen before the join attempt below, or a still-open channel with no
+        // sender activity blocks `recv()` -- and therefore the thread's exit -- forever.
+        self.sender.take();
+        let Some(handle) = self.join_handle.take() else {
+            return;
+        };
+        // `std::thread::JoinHandle` has no timed join in `std`. Poll `is_finished()` for a
+        // short grace period instead of blocking indefinitely on `join()`: a caller's
+        // shutdown path (notably `vg-cli`'s hook process) must never hang because one
+        // background thread is slow to unwind, even though the common case (an already-
+        // flushed, idle thread) finishes this loop on its first check.
+        let deadline = std::time::Instant::now() + JOIN_GRACE_PERIOD;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // else: the thread is abandoned, not leaked in the sense that matters here -- it
+        // will still run to completion (bounded by `REQUEST_TIMEOUT` per remaining record)
+        // or be reclaimed by the OS at process exit, whichever comes first.
     }
 }
 
@@ -353,7 +467,8 @@ fn build_edge_event_emitter(
 
     let key = parse_receipt_signing_key(Some(key_raw)).map_err(EmitterInitError::Signing)?;
     let endpoint = parse_observatory_endpoint(&endpoint_raw)?;
-    Ok(Some(EdgeEventEmitterHandle::connect(key, endpoint)))
+    let handle = EdgeEventEmitterHandle::connect(key, endpoint).map_err(EmitterInitError::ThreadSpawnFailed)?;
+    Ok(Some(handle))
 }
 
 /// Parses and validates [`VEIL_OBSERVATORY_ENDPOINT_ENV_VAR`]'s raw value: must be an
@@ -505,7 +620,7 @@ mod tests {
     fn end_to_end_posts_the_exact_signed_bytes_to_a_real_local_server() {
         let (addr, rx) = spawn_single_request_test_server();
         let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint);
+        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
 
         let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
         assert!(handle.try_emit(sent_body.clone()));
@@ -527,6 +642,31 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_handle_right_after_emit_still_delivers_the_record() {
+        // Mimics `vg-cli`'s short-lived hook process: `try_emit`, then immediately let the
+        // handle go out of scope, with NO polling/waiting in between -- unlike every other
+        // test in this file, which calls `wait_for` before checking the outcome. Before the
+        // `Drop` impl's bounded flush existed, this raced process exit against the
+        // background thread's own connect+handshake+POST and could silently lose the
+        // record; `cargo test`'s long-lived process never exercised that race because it
+        // never exits between `try_emit` and the assertions.
+        let (addr, rx) = spawn_single_request_test_server();
+        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
+
+        {
+            let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
+            assert!(handle.try_emit(sent_body.clone()));
+            // `handle` drops here, at the end of this block -- no `wait_for`, no sleep.
+        }
+
+        let (_head, received_body) = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the record was lost: Drop's flush did not win the race against the handle going away");
+        assert_eq!(received_body, sent_body.as_bytes());
+    }
+
+    #[test]
     fn unreachable_endpoint_does_not_block_try_emit_and_counts_a_failure() {
         // Port 0 binds to an ephemeral free port and is immediately dropped, so nothing
         // is listening on it once we read back its address -- a real "connection
@@ -538,7 +678,7 @@ mod tests {
             listener.local_addr().unwrap()
         };
         let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint);
+        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
 
         let started = std::time::Instant::now();
         let queued = handle.try_emit("{}".to_string());
@@ -567,7 +707,7 @@ mod tests {
         // documentation/testing, guaranteed unroutable, so the connect attempt blocks
         // instead of getting a fast "connection refused."
         let endpoint: ObservatoryEndpoint = "http://192.0.2.1:9/v1/edge-events".parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint);
+        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
 
         let mut queued = 0;
         let mut dropped = 0;

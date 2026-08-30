@@ -3799,3 +3799,48 @@ doc too.
 New checked-in test: `crates/vg-audit/tests/live_edge_event_integration.rs`,
 `#[ignore]`d by default (requires a real running `veil-observatory serve` instance) — `cargo
 test --workspace` behavior is unchanged by adding it.
+
+## 2026-08-30: fixed two real defects in the emitter found by an independent code-review pass
+
+An independent code-review pass on the emitter PR found two defects that both contradicted
+`emitter.rs`'s own explicitly documented "fire-and-forget, fail-open" guarantee.
+
+**`.expect()` on background-thread spawn panicked instead of failing open.** Under OS thread
+exhaustion (`ulimit` hit, `ENOMEM`/`EAGAIN` from `pthread_create` — realistic under load on a
+busy `vg-proxy` host), `EdgeEventEmitterHandle::connect` panicked, and that panic propagated
+through `edge_event_emitter_from_env` -> `TelemetryCountingAuditSink::new` -> `Engine::open`,
+meaning a telemetry-only condition could crash an entire hook invocation or daemon startup —
+precisely under the resource pressure where inert-by-default matters most. Fixed:
+`connect` now returns `Result<Self, std::io::Error>`; a new `EmitterInitError::ThreadSpawnFailed`
+variant carries the failure into the exact same log-and-disable arm
+`TelemetryCountingAuditSink::new` already has for a bad key or bad endpoint URL — no new error
+path needed on the `vg-audit` side, since that arm was already generic over `EmitterInitError`.
+
+**No flush/join path — the short-lived CLI hook process could race process exit and silently
+drop telemetry.** `emitter.rs`'s own module doc states the emitter must work from BOTH call
+contexts: `vg-proxy`'s long-lived async daemon, and a fully synchronous, short-lived CLI process
+(`vg-cli`'s `cmd_hook`, `fn main() -> ExitCode`). But nothing joined or flushed the background
+thread — `try_emit` only enqueues and returns. In the CLI path, `cmd_hook` builds a local
+`Engine` (owning the emitter, transitively), calls `try_emit` once via the audit sink, then
+returns; Rust drops non-main threads immediately on process exit, and the background thread
+still has to be scheduled, build its own Tokio runtime, connect, and complete an HTTP/1.1
+handshake+POST — easily losing that race. Fixed with a `Drop` impl on `EdgeEventEmitterHandle`
+that does a bounded flush (waits up to 500ms for the channel to drain per an `enqueued` counter
+matching `sent_ok + send_failed`) then a bounded join (200ms grace via `is_finished()` polling —
+`std::thread::JoinHandle` has no timed join in `std`), abandoning rather than blocking forever
+if the thread is still slow. Confirmed this is the correct hook point, not just assumed: `main`
+returns `ExitCode` (not `std::process::exit`, which would skip destructors), `cmd_hook`'s
+`engine` is a local variable, and `Engine.telemetry_sink: Option<SharedTelemetrySink>` is the
+only owner of the one `Arc` wrapping the sink — so normal Rust destructor semantics already
+guarantee `Drop::drop` runs exactly once, at the natural point everything goes away, with no
+call-site wiring needed anywhere in `vg-cli`.
+
+New test (`dropping_the_handle_right_after_emit_still_delivers_the_record`) exercises exactly
+this: `try_emit` then an immediate scope-exit drop, no `wait_for` polling first — unlike every
+other test in the file, which would never have caught this bug because `cargo test`'s own
+process never exits between emit and assertion.
+
+`cargo build --workspace`, `cargo clippy --workspace --all-targets` (clean), `cargo test
+--workspace` all pass, zero regressions (three existing call sites in `vg-audit`'s own test
+module needed `.unwrap()` added for `connect`'s new `Result` return type — mechanical, no
+behavior change).

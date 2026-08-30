@@ -516,3 +516,17 @@ displace it for long.
       `load_or_create_actor_pseudonym_key`'s precedent, instead of the env var.
 - [ ] `Receipt`/`Alert` serialization is still unbuilt — deferred until `Receipt` is actually
       producible (the aggregator, `telemetry::aggregator`, is still a documented skeleton).
+
+## Session Update: 2026-08-30 — fixed two review-found defects in the emitter
+
+- [x] ~~`EdgeEventEmitterHandle::connect` panics on thread-spawn failure~~ — fixed:
+      now returns `Result<Self, std::io::Error>`, propagated through
+      `EmitterInitError::ThreadSpawnFailed` into the same log-and-disable path
+      `TelemetryCountingAuditSink::new` already has for other misconfigurations.
+- [x] ~~No flush/join path — the short-lived CLI hook process can race process exit and
+      silently drop telemetry~~ — fixed: `EdgeEventEmitterHandle` now has a `Drop` impl
+      doing a bounded (500ms + 200ms grace) flush-then-join, so a normal-return exit path
+      (no `std::process::exit`) delivers already-`try_emit`ted records before the process
+      goes away, without meaningfully slowing down the common case. New test
+      (`dropping_the_handle_right_after_emit_still_delivers_the_record`) exercises exactly
+      the race the other tests' `wait_for` polling never touched.

@@ -599,7 +599,8 @@ mod tests {
         let emitter = EdgeEventEmitterHandle::connect(
             ReceiptSigningKey::from_bytes(RAW_KEY.to_vec()).unwrap(),
             endpoint,
-        );
+        )
+        .unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
             key(),
@@ -659,7 +660,7 @@ mod tests {
             listener.local_addr().unwrap()
         };
         let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint);
+        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint).unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
             key(),
@@ -692,7 +693,7 @@ mod tests {
     #[test]
     fn a_burst_of_writes_past_channel_capacity_drops_rather_than_blocking() {
         let endpoint: ObservatoryEndpoint = "http://192.0.2.1:9/v1/edge-events".parse().unwrap();
-        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint);
+        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint).unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
             key(),
