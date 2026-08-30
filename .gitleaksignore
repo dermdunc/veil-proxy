@@ -1,0 +1,17 @@
+# FOSS Publication Workflow Gate 2 triage (2026-08-30): all 11 findings below are
+# confirmed false positives from this repo's own detector-test fixtures and seeded
+# eval corpus -- entropy.rs and pipeline.rs/keying_integration.rs are unit tests for
+# a secret-entropy PII detector; corpus/seeded/manifest.json is a synthetic eval
+# fixture explicitly documented as containing no real PII/secrets. None are real
+# leaked credentials.
+6eaa5a22d86c41fec304fb031952e91304fbc1fe:corpus/seeded/manifest.json:generic-api-key:35
+6eaa5a22d86c41fec304fb031952e91304fbc1fe:corpus/seeded/manifest.json:generic-api-key:45
+6eaa5a22d86c41fec304fb031952e91304fbc1fe:corpus/seeded/manifest.json:generic-api-key:57
+6f4ea5db0277688c07a9e99e5989f689446ff85e:crates/vg-detectors/src/entropy.rs:generic-api-key:519
+6f4ea5db0277688c07a9e99e5989f689446ff85e:crates/vg-detectors/src/entropy.rs:generic-api-key:586
+6f4ea5db0277688c07a9e99e5989f689446ff85e:crates/vg-detectors/src/entropy.rs:generic-api-key:630
+ac79f926c6119af89e1ee4731e5cf568cb4cda7b:crates/vg-core/tests/keying_integration.rs:generic-api-key:24
+c1f58e2caf8580648188f91b2fd15897cae44951:crates/vg-core/tests/pipeline.rs:generic-api-key:296
+fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:179
+fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:234
+fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:242

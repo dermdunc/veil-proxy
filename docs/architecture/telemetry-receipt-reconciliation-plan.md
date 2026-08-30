@@ -30,9 +30,10 @@ three further defects in `veil.receipt.v1` that neither document caught (§2.4a)
 question set changed: Q3 and Q1 and Q2 were widened, Q4 demoted to non-blocking, and one new
 blocking question (Q5, contract-change governance) was added.
 
-Path abbreviations used below:
-- `VP` = `/Users/hekton/Development/hekton/factory-output/veilgremlin`
-- `VO` = `/Users/hekton/Development/veil-observatory`
+Path abbreviations used below (relative to each repo's own root — `VP/<subpath>` means
+`<subpath>` inside this repo, `VO/<subpath>` means `<subpath>` inside the sibling repo):
+- `VP` = `veilgremlin` (this repo)
+- `VO` = `veil-observatory` (sibling repo)
 
 All `file:line` citations in this document were re-verified by direct read during the
 critique-review pass. Where the draft's or the critique's line numbers were off, they are
