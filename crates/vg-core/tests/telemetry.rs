@@ -13,9 +13,10 @@
 
 use uuid::Uuid;
 use vg_core::telemetry::{
-    ActorPseudonymKey, AlertRuleId, ArtefactKindId, DetectorSetId, DeviceRef, DeviceRefError,
-    EdgeEvent, EntityClassId, ExceptionRuleId, KeyRef, RegistryRef, TelemetryEvent,
-    TelemetryReject, TenantId, VersionToken,
+    sign_edge_event_record, ActorPseudonymKey, AlertRuleId, ArtefactKindId, DetectorSetId,
+    DeviceRef, DeviceRefError, EdgeEvent, EdgeEventRecordInput, EntityClassId, ExceptionRuleId,
+    KeyRef, ReceiptSigningKey, RecordId, RegistryRef, TelemetryEvent, TelemetryReject, TenantId,
+    VersionToken,
 };
 use vg_core::{
     conformance::assert_telemetry_token_rejects_raw_value, ActorId, ArtefactKind, AuditEvent,
@@ -465,4 +466,177 @@ fn edge_event_block_rejects_an_unrecognized_reason_string() {
         // comment above, rather than leaving it asserted only in prose.
         assert_eq!(expect_reject(TelemetryEvent::try_from(&event)), got);
     }
+}
+
+// -- Wire serialization / canonical JSON / HMAC signing --
+
+/// Cross-language contract test: reconstructs the exact `veil.edge_event.v1` record
+/// pinned in `tests/fixtures/edge_event_v1_golden.json` via the *production* path
+/// (`AuditEvent` -> `EdgeEvent::try_from_audit_event` -> `sign_edge_event_record`) and
+/// asserts byte-exact equality against the fixture's `canonical_json` and
+/// `signature_hex`. A downstream Python verifier (`veil-observatory`, a separate
+/// private repo) pins against this same fixture — any future change to field names,
+/// canonicalization, or signing here that doesn't also update the fixture (deliberately,
+/// with the cross-repo consequences considered) must fail this test loudly, not pass
+/// silently.
+///
+/// The concrete input values below must match `tests/fixtures/edge_event_v1_golden.json`'s
+/// own `input` object exactly -- reviewed and edited together, not derived from each
+/// other automatically (deliberately not parsed back out of the fixture file: a bug that
+/// corrupted both the fixture and this test's input construction identically would
+/// otherwise still pass).
+#[test]
+fn edge_event_v1_golden_vector_matches_the_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/edge_event_v1_golden.json"
+    ))
+    .unwrap();
+
+    // input.actor_pseudonym_key_hex = "09" * 32
+    let actor_key = ActorPseudonymKey::from_bytes([0x09u8; 32]);
+    // input.audit_event
+    let event = AuditEvent::DemaskDecision {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId("jane.doe".to_string()),
+        allowed: true,
+        policy_version: "policy-v1".to_string(),
+    };
+    let edge_event = EdgeEvent::try_from_audit_event(&event, &actor_key).unwrap();
+
+    // input.signing_key_hex = 01 02 ... 20 (32 sequential bytes)
+    let signing_key = ReceiptSigningKey::from_bytes((1u8..=32u8).collect()).unwrap();
+    // input.record_id
+    let record_id = RecordId::from(
+        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+    );
+    // input.nonce_hex = 01 02 ... 10 (16 sequential bytes)
+    let nonce: [u8; 16] = (1u8..=16u8).collect::<Vec<_>>().try_into().unwrap();
+
+    let input = EdgeEventRecordInput {
+        contract_revision: 1,               // input.contract_revision
+        record_id,
+        issued_at_us: 1_700_000_000_000_000, // input.issued_at_us
+        device_ref: None,                    // input.device_ref
+        tenant_id: None,                     // input.tenant_id
+        sequence: 0,                         // input.sequence
+        valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
+        payload_sha256: [0u8; 32],           // input.payload_sha256_hex = "00" * 32
+        nonce,
+        key_ref: None,                       // input.key_ref
+        edge_event,
+    };
+
+    let signed = sign_edge_event_record(input, &signing_key).unwrap();
+
+    assert_eq!(
+        signed.canonical_json,
+        fixture["canonical_json"].as_str().unwrap(),
+        "canonical JSON drifted from the pinned golden vector"
+    );
+    assert_eq!(
+        signed.signature_hex,
+        fixture["signature_hex"].as_str().unwrap(),
+        "HMAC signature drifted from the pinned golden vector"
+    );
+    // The signature is also embedded in the canonical JSON -- both must agree.
+    assert!(signed.canonical_json.contains(&signed.signature_hex));
+}
+
+/// Hard-gate regression: every raw, free-text-shaped value this session's whole input
+/// surface can carry (an operator-typed actor identity that could itself be
+/// hostname/PII-shaped, and a parser-detected source-code language name) must never
+/// appear verbatim in the serialized wire record -- only its pseudonymized/classified/
+/// collapsed form may. `EdgeEvent`'s actual input surface has exactly two raw-string
+/// vectors (`ActorId`, `ArtefactKind::SourceCode`'s language name) plus one more that
+/// collapses to an integer before it can ever reach this struct at all
+/// (`AuditEvent::Block.reason`, classified by `telemetry::block_reason` inside
+/// `try_from_audit_event` -- there is no field left on `BlockedAttemptPayload` capable
+/// of holding the original string, so it isn't re-tested here beyond the coverage
+/// `blocked_attempt_serializes_the_reason_as_an_integer_never_the_original_string`
+/// (`telemetry::edge_event`'s own tests) already gives it). `EdgeEvent` has no
+/// "detected PII value" field of its own (that belongs to `Receipt`/`Detection`, out of
+/// this session's scope) -- the marker below stands in for that category via the one
+/// vector that actually exists, an actor identity that happens to look like PII.
+#[test]
+fn edge_event_serialization_never_leaks_raw_forbidden_values() {
+    const FORBIDDEN_USERNAME: &str = "jane-q-doe-raw-username-marker-9f3a";
+    const FORBIDDEN_PII_LIKE_ACTOR: &str = "4111-1111-1111-1111-raw-pii-marker-2b7c";
+    const FORBIDDEN_HOSTNAME: &str = "corp-laptop-0043-raw-hostname-marker-c81e";
+
+    let actor_key = ActorPseudonymKey::from_bytes([9u8; 32]);
+    let signing_key = ReceiptSigningKey::from_bytes(vec![7u8; 32]).unwrap();
+
+    let demask_request = AuditEvent::DemaskRequest {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId(FORBIDDEN_USERNAME.to_string()),
+    };
+    let demask_decision = AuditEvent::DemaskDecision {
+        dest: Destination::ObservabilitySink,
+        actor: ActorId(FORBIDDEN_PII_LIKE_ACTOR.to_string()),
+        allowed: true,
+        policy_version: "policy-v1".to_string(),
+    };
+    let block = AuditEvent::Block {
+        artefact: ArtefactKind::SourceCode(FORBIDDEN_HOSTNAME.to_string()),
+        // Mirrors `BlockReason::ARTEFACT_POLICY_BLOCK_TEXT`, `pub(crate)` and not
+        // reachable from this integration-test crate -- see
+        // `edge_event_block_reason_dictionary_diverges_from_the_frozen_try_from_on_purpose`
+        // above for the same accepted duplication trade-off.
+        reason: "artefact class is Block in resolved policy".to_string(),
+    };
+
+    let edge_events = vec![
+        EdgeEvent::try_from_audit_event(&demask_request, &actor_key).unwrap(),
+        EdgeEvent::try_from_audit_event(&demask_decision, &actor_key).unwrap(),
+        EdgeEvent::try_from_audit_event(&block, &actor_key).unwrap(),
+    ];
+
+    for (i, edge_event) in edge_events.into_iter().enumerate() {
+        let input = EdgeEventRecordInput {
+            contract_revision: 1,
+            record_id: RecordId::from(Uuid::nil()),
+            issued_at_us: 1_700_000_000_000_000,
+            device_ref: None,
+            tenant_id: None,
+            sequence: i as u64,
+            valid_until_us: 1_700_000_300_000_000,
+            payload_sha256: [0u8; 32],
+            nonce: [0u8; 16],
+            key_ref: None,
+            edge_event,
+        };
+        let signed = sign_edge_event_record(input, &signing_key).unwrap();
+
+        assert!(
+            !signed.canonical_json.contains(FORBIDDEN_USERNAME),
+            "events[{i}]: raw username leaked into the wire record"
+        );
+        assert!(
+            !signed.canonical_json.contains(FORBIDDEN_PII_LIKE_ACTOR),
+            "events[{i}]: PII-shaped raw actor identity leaked into the wire record"
+        );
+        assert!(
+            !signed.canonical_json.contains(FORBIDDEN_HOSTNAME),
+            "events[{i}]: raw hostname-shaped source-code language name leaked into the \
+             wire record"
+        );
+        assert!(
+            !signed.canonical_json.contains("artefact class is Block"),
+            "events[{i}]: Block's original free-text reason leaked into the wire record \
+             instead of its classified ReasonCode"
+        );
+    }
+}
+
+/// Negative control for the leak-regression test above: proves it can actually detect a
+/// leak, not just that these three inputs happen not to trigger one. Constructs a
+/// deliberately non-conforming payload (bypassing the normal `EdgeEvent` constructors
+/// entirely, which is the whole point of this crate's `pub(crate)`-only construction —
+/// simulated here by asserting directly against a hand-built JSON value instead) and
+/// confirms the same substring check would fail if the marker really were present.
+#[test]
+fn leak_regression_helper_actually_detects_a_planted_marker() {
+    let planted = serde_json::json!({"actor": "jane-q-doe-raw-username-marker-9f3a"});
+    let rendered = serde_json::to_string(&planted).unwrap();
+    assert!(rendered.contains("jane-q-doe-raw-username-marker-9f3a"));
 }

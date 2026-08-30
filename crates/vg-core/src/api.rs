@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::audit::AuditEvent;
@@ -102,6 +103,19 @@ impl Destination {
             self,
             Destination::RemoteModelPrompt | Destination::ObservabilitySink
         )
+    }
+}
+
+impl Serialize for Destination {
+    /// Reuses `Destination::id()`'s existing stable slug rather than a second,
+    /// independently-maintained string mapping (`telemetry::edge_event`'s
+    /// `DemaskRequestPayload`/`DemaskDecisionPayload` wire shape uses this) — one source
+    /// of truth for "what does this destination look like on the wire," policy-lookup
+    /// key or telemetry field alike. `Destination` is a closed enum with no raw-string
+    /// variant (already verified safe to serialize — see `telemetry::signing`'s module
+    /// doc), so this can never leak anything beyond one of the fixed slugs below.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.id().0)
     }
 }
 

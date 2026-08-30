@@ -1,0 +1,30 @@
+{
+  "_comment": "Golden cross-language vector for the veil.edge_event.v1 wire contract. A downstream Python verifier (veil-observatory, a separate private repo) must reproduce `canonical_json` and `signature_hex` byte-for-byte from `input`, using json.dumps(obj, sort_keys=True, separators=(\",\", \":\")) for canonicalization and hmac.new(key, canonical_json.encode('utf-8'), hashlib.sha256).hexdigest() for the signature, with integrity.signature set to the empty string \"\" during MAC computation. Pinned by crates/vg-core/tests/telemetry.rs's `edge_event_v1_golden_vector_matches_the_fixture` test, which reconstructs this exact record in Rust via the production AuditEvent -> EdgeEvent::try_from_audit_event -> sign_edge_event_record path and asserts byte-exact equality against canonical_json and signature_hex below.",
+
+  "input": {
+    "_comment": "The AuditEvent this record was built from, plus every value sign_edge_event_record needed.",
+    "audit_event": {
+      "variant": "DemaskDecision",
+      "dest": "RemoteModelPrompt",
+      "actor": "jane.doe",
+      "allowed": true,
+      "policy_version": "policy-v1"
+    },
+    "actor_pseudonym_key_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+    "signing_key_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "contract_revision": 1,
+    "record_id": "11111111-1111-1111-1111-111111111111",
+    "issued_at_us": 1700000000000000,
+    "device_ref": null,
+    "tenant_id": null,
+    "sequence": 0,
+    "valid_until_us": 1700000300000000,
+    "payload_sha256_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "nonce_hex": "0102030405060708090a0b0c0d0e0f10",
+    "key_ref": null
+  },
+
+  "canonical_json": "{\"edge_event\":{\"actor\":\"21302deb67dfc6c76feea1be4d57921d2fc8b3f14330641cc0965c1fe2f6d624\",\"allowed\":true,\"destination\":\"remote-model-prompt\",\"kind\":\"demask_decision\",\"policy_version\":\"policy-v1\"},\"envelope\":{\"contract_revision\":1,\"device_ref\":null,\"integrity\":{\"algorithm\":\"HMAC_SHA_256\",\"key_ref\":null,\"nonce\":\"0102030405060708090a0b0c0d0e0f10\",\"payload_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"signature\":\"887354b475007755d4fdb60dff085b947a1710825ca2002272349ab416ec0b8a\"},\"issued_at_us\":1700000000000000,\"record_id\":\"11111111-1111-1111-1111-111111111111\",\"schema_version\":\"veil.edge_event.v1\",\"sequence\":0,\"tenant_id\":null,\"valid_until_us\":1700000300000000}}",
+
+  "signature_hex": "887354b475007755d4fdb60dff085b947a1710825ca2002272349ab416ec0b8a"
+}

@@ -64,29 +64,42 @@
 //! types cannot hold a raw string, full stop) rather than a runtime check on a rendering
 //! path this module isn't supposed to have at all.
 //!
-//! `#[allow(dead_code)]` module-wide: nothing here is called from production code yet
-//! (see above). Most items are reachable from this module's own `#[cfg(test)]` blocks
-//! or the integration tests in `crates/vg-core/tests/telemetry.rs`, which a plain
-//! `cargo build`/`cargo clippy` (without `--tests`/`--all-targets`) does not compile —
-//! but this repo's actual CI gate does run `--all-targets` (`.github/workflows/ci.yml`),
-//! so `#[allow(dead_code)]` is doing real, load-bearing suppression under the gate that
-//! actually runs, not just a hedge against a narrower invocation nobody uses. Remove
-//! this once the aggregator or actor pseudonymization lands and something in production
-//! actually constructs a [`Receipt`]/[`Alert`]/[`EdgeEvent`].
+//! `#[allow(dead_code)]` module-wide: predates the emitter and is now stale in its literal
+//! claim ("nothing here is called from production code yet") but still load-bearing —
+//! `EdgeEvent::try_from_audit_event`, `sign_edge_event_record`, and, as of the network
+//! emitter (`emitter.rs`), `edge_event_emitter_from_env`/`EdgeEventEmitterHandle` are all
+//! now called from `vg-audit::telemetry_sink::TelemetryCountingAuditSink::write` in
+//! production, but `Receipt`/`Alert` and most of `TelemetryEvent`'s own conversion path
+//! genuinely are not (out of scope for this and the preceding session — see this module's
+//! banner above). Kept crate-wide rather than narrowed to just the still-truly-dead items:
+//! this repo's CI gate runs `cargo clippy --all-targets`
+//! (`.github/workflows/ci.yml`), under which most of this module's remaining dead surface
+//! is only reachable from `#[cfg(test)]`/integration tests, so the suppression is still
+//! doing real work, just for a smaller and shrinking set of items than when it was
+//! written. Narrow this further as each remaining reject-only arm and `Receipt`/`Alert`
+//! path gets a real production caller.
 #![allow(dead_code)]
 
 pub(crate) mod aggregator;
 mod alert;
 pub(crate) mod block_reason;
+mod canonical;
 mod edge_event;
+mod emitter;
 mod envelope;
+mod hexutil;
 mod ids;
 mod pseudonymize;
 mod receipt;
 mod reject;
+mod signing;
 
 pub use alert::{Alert, Severity};
 pub use edge_event::EdgeEvent;
+pub use emitter::{
+    edge_event_emitter_from_env, EdgeEventEmitterHandle, EmitterInitError, EmitterStats,
+    ObservatoryEndpoint, VEIL_OBSERVATORY_ENDPOINT_ENV_VAR,
+};
 pub use envelope::{Envelope, EnvelopeInvariantError, Integrity, SchemaVersion, SigningAlgorithm};
 pub use ids::{
     ActorPseudonym, AlertRuleId, ArtefactKindId, DetectorSetId, DeviceRef, DeviceRefError,
@@ -99,6 +112,11 @@ pub use receipt::{
     TraceLinkage,
 };
 pub use reject::TelemetryReject;
+pub use signing::{
+    load_receipt_signing_key_from_env, sign_edge_event_record, EdgeEventRecordInput,
+    ReceiptSigningKey, SignedEdgeEventRecord, SigningError, MIN_SIGNING_KEY_LEN,
+    VEIL_RECEIPT_KEY_ENV_VAR,
+};
 
 use crate::audit::AuditEvent;
 

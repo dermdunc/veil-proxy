@@ -484,3 +484,35 @@ displace it for long.
 ## Session Update: 2026-08-01 — Bank display-collision measurement, propose vg-bench CI gate
 
 - [ ] Human reviews and merges PR; install ci-proposed/ci.yml when ready (see its README for the exact command)
+
+## Session Update: 2026-08-29 — `EdgeEvent`/`Envelope`/`Integrity` wire-serialization + HMAC signing contract built
+
+- [ ] Human reviews and merges the PR; hand the golden vector
+      (`crates/vg-core/tests/fixtures/edge_event_v1_golden.json`) to the `veil-observatory` team
+      building the Python-side verifier.
+- [x] ~~Build the network emitter / HTTP client~~ — done: `crates/vg-core/src/telemetry/emitter.rs`,
+      fire-and-forget over a dedicated thread + single-threaded Tokio runtime, structurally
+      opt-in on both `VEIL_RECEIPT_KEY` and a new `VEIL_OBSERVATORY_ENDPOINT` env var.
+- [x] ~~Wire the signer into `TelemetryCountingAuditSink::write`~~ — done, same session.
+- [x] ~~Merge this branch (and veil-observatory's ingestion branch)~~ — both fast-forward
+      merged to local `main` in their respective repos, 2026-08-29. Not pushed to GitHub yet.
+- [x] ~~Point a real `VEIL_OBSERVATORY_ENDPOINT` at a running `veil-observatory serve` instance
+      and confirm one genuine end-to-end delivery~~ — done, 2026-08-29. Real
+      `TelemetryCountingAuditSink` write, over the real `JsonlAuditSink`, through the real
+      signer and emitter, to a real separately-running `veil-observatory serve` process:
+      server logged `POST /ingest HTTP/1.1" 202`, and the record persisted in its real
+      evidence store (`raw/<hash>.json`) with `edge_event.actor` as a genuine 64-hex-char
+      HMAC pseudonym, never the raw actor string used to build it. See
+      `crates/vg-audit/tests/live_edge_event_integration.rs` (checked in, `#[ignore]`d by
+      default — requires a real running observatory) for the exact repeatable invocation.
+      **Caught in the process, worth keeping visible**: veil-proxy's `VEIL_RECEIPT_KEY`
+      hex-decodes; veil-observatory's UTF-8-encodes the same env var name directly. The
+      same 32-byte key needs two DIFFERENT string values, one per side — using one string
+      for both silently produces two different keys. Documented in the test's own module
+      doc; worth a matching note in `veil-ecosystem/docs/architecture.md` if this hasn't
+      already been flagged there.
+- [ ] Follow-up: source `VEIL_RECEIPT_KEY` from the OS keychain via a `vg-vault`-style loader
+      (`// TODO` left in `crates/vg-core/src/telemetry/signing.rs`'s module doc), matching
+      `load_or_create_actor_pseudonym_key`'s precedent, instead of the env var.
+- [ ] `Receipt`/`Alert` serialization is still unbuilt — deferred until `Receipt` is actually
+      producible (the aggregator, `telemetry::aggregator`, is still a documented skeleton).

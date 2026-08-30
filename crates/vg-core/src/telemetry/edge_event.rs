@@ -35,6 +35,9 @@
 //! No `Debug` derives here (`docs/architecture/implementation-plan.md` §3.2) — see
 //! `telemetry::ids`'s module doc for why.
 
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
+
 use super::ids::{ActorPseudonym, ArtefactKindId, ReasonCode, VersionToken};
 use super::pseudonymize::{pseudonymize_actor, ActorPseudonymKey};
 use super::reject::TelemetryReject;
@@ -51,6 +54,23 @@ pub struct DemaskRequestPayload {
 impl DemaskRequestPayload {
     pub(crate) fn new(dest: Destination, actor: ActorPseudonym) -> Self {
         Self { dest, actor }
+    }
+}
+
+impl Serialize for DemaskRequestPayload {
+    /// `destination` reuses `Destination::id()`'s existing stable slug
+    /// (`crate::api::Destination`'s `Serialize` impl) rather than a second, independently
+    /// maintained string mapping — one source of truth for "what does this destination
+    /// look like on any wire," policy-lookup or telemetry. `actor` is the already-opaque
+    /// `ActorPseudonym` (32-byte HMAC output, hex-encoded) — the real `ActorId` string
+    /// this payload was built from never reaches this impl at all (see this struct's own
+    /// field: there is no raw actor field here to accidentally serialize).
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("DemaskRequestPayload", 3)?;
+        state.serialize_field("kind", "demask_request")?;
+        state.serialize_field("destination", &self.dest)?;
+        state.serialize_field("actor", &self.actor)?;
+        state.end()
     }
 }
 
@@ -82,6 +102,24 @@ impl DemaskDecisionPayload {
     }
 }
 
+impl Serialize for DemaskDecisionPayload {
+    /// Same `destination`/`actor` treatment as `DemaskRequestPayload`'s impl above.
+    /// `policy_version` is `VersionToken` — a charset/length-bounded token, not the raw
+    /// `String` `AuditEvent::DemaskDecision.policy_version` started as (see
+    /// `EdgeEvent::try_from_audit_event`'s `VersionToken::try_from` conversion, which
+    /// already rejects anything outside that bound before a `DemaskDecisionPayload` can
+    /// even be constructed).
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("DemaskDecisionPayload", 5)?;
+        state.serialize_field("kind", "demask_decision")?;
+        state.serialize_field("destination", &self.dest)?;
+        state.serialize_field("actor", &self.actor)?;
+        state.serialize_field("allowed", &self.allowed)?;
+        state.serialize_field("policy_version", &self.policy_version)?;
+        state.end()
+    }
+}
+
 /// Mirrors `AuditEvent::Block`'s fields exactly (`artefact`, `reason`) — no
 /// `policy_version`, which `AuditEvent::Block` doesn't carry either.
 #[derive(Clone, PartialEq, Eq)]
@@ -93,6 +131,23 @@ pub struct BlockedAttemptPayload {
 impl BlockedAttemptPayload {
     pub(crate) fn new(artefact: ArtefactKindId, reason: ReasonCode) -> Self {
         Self { artefact, reason }
+    }
+}
+
+impl Serialize for BlockedAttemptPayload {
+    /// `artefact` is the closed `ArtefactKindId` tag (`ArtefactKind::SourceCode`'s
+    /// language name already collapsed away by `ArtefactKindId::from`, before this
+    /// struct could ever be constructed — see `telemetry::ids`). `reason` is the
+    /// integer `ReasonCode`, never `AuditEvent::Block.reason`'s original free-text
+    /// string — `BlockReason::classify` in `EdgeEvent::try_from_audit_event` is the only
+    /// path that produces one, and it maps a recognized string to this fixed code, never
+    /// passes the string itself through.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("BlockedAttemptPayload", 3)?;
+        state.serialize_field("kind", "blocked_attempt")?;
+        state.serialize_field("artefact", &self.artefact)?;
+        state.serialize_field("reason", &self.reason)?;
+        state.end()
     }
 }
 
@@ -115,6 +170,21 @@ pub enum EdgeEvent {
     /// arm — for an unrelated reason (`Envelope`/`Integrity` construction, not the
     /// reason dictionary).
     BlockedAttempt(BlockedAttemptPayload),
+}
+
+impl Serialize for EdgeEvent {
+    /// Delegates straight to whichever payload struct's own `Serialize` impl (above) —
+    /// each already emits its own `"kind"` discriminant tag
+    /// (`"demask_request"`/`"demask_decision"`/`"blocked_attempt"`), so this impl adds no
+    /// wrapping of its own. `#[non_exhaustive]` on this enum (from outside `vg-core`)
+    /// doesn't affect this match: it lives inside the defining crate.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EdgeEvent::DemaskRequest(p) => p.serialize(serializer),
+            EdgeEvent::DemaskDecision(p) => p.serialize(serializer),
+            EdgeEvent::BlockedAttempt(p) => p.serialize(serializer),
+        }
+    }
 }
 
 impl EdgeEvent {
@@ -287,4 +357,46 @@ mod tests {
     // hand at review time — but proving it in CI would need a `trybuild`-style
     // compile-fail test, a new dev-dependency not otherwise justified here. Recorded as
     // a claim a reviewer can re-verify by hand, not as a green check nobody can trust.
+
+    #[test]
+    fn demask_request_serializes_with_the_expected_kind_and_fields() {
+        let event = EdgeEvent::new_demask_request(
+            Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([0xabu8; 32]),
+        );
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["kind"], serde_json::json!("demask_request"));
+        assert_eq!(v["destination"], serde_json::json!("remote-model-prompt"));
+        assert_eq!(v["actor"], serde_json::json!("ab".repeat(32)));
+        // No other keys leaked in (e.g. no raw actor string field exists to leak).
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn demask_decision_serializes_with_the_expected_kind_and_fields() {
+        let event = EdgeEvent::new_demask_decision(
+            Destination::ObservabilitySink,
+            ActorPseudonym::from_bytes([0xcdu8; 32]),
+            true,
+            VersionToken::try_from("policy-v3.1").unwrap(),
+        );
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["kind"], serde_json::json!("demask_decision"));
+        assert_eq!(v["destination"], serde_json::json!("observability-sink"));
+        assert_eq!(v["actor"], serde_json::json!("cd".repeat(32)));
+        assert_eq!(v["allowed"], serde_json::json!(true));
+        assert_eq!(v["policy_version"], serde_json::json!("policy-v3.1"));
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn blocked_attempt_serializes_the_reason_as_an_integer_never_the_original_string() {
+        let event = EdgeEvent::new_blocked_attempt(ArtefactKindId::EnvFile, ReasonCode::from(1));
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["kind"], serde_json::json!("blocked_attempt"));
+        assert_eq!(v["artefact"], serde_json::json!("env_file"));
+        assert_eq!(v["reason"], serde_json::json!(1));
+        assert!(v["reason"].is_number());
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
 }

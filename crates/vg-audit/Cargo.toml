@@ -21,3 +21,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# `telemetry_sink`'s own end-to-end emitter test independently recomputes an HMAC-SHA256
+# over a real received wire record and compares it against the signature that arrived, to
+# verify `vg_core::telemetry`'s signing without needing that crate's `pub(crate)`
+# canonical-JSON renderer -- same crates, same versions, already resolved in the workspace
+# lock via `vg-core`'s own (non-dev) dependency on both.
+hmac = "0.12"
+sha2 = "0.10"

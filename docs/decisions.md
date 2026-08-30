@@ -3639,3 +3639,163 @@ correctness assertion; the H1 case at the HTTP level — two requests over the s
 - Unbounded binding-store growth/cloning over a long conversation (named above, not fixed).
 - The partial-vault-interning-on-mid-request-block trade-off (named in the M3 entry, still open).
 - Bedrock (M8+), OAuth/bearer specifics beyond header pass-through (M7).
+
+## 2026-08-29 — `EdgeEvent`/`Envelope`/`Integrity` wire-serialization + HMAC signing contract built
+
+Built the crypto/serialization contract `telemetry::mod`'s own doc has named as missing since
+Phase 1: zero `serde`/serialization anywhere in `telemetry`, no way to actually put a
+`TelemetryEvent` on a wire. Scoped to `EdgeEvent` + `Envelope` + `Integrity` only (`Receipt`/
+`Alert` untouched) — `EdgeEvent::try_from_audit_event` is the only production path that already
+succeeds today (`DemaskRequest`/`DemaskDecision`/a recognized `Block`); `Receipt` cannot be
+produced at all yet (the aggregator is a documented skeleton). The network emitter/HTTP client and
+wiring the signer into `vg-audit`'s `TelemetryCountingAuditSink::write` are both explicit,
+deliberate scope cuts for a follow-up session, not gaps found late.
+
+**Built**, all hand-written `Serialize` impls (no `#[derive(Serialize)]` anywhere — field-by-field,
+so each field's wire encoding is a reviewable, single-purpose line, not a macro-generated
+default):
+
+- `SchemaVersion` → fixed strings, `EdgeEventV1` → the literal `"veil.edge_event.v1"`.
+- `SigningAlgorithm` → `"HMAC_SHA_256"` / `"ECDSA_SHA_256"`, matching `veil-observatory`'s existing
+  gated convention (this type's own pre-existing doc comment already named the exact strings).
+- `Envelope`/`Integrity` (`telemetry::envelope`) — `Integrity.{payload_sha256,nonce,signature}` as
+  lowercase hex, never a byte array or base64; `Option<T>` fields as JSON `null` when absent.
+- `EdgeEvent` + its three payload structs (`telemetry::edge_event`) — each payload emits its own
+  `"kind"` tag (`demask_request`/`demask_decision`/`blocked_attempt`); `Destination` reuses
+  `Destination::id()`'s existing stable slug rather than a second mapping; `ArtefactKindId` gets a
+  new lower_snake_case tag set (no existing precedent to reuse); `ReasonCode` serializes as a plain
+  integer, never `AuditEvent::Block.reason`'s original string.
+- `RecordId`/`DeviceRef`/`ActorPseudonym` (`telemetry::ids`) → UUID string / hex / hex respectively;
+  `VersionToken`/`TenantId`/`KeyRef` → their validated string form. Deliberately **not** extended to
+  `DetectorSetId`/`ExceptionRuleId`/`AlertRuleId`/`RegistryRef` — those belong to `Receipt`/`Alert`,
+  out of this session's scope, and adding unused `Serialize` impls would be surface area with no
+  caller to review it against.
+- `telemetry::canonical` — a from-scratch canonical-JSON renderer (object keys sorted at every
+  level via an explicit `BTreeMap` re-sort, no insignificant whitespace, Python-`ensure_ascii`-
+  compatible string escaping) rather than trusting `serde_json::to_string`'s own key ordering:
+  `serde_json::Map`'s sorted-by-default iteration only holds as long as nothing in this workspace's
+  dependency graph ever enables serde_json's `preserve_order` feature, and Cargo unifies that
+  feature crate-wide — a future, unrelated crate flipping it on anywhere in the workspace would
+  otherwise silently break every past HMAC ever computed here. Tested against a hand-computed
+  expected string, not just "looks sorted."
+- `telemetry::signing` — `ReceiptSigningKey` (32-byte-minimum, zeroize-on-drop, redacted `Debug`,
+  same convention as `ActorPseudonymKey`), sourced today from a hex-encoded `VEIL_RECEIPT_KEY` env
+  var (`// TODO` left pointing at `vg-vault`'s `load_or_create_actor_pseudonym_key` as the ratified
+  eventual keychain path — a deliberate, documented scope cut, not an oversight).
+  `sign_edge_event_record` builds the record twice (placeholder `signature = ""`, then the real
+  HMAC-SHA256 hex digest) so a verifier's own strip-and-recompute procedure is exactly mirrored,
+  never approximated.
+- A golden cross-language fixture, `crates/vg-core/tests/fixtures/edge_event_v1_golden.json` (a
+  concrete `DemaskDecision`, fixed record id/timestamps/key/nonce), pinned by
+  `edge_event_v1_golden_vector_matches_the_fixture` in `crates/vg-core/tests/telemetry.rs`, which
+  reconstructs the identical record through the real `AuditEvent -> EdgeEvent::try_from_audit_event
+  -> sign_edge_event_record` path and asserts byte-exact equality. Independently cross-checked by
+  hand against a standalone Python `hmac`/`json.dumps(sort_keys=True, separators=(",", ":"))`
+  computation during this session (not committed as a script) — same canonical JSON, same
+  signature, byte-for-byte.
+- A hard-gate regression test (`edge_event_serialization_never_leaks_raw_forbidden_values`)
+  plants distinctive marker strings in every raw-string-carrying input `EdgeEvent`'s three
+  variants can reach (an actor identity, twice — once username-shaped, once PII-shaped — and a
+  `SourceCode` language name standing in for a hostname) and asserts none of them appear in the
+  signed wire record, plus a negative control proving the check can actually fail.
+
+**Field excluded from consideration, not from serialization** (nothing was serialized then
+un-serialized): `AuditEvent::Block.reason`'s free-text string never reaches `BlockedAttemptPayload`
+at all — `EdgeEvent::try_from_audit_event`'s `Block` arm already classifies it to a `ReasonCode`
+(Phase 2) or rejects it outright before a payload is ever constructed, so there was no raw-string
+field on any `EdgeEvent` payload to make a serialization decision about in the first place.
+
+### Validation
+
+`cargo build --workspace`, `cargo clippy --workspace --all-targets` (clean, workspace lints
+`clippy::all = warn`), `cargo test --workspace` all pass, no regressions. `vg-core`'s own test
+count: 141 → 176 (128 lib unit + 7 conformance_stubs + 6 demask + 5 keying_integration + 10
+pipeline + 1 pipeline_latency_gate + 19 telemetry, up from 96/16 respectively before this session).
+
+### Still open, not solved by this session
+
+- The network emitter / HTTP client (`vg-proxy` hyper wiring) — not built.
+- Wiring the signer into `vg-audit`'s `TelemetryCountingAuditSink::write` — left untouched; the
+  hook point is a `write_edge_event`-shaped call this session did not add.
+- Receipt signing key sourcing is an env var (`VEIL_RECEIPT_KEY`, hex-encoded), not the OS keychain
+  — `// TODO` left in `telemetry::signing`'s module doc.
+- `Integrity.payload_sha256`'s own computation (what exactly it hashes, once real signing exists
+  more broadly) is still caller-supplied, unchanged from before this session — this session signs
+  `integrity.signature` over the full canonical record, a separate, narrower thing.
+- `Receipt`/`Alert` serialization — untouched, `EdgeEvent` only.
+
+## 2026-08-29: network emitter + audit-sink wiring (session 2, same MVP)
+
+Closed the two items the previous session's entry above listed as "still open": built the
+HTTP client (`crates/vg-core/src/telemetry/emitter.rs`) and wired it into `vg-audit`'s
+`TelemetryCountingAuditSink::write`.
+
+**Design**: fire-and-forget, fail-open, structurally opt-in. `edge_event_emitter_from_env`
+reads both `VEIL_RECEIPT_KEY` and a new `VEIL_OBSERVATORY_ENDPOINT` env var; either absent is
+a documented `Ok(None)` no-op with a test proving the channel/thread/client are never
+constructed in that case, not merely that nothing gets sent. When both are set,
+`EdgeEventEmitterHandle::connect` spawns a dedicated OS thread running its own
+single-threaded Tokio runtime (not `tokio::spawn` onto an ambient runtime — this sink is
+called from both `vg-proxy`'s async daemon and a fully synchronous CLI hook path with no
+ambient runtime at all) that drains a bounded `mpsc` channel (capacity 256) and POSTs each
+record with a 3-second timeout, one at a time, no retry. `try_emit` never blocks: a full
+channel or a dead worker both count and drop.
+
+**Validation, independently re-run after this session's own stall/recovery** (see below):
+`cargo build --workspace`, `cargo clippy --workspace --all-targets` (clean), and
+`cargo test --workspace` — every test binary in the workspace, zero failures. The new
+`telemetry::emitter` module alone: 10 tests (structural no-op gating in all four
+present/absent combinations, a real local-TCP-server end-to-end POST asserting the exact
+bytes received, an unreachable-endpoint test proving `try_emit` returns in under 500ms
+regardless of the endpoint's reachability, and a full-channel test proving drop-not-block
+under load).
+
+**A process note, not a code note**: the agent session that built this stalled for 10
+minutes mid-run with no output, right as it began the full build/clippy/test cycle, and was
+reported as failed by the orchestrating session's watchdog. Independently re-running the
+exact same build/clippy/test commands afterward found zero issues — full workspace suite
+green, sub-second runtime everywhere, no hang reproduced. Treated as an infrastructure
+stall, not a defect in the code, but recorded here rather than silently assumed, since "ran
+clean when re-checked" is a claim worth being checked itself, not just believed.
+
+### Still open
+
+- `Receipt`/`Alert` emission — `EdgeEvent` only, unchanged from the previous session.
+- OS-keychain sourcing for `VEIL_RECEIPT_KEY` — still an env var, `// TODO` left in place.
+- TLS on the emitter's HTTP client — plain `http://` only, matching the receiver's own
+  loopback-only MVP scope on the veil-observatory side.
+- This work is on an unmerged, unpushed local branch (`worktree-agent-a9869ec2363020f3e`).
+  Nothing fires against a real veil-observatory instance until both `VEIL_RECEIPT_KEY` and
+  `VEIL_OBSERVATORY_ENDPOINT` are set on a real deployment, which has not happened.
+
+## 2026-08-29: genuine live end-to-end proof, veil-proxy to a real veil-observatory process
+
+After merging both repos' `edge_event.v1` branches to local `main`, ran a real cross-process
+integration: a live `veil-observatory serve` instance (separate process, separate repo,
+`--store /tmp/veil-live-demo-store`), and a real `TelemetryCountingAuditSink::write` against
+the real production `JsonlAuditSink`, with `VEIL_RECEIPT_KEY`/`VEIL_OBSERVATORY_ENDPOINT` set
+to point at it. Not a mock, not either side's own unit tests re-run — two real, separately
+running processes.
+
+**Result**: the observatory's own log recorded `POST /ingest HTTP/1.1" 202`, and its real
+evidence store persisted the record with `edge_event.actor` as a genuine HMAC pseudonym, not
+the raw actor string the test constructed the `AuditEvent` with. This is direct, run-it-
+yourself evidence that the signer, the emitter, the schema, and the verifier all agree with
+each other for real, not just against each side's own fixtures.
+
+**A genuine cross-repo gotcha found in the process, not assumed away**: veil-proxy's
+`VEIL_RECEIPT_KEY` is hex-decoded (`parse_receipt_signing_key`); veil-observatory's is UTF-8-
+encoded directly (`raw.encode()` in `verifier_from_env`). The same 32-byte key therefore needs
+two different string values, one per process, depending on which repo's convention applies —
+setting the identical string in both environments silently produces two unrelated keys that
+would never verify against each other, with no error on either side to say so. Checked before
+running this test, not discovered by a failure: `parse_receipt_signing_key` was hex-decoded
+against a 32-ASCII-byte value (`veil-live-integration-demo-key!!`) to derive the matching hex
+string used on the veil-proxy side. Recorded in
+`crates/vg-audit/tests/live_edge_event_integration.rs`'s module doc as the exact, repeatable
+invocation, and in `docs/next-actions.md` as worth surfacing in `veil-ecosystem`'s architecture
+doc too.
+
+New checked-in test: `crates/vg-audit/tests/live_edge_event_integration.rs`,
+`#[ignore]`d by default (requires a real running `veil-observatory serve` instance) — `cargo
+test --workspace` behavior is unchanged by adding it.

@@ -37,9 +37,11 @@
 //! ingest, per the reconciliation plan's own §3.2a language for open external domains —
 //! is real future work, not done here.
 
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::hexutil;
 use crate::traits::ArtefactKind;
 use crate::types::EntityType;
 
@@ -88,6 +90,14 @@ pub struct RecordId(Uuid);
 impl From<Uuid> for RecordId {
     fn from(id: Uuid) -> Self {
         Self(id)
+    }
+}
+
+impl Serialize for RecordId {
+    /// The record's own generated identity, not raw input data (task's own "verified
+    /// safe" list) — rendered as `Uuid`'s standard hyphenated lowercase string form.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
     }
 }
 
@@ -229,6 +239,27 @@ bounded_token!(
      implies."
 );
 
+/// `Serialize` for exactly the three `bounded_token!` types the `veil.edge_event.v1`
+/// wire contract actually uses (`Envelope::tenant_id`, `Integrity::key_ref`,
+/// `DemaskDecisionPayload::policy_version`) — deliberately not extended to the other
+/// four (`DetectorSetId`, `ExceptionRuleId`, `AlertRuleId`, `RegistryRef`), which belong
+/// to `Receipt`/`Alert`, out of this session's scope (per the task's own "Scope this
+/// work to EdgeEvent + Envelope + Integrity only"). Each is safe to serialize as its
+/// validated string form for the reason this module's own doc comment already gives:
+/// charset/length-bounded, never a raw/unbounded value.
+macro_rules! serialize_as_validated_string {
+    ($name:ident) => {
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0)
+            }
+        }
+    };
+}
+serialize_as_validated_string!(VersionToken);
+serialize_as_validated_string!(TenantId);
+serialize_as_validated_string!(KeyRef);
+
 /// Why `DeviceRef::try_from` rejected its input. Derives `Debug` for the same
 /// `thiserror`/safe-fields-only reason as `TokenError` above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -256,6 +287,16 @@ impl TryFrom<&[u8]> for DeviceRef {
     }
 }
 
+impl Serialize for DeviceRef {
+    /// 16 raw bytes, hex-encoded (task's own "verified safe" list: `DeviceRef` is
+    /// `[u8; 16]`, safe as hex) — never the `^dev_[a-f0-9]{32}$` display pattern this
+    /// type's own doc mentions as a *future* wire sketch; that's schema-generation's job,
+    /// not this session's.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hexutil::encode(&self.0))
+    }
+}
+
 /// Integer index into a not-yet-built versioned reason dictionary (block reasons, alert
 /// rule explanations). The distribution mechanism for that dictionary is explicitly
 /// deferred (`telemetry-receipt-reconciliation-plan.md` §5, "the reason-dictionary
@@ -268,6 +309,15 @@ pub struct ReasonCode(u16);
 impl From<u16> for ReasonCode {
     fn from(code: u16) -> Self {
         Self(code)
+    }
+}
+
+impl Serialize for ReasonCode {
+    /// A code-dictionary integer, its natural encoding (task's own "verified safe"
+    /// list) — never the free-text `AuditEvent::Block.reason` string this code is
+    /// resolved from (`telemetry::block_reason::BlockReason::classify`).
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(self.0)
     }
 }
 
@@ -361,6 +411,29 @@ pub enum ArtefactKindId {
     Unknown,
 }
 
+impl Serialize for ArtefactKindId {
+    /// Fixed lower_snake_case tags, hand-matched (no existing project-wide convention
+    /// to reuse for `ArtefactKind` the way `Destination::id()` gives one for
+    /// destinations) — closed enum, no raw-string variant, safe per this module's own
+    /// doc comment on this type.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            ArtefactKindId::Json => "json",
+            ArtefactKindId::Yaml => "yaml",
+            ArtefactKindId::Toml => "toml",
+            ArtefactKindId::Sql => "sql",
+            ArtefactKindId::Csv => "csv",
+            ArtefactKindId::LogLine => "log_line",
+            ArtefactKindId::Diff => "diff",
+            ArtefactKindId::EnvFile => "env_file",
+            ArtefactKindId::SourceCode => "source_code",
+            ArtefactKindId::PlainText => "plain_text",
+            ArtefactKindId::Unknown => "unknown",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
 impl From<&ArtefactKind> for ArtefactKindId {
     fn from(kind: &ArtefactKind) -> Self {
         match kind {
@@ -392,6 +465,15 @@ pub struct ActorPseudonym([u8; 32]);
 impl ActorPseudonym {
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+}
+
+impl Serialize for ActorPseudonym {
+    /// A 32-byte HMAC-SHA256 output, hex-encoded (task's own "verified safe" list) —
+    /// never the raw `ActorId` string `pseudonymize_actor` derived it from; this type
+    /// has no field capable of holding that string at all.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hexutil::encode(&self.0))
     }
 }
 
@@ -479,5 +561,60 @@ mod tests {
     fn entity_class_id_maps_fixed_variants_through() {
         assert!(EntityClassId::from(&EntityType::Email) == EntityClassId::Email);
         assert!(EntityClassId::from(&EntityType::AccountId) == EntityClassId::AccountId);
+    }
+
+    #[test]
+    fn record_id_serializes_as_a_uuid_string() {
+        let id = RecordId::from(Uuid::nil());
+        assert_eq!(
+            serde_json::to_value(id).unwrap(),
+            serde_json::json!("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[test]
+    fn device_ref_serializes_as_lowercase_hex() {
+        let dr = DeviceRef::try_from([0xffu8; 16].as_slice()).unwrap();
+        assert_eq!(serde_json::to_value(dr).unwrap(), serde_json::json!("ff".repeat(16)));
+    }
+
+    #[test]
+    fn actor_pseudonym_serializes_as_lowercase_hex() {
+        let a = ActorPseudonym::from_bytes([0x01u8; 32]);
+        assert_eq!(serde_json::to_value(a).unwrap(), serde_json::json!("01".repeat(32)));
+    }
+
+    #[test]
+    fn reason_code_serializes_as_an_integer() {
+        let r = ReasonCode::from(42);
+        assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(42));
+    }
+
+    #[test]
+    fn artefact_kind_id_serializes_as_snake_case_tags() {
+        assert_eq!(
+            serde_json::to_value(ArtefactKindId::EnvFile).unwrap(),
+            serde_json::json!("env_file")
+        );
+        assert_eq!(
+            serde_json::to_value(ArtefactKindId::SourceCode).unwrap(),
+            serde_json::json!("source_code")
+        );
+    }
+
+    #[test]
+    fn version_token_tenant_id_key_ref_serialize_as_their_plain_string_form() {
+        assert_eq!(
+            serde_json::to_value(VersionToken::try_from("policy-v1").unwrap()).unwrap(),
+            serde_json::json!("policy-v1")
+        );
+        assert_eq!(
+            serde_json::to_value(TenantId::try_from("org-123").unwrap()).unwrap(),
+            serde_json::json!("org-123")
+        );
+        assert_eq!(
+            serde_json::to_value(KeyRef::try_from("device-key-001").unwrap()).unwrap(),
+            serde_json::json!("device-key-001")
+        );
     }
 }
