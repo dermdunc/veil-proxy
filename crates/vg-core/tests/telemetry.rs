@@ -487,10 +487,8 @@ fn edge_event_block_rejects_an_unrecognized_reason_string() {
 /// otherwise still pass).
 #[test]
 fn edge_event_v1_golden_vector_matches_the_fixture() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/edge_event_v1_golden.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/edge_event_v1_golden.json")).unwrap();
 
     // input.actor_pseudonym_key_hex = "09" * 32
     let actor_key = ActorPseudonymKey::from_bytes([0x09u8; 32]);
@@ -506,14 +504,13 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
     // input.signing_key_hex = 01 02 ... 20 (32 sequential bytes)
     let signing_key = ReceiptSigningKey::from_bytes((1u8..=32u8).collect()).unwrap();
     // input.record_id
-    let record_id = RecordId::from(
-        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
-    );
+    let record_id =
+        RecordId::from(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
     // input.nonce_hex = 01 02 ... 10 (16 sequential bytes)
     let nonce: [u8; 16] = (1u8..=16u8).collect::<Vec<_>>().try_into().unwrap();
 
     let input = EdgeEventRecordInput {
-        contract_revision: 1,               // input.contract_revision
+        contract_revision: 1, // input.contract_revision
         record_id,
         issued_at_us: 1_700_000_000_000_000, // input.issued_at_us
         device_ref: None,                    // input.device_ref
@@ -522,7 +519,7 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
         valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
         payload_sha256: [0u8; 32],           // input.payload_sha256_hex = "00" * 32
         nonce,
-        key_ref: None,                       // input.key_ref
+        key_ref: None, // input.key_ref
         edge_event,
     };
 

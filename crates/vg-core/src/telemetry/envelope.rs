@@ -354,7 +354,10 @@ mod tests {
         // `veil-observatory`'s existing verifier gates on this exact literal string —
         // see this type's `Serialize` impl doc.
         let v = serde_json::to_value(SchemaVersion::EdgeEventV1).unwrap();
-        assert_eq!(v, serde_json::Value::String("veil.edge_event.v1".to_string()));
+        assert_eq!(
+            v,
+            serde_json::Value::String("veil.edge_event.v1".to_string())
+        );
     }
 
     #[test]

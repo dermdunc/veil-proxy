@@ -57,7 +57,9 @@ use hyper_util::rt::TokioIo;
 use thiserror::Error;
 use tokio::net::TcpStream;
 
-use super::signing::{parse_receipt_signing_key, ReceiptSigningKey, SigningError, VEIL_RECEIPT_KEY_ENV_VAR};
+use super::signing::{
+    parse_receipt_signing_key, ReceiptSigningKey, SigningError, VEIL_RECEIPT_KEY_ENV_VAR,
+};
 
 /// The env var [`edge_event_emitter_from_env`] reads for the observatory's full URL
 /// (scheme + host + port + path, e.g. `http://127.0.0.1:8787/v1/edge-events`) — the whole
@@ -223,7 +225,9 @@ impl EdgeEventEmitterHandle {
         // Guarded rather than assumed anyway: failing open (report "dropped", same as a
         // full channel) is the correct degradation for a call that somehow still happens.
         let Some(sender) = self.sender.as_ref() else {
-            self.stats.queue_full_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .queue_full_dropped
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         };
         match sender.try_send(canonical_json) {
@@ -232,7 +236,9 @@ impl EdgeEventEmitterHandle {
                 true
             }
             Err(_) => {
-                self.stats.queue_full_dropped.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .queue_full_dropped
+                    .fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -315,7 +321,10 @@ fn run_poster_loop(
     receiver: mpsc::Receiver<String>,
     stats: Arc<EmitterStatsInner>,
 ) {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(err) => {
             eprintln!(
@@ -368,7 +377,10 @@ async fn post_edge_event(endpoint: &ObservatoryEndpoint, body: String) -> Result
     }
 }
 
-async fn post_edge_event_inner(endpoint: &ObservatoryEndpoint, body: String) -> Result<(), PostError> {
+async fn post_edge_event_inner(
+    endpoint: &ObservatoryEndpoint,
+    body: String,
+) -> Result<(), PostError> {
     // Same low-level `hyper::client::conn::http1` shape `vg-proxy`'s own
     // `upstream.rs::forward` already uses for its outbound leg -- one connection per
     // request, no pooling, deliberately (this crate's own doc explains why: a
@@ -410,7 +422,10 @@ async fn post_edge_event_inner(endpoint: &ObservatoryEndpoint, body: String) -> 
         .header("content-length", body.len())
         .body(Full::new(Bytes::from(body)))?;
 
-    let response = sender.send_request(request).await.map_err(PostError::Send)?;
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(PostError::Send)?;
     if !response.status().is_success() {
         return Err(PostError::NonSuccess(response.status()));
     }
@@ -467,7 +482,8 @@ fn build_edge_event_emitter(
 
     let key = parse_receipt_signing_key(Some(key_raw)).map_err(EmitterInitError::Signing)?;
     let endpoint = parse_observatory_endpoint(&endpoint_raw)?;
-    let handle = EdgeEventEmitterHandle::connect(key, endpoint).map_err(EmitterInitError::ThreadSpawnFailed)?;
+    let handle = EdgeEventEmitterHandle::connect(key, endpoint)
+        .map_err(EmitterInitError::ThreadSpawnFailed)?;
     Ok(Some(handle))
 }
 
@@ -517,10 +533,8 @@ mod tests {
 
     #[test]
     fn key_set_but_endpoint_unset_is_still_a_no_op() {
-        let result = build_edge_event_emitter(
-            Ok("ab".repeat(32)),
-            Err(std::env::VarError::NotPresent),
-        );
+        let result =
+            build_edge_event_emitter(Ok("ab".repeat(32)), Err(std::env::VarError::NotPresent));
         assert!(matches!(result, Ok(None)));
     }
 
@@ -570,7 +584,10 @@ mod tests {
     /// received, and replies `204 No Content`. Manual `TcpListener` parsing rather than a
     /// second `hyper` server (this module's own doc's stated preference) -- keeps
     /// `vg-core`'s `hyper` dependency client-only, in both production and tests.
-    fn spawn_single_request_test_server() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+    fn spawn_single_request_test_server() -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -619,7 +636,8 @@ mod tests {
     #[test]
     fn end_to_end_posts_the_exact_signed_bytes_to_a_real_local_server() {
         let (addr, rx) = spawn_single_request_test_server();
-        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let endpoint: ObservatoryEndpoint =
+            format!("http://{addr}/v1/edge-events").parse().unwrap();
         let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
 
         let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
@@ -629,7 +647,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("test server never received a request");
         assert_eq!(received_body, sent_body.as_bytes());
-        assert!(head.to_ascii_lowercase().contains("content-type: application/json"));
+        assert!(head
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"));
         assert!(head.starts_with("POST /v1/edge-events"));
 
         // Wait for the background worker to record the outcome (it replies after the
@@ -651,7 +671,8 @@ mod tests {
         // record; `cargo test`'s long-lived process never exercised that race because it
         // never exits between `try_emit` and the assertions.
         let (addr, rx) = spawn_single_request_test_server();
-        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let endpoint: ObservatoryEndpoint =
+            format!("http://{addr}/v1/edge-events").parse().unwrap();
         let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
 
         {
@@ -660,9 +681,9 @@ mod tests {
             // `handle` drops here, at the end of this block -- no `wait_for`, no sleep.
         }
 
-        let (_head, received_body) = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("the record was lost: Drop's flush did not win the race against the handle going away");
+        let (_head, received_body) = rx.recv_timeout(Duration::from_secs(1)).expect(
+            "the record was lost: Drop's flush did not win the race against the handle going away",
+        );
         assert_eq!(received_body, sent_body.as_bytes());
     }
 
@@ -677,14 +698,18 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap()
         };
-        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let endpoint: ObservatoryEndpoint =
+            format!("http://{addr}/v1/edge-events").parse().unwrap();
         let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
 
         let started = std::time::Instant::now();
         let queued = handle.try_emit("{}".to_string());
         let elapsed = started.elapsed();
 
-        assert!(queued, "try_emit must enqueue promptly, not block on the dead connection");
+        assert!(
+            queued,
+            "try_emit must enqueue promptly, not block on the dead connection"
+        );
         assert!(
             elapsed < Duration::from_millis(500),
             "try_emit blocked for {elapsed:?} -- it must return immediately regardless of \
@@ -722,7 +747,10 @@ mod tests {
             }
         }
 
-        assert!(dropped > 0, "expected at least one drop once the channel filled up");
+        assert!(
+            dropped > 0,
+            "expected at least one drop once the channel filled up"
+        );
         assert_eq!(queued + dropped, CHANNEL_CAPACITY + 8);
         assert_eq!(
             handle.stats().queue_full_dropped,
@@ -734,7 +762,10 @@ mod tests {
     fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let started = std::time::Instant::now();
         while !condition() {
-            assert!(started.elapsed() < timeout, "condition did not become true in time");
+            assert!(
+                started.elapsed() < timeout,
+                "condition did not become true in time"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }

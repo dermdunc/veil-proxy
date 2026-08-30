@@ -173,7 +173,10 @@ mod tests {
         let sample = Sample {
             zebra: 7,
             apple: true,
-            middle: Nested { z: "last", a: "first" },
+            middle: Nested {
+                z: "last",
+                a: "first",
+            },
         };
         let got = to_canonical_json(&sample).unwrap();
         // Hand-computed: top-level keys sorted (apple, middle, zebra), nested keys

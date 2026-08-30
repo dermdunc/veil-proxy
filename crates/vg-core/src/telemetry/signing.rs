@@ -49,7 +49,9 @@ use zeroize::Zeroize;
 
 use super::canonical::{to_canonical_json, CanonicalizeError};
 use super::edge_event::EdgeEvent;
-use super::envelope::{Envelope, EnvelopeInvariantError, Integrity, SchemaVersion, SigningAlgorithm};
+use super::envelope::{
+    Envelope, EnvelopeInvariantError, Integrity, SchemaVersion, SigningAlgorithm,
+};
 use super::ids::{DeviceRef, KeyRef, RecordId, TenantId};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -122,7 +124,9 @@ pub fn load_receipt_signing_key_from_env() -> Result<ReceiptSigningKey, SigningE
 /// from [`load_receipt_signing_key_from_env`] in the first place) -- kept `pub(super)`
 /// rather than `pub` so no crate outside `vg-core` can call it directly, only siblings
 /// inside `telemetry`.
-pub(super) fn parse_receipt_signing_key(raw: Option<String>) -> Result<ReceiptSigningKey, SigningError> {
+pub(super) fn parse_receipt_signing_key(
+    raw: Option<String>,
+) -> Result<ReceiptSigningKey, SigningError> {
     let raw = raw.ok_or(SigningError::KeyEnvVarMissing)?;
     let bytes = super::hexutil::decode(raw.trim()).map_err(|_| SigningError::KeyNotHex)?;
     ReceiptSigningKey::from_bytes(bytes)
@@ -381,7 +385,10 @@ mod tests {
         let re_canonicalized = to_canonical_json(&value).unwrap();
 
         let recomputed = compute_hmac(&sample_key(), re_canonicalized.as_bytes());
-        assert_eq!(super::super::hexutil::encode(&recomputed), original_signature);
+        assert_eq!(
+            super::super::hexutil::encode(&recomputed),
+            original_signature
+        );
     }
 
     #[test]
@@ -400,10 +407,12 @@ mod tests {
 
     #[test]
     fn sign_edge_event_record_signature_changes_with_the_key() {
-        let event = || EdgeEvent::new_blocked_attempt(
-            crate::telemetry::ids::ArtefactKindId::EnvFile,
-            crate::telemetry::ids::ReasonCode::from(1),
-        );
+        let event = || {
+            EdgeEvent::new_blocked_attempt(
+                crate::telemetry::ids::ArtefactKindId::EnvFile,
+                crate::telemetry::ids::ReasonCode::from(1),
+            )
+        };
         let key_a = ReceiptSigningKey::from_bytes(vec![1u8; 32]).unwrap();
         let key_b = ReceiptSigningKey::from_bytes(vec![2u8; 32]).unwrap();
         let a = sign_edge_event_record(sample_input(event()), &key_a).unwrap();

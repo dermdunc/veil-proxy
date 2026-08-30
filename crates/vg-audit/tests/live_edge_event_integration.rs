@@ -63,7 +63,8 @@ fn a_real_demask_decision_reaches_a_real_running_veil_observatory() {
         policy_version: "policy-v1".to_string(),
     };
 
-    sink.write(event).expect("write to the real JsonlAuditSink must not fail");
+    sink.write(event)
+        .expect("write to the real JsonlAuditSink must not fail");
 
     // The emitter is fire-and-forget on a background thread; give the real HTTP round
     // trip (connect, handshake, send, response) a moment to actually complete against

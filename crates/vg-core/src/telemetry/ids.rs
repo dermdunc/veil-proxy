@@ -575,13 +575,19 @@ mod tests {
     #[test]
     fn device_ref_serializes_as_lowercase_hex() {
         let dr = DeviceRef::try_from([0xffu8; 16].as_slice()).unwrap();
-        assert_eq!(serde_json::to_value(dr).unwrap(), serde_json::json!("ff".repeat(16)));
+        assert_eq!(
+            serde_json::to_value(dr).unwrap(),
+            serde_json::json!("ff".repeat(16))
+        );
     }
 
     #[test]
     fn actor_pseudonym_serializes_as_lowercase_hex() {
         let a = ActorPseudonym::from_bytes([0x01u8; 32]);
-        assert_eq!(serde_json::to_value(a).unwrap(), serde_json::json!("01".repeat(32)));
+        assert_eq!(
+            serde_json::to_value(a).unwrap(),
+            serde_json::json!("01".repeat(32))
+        );
     }
 
     #[test]

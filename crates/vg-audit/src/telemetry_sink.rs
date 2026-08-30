@@ -518,7 +518,10 @@ mod tests {
     fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let started = std::time::Instant::now();
         while !condition() {
-            assert!(started.elapsed() < timeout, "condition did not become true in time");
+            assert!(
+                started.elapsed() < timeout,
+                "condition did not become true in time"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -541,7 +544,10 @@ mod tests {
             "test assumes neither telemetry env var is set in this process"
         );
         let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
-        assert!(sink.emitter.is_none(), "no emitter should be constructed with both vars unset");
+        assert!(
+            sink.emitter.is_none(),
+            "no emitter should be constructed with both vars unset"
+        );
         let id = sink.write(demask_request_event());
         assert!(id.is_ok());
         assert_eq!(
@@ -594,7 +600,8 @@ mod tests {
             let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
         });
 
-        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let endpoint: ObservatoryEndpoint =
+            format!("http://{addr}/v1/edge-events").parse().unwrap();
         const RAW_KEY: [u8; 32] = [9u8; 32];
         let emitter = EdgeEventEmitterHandle::connect(
             ReceiptSigningKey::from_bytes(RAW_KEY.to_vec()).unwrap(),
@@ -625,21 +632,33 @@ mod tests {
         // subset of what a real verifier does, over the literal received bytes rather
         // than a reconstruction of them.
         let needle = "\"signature\":\"";
-        let sig_start = received_str.find(needle).expect("no signature field in received body") + needle.len();
+        let sig_start = received_str
+            .find(needle)
+            .expect("no signature field in received body")
+            + needle.len();
         let sig_end = received_str[sig_start..]
             .find('"')
             .map(|i| i + sig_start)
             .expect("unterminated signature field");
         let signature = received_str[sig_start..sig_end].to_string();
-        assert_eq!(signature.len(), 64, "expected a 64-hex-char HMAC-SHA256 signature");
+        assert_eq!(
+            signature.len(),
+            64,
+            "expected a 64-hex-char HMAC-SHA256 signature"
+        );
 
         let unsigned = format!("{}{}", &received_str[..sig_start], &received_str[sig_end..]);
         let mut mac = Hmac::<Sha256>::new_from_slice(&RAW_KEY).unwrap();
         mac.update(unsigned.as_bytes());
         let expected = hex_encode(&mac.finalize().into_bytes());
-        assert_eq!(expected, signature, "HMAC over the received body did not verify");
+        assert_eq!(
+            expected, signature,
+            "HMAC over the received body did not verify"
+        );
 
-        wait_for(Duration::from_secs(5), || sink.emitter.as_ref().unwrap().stats().sent_ok == 1);
+        wait_for(Duration::from_secs(5), || {
+            sink.emitter.as_ref().unwrap().stats().sent_ok == 1
+        });
         assert_eq!(
             sink.counts().get("DemaskRequest"),
             VariantCounts { ok: 1, rejected: 0 }
@@ -659,7 +678,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap()
         };
-        let endpoint: ObservatoryEndpoint = format!("http://{addr}/v1/edge-events").parse().unwrap();
+        let endpoint: ObservatoryEndpoint =
+            format!("http://{addr}/v1/edge-events").parse().unwrap();
         let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint).unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
