@@ -3426,7 +3426,7 @@ mask every text-bearing field through the real `vg_core::mask` pipeline, forward
 to an upstream, and return its response verbatim (response *de*masking is a separate, later
 milestone, M4, not attempted here).
 
-**Built**, per `/Users/hekton/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3,
+**Built**, per `<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3,
 refined against this session's interview (recursive masking inside `tool_use`/`tool_result`;
 `document` blocks unconditionally like `image`; the full milestone in one session):
 
@@ -3545,7 +3545,7 @@ untouched — whatever the model generated, including any echoed placeholder, re
 client as-is. M4 demasks the response before it reaches the client, for the first time real
 end-to-end.
 
-**Built**, per `/Users/hekton/hekton/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3
+**Built**, per `<hekton-machinery>/docs/plans/veilgremlin-masking-proxy-plan-v1.md` §10.2/§10.3
 milestone M4:
 
 - `crates/vg-core/src/api.rs` — new `Destination::ProxyResponse` variant (the enum is
