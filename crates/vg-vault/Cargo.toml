@@ -34,6 +34,33 @@ keyring = { version = "2", default-features = false, features = [
 ] }
 uuid = { version = "1", features = ["v4"] }
 getrandom = "0.2"
+# Parses the custodian-issued (ADR-S) PEM certificate this crate's keychain loader reads
+# back out of the OS keychain, so `keychain::load_device_signing_credential` can validate
+# its Key Usage / Extended Key Usage profile and extract the SAN-carried `DeviceRef` --
+# `vg-core` deliberately has no X.509 parser (its own `Cargo.toml` explains why), so this
+# is the one crate in the workspace that owns certificate parsing. Default features only
+# (`pem`, `std`): no `builder` (never issues a certificate, only reads one), no `signature`
+# (never verifies a certificate's own CA signature -- that trust decision belongs to
+# `veil-custodian`, the issuer; this loader only checks the profile of a certificate
+# already retrieved from the local, already-trusted keychain).
+x509-cert = "0.3"
+# `x509-cert 0.3`'s own typed extension accessors (`get_extension::<KeyUsage>()`) return
+# `der`/`const-oid` types directly, so this crate names them to construct the two OIDs it
+# compares against (the ADR-S placeholder EKU, `id-kp-clientAuth`). Versions pinned to
+# exactly what `x509-cert 0.3` itself depends on (der 0.8, const-oid 0.10) -- the same
+# versions `p256`'s tree already resolves elsewhere in this workspace, so this adds no
+# second `der`/`const-oid` major version to the build graph.
+der = { version = "0.8", features = ["oid", "pem"] }
+const-oid = "0.10"
+# `keychain::load_device_signing_credential` reconstructs the loaded raw scalar as a real
+# `p256::ecdsa::SigningKey` (the type `vg_core::telemetry::DeviceSigningCredential::from_parts`
+# takes) and derives its public half to cross-check against the certificate's own SPKI --
+# this crate never signs or verifies anything itself, only loads and cross-checks, but
+# still needs the key type to do that. `alloc` (not `std`): `to_sec1_bytes()`'s only
+# `#[cfg]` requirement, needed to get the public key's raw bytes for that comparison. Same
+# version `vg-core`'s own `p256` dependency already resolves, so no second version enters
+# the build graph.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
 # Zeroizes the plaintext-hex encode/decode intermediates in keychain.rs (a
 # doubt-driven-development finding: the final [u8; 32] key crosses this crate's boundary
 # unwrapped by design — see keychain.rs's doc comments — but the hex String/Vec<u8> this

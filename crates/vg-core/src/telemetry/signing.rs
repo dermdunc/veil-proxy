@@ -1,4 +1,9 @@
-//! Builds and HMAC-signs a `veil.edge_event.v1` wire record.
+//! Builds and signs a `veil.edge_event.v1` wire record, with either of two credentials
+//! ([`SigningCredential`]): the pre-existing env-var HMAC key, or (ADR-S,
+//! `veil-custodian`'s per-device telemetry signing-key issuance) a custodian-issued
+//! ECDSA P-256 device credential ([`DeviceSigningCredential`]). Production still signs
+//! with HMAC only — see `telemetry::emitter`'s doc — the ECDSA path is real and fully
+//! tested but not yet selected by any production call site.
 //!
 //! **Wire shape.** The signed record is a JSON object with exactly two top-level keys:
 //!
@@ -11,24 +16,41 @@
 //!
 //! `envelope.schema_version` is always the literal string `"veil.edge_event.v1"` for a
 //! record built here (this module always constructs an `Envelope` with
-//! `SchemaVersion::EdgeEventV1`); `envelope.integrity.algorithm` is always
-//! `"HMAC_SHA_256"`, since [`sign_edge_event_record`] is the only production path that
-//! builds a signed record and it only ever produces an HMAC. See `telemetry::envelope`
-//! and `telemetry::edge_event` for the full field-by-field shape of each nested object.
+//! `SchemaVersion::EdgeEventV1`); `envelope.integrity.algorithm` and
+//! `envelope.integrity.key_ref` are both derived from the [`SigningCredential`] passed
+//! to [`sign_edge_event_record`] — `"HMAC_SHA_256"`/`None` for
+//! [`SigningCredential::Hmac`], `"ECDSA_SHA_256"`/`Some(key_ref)` for
+//! [`SigningCredential::EcdsaP256`] — never asserted independently of the key that
+//! actually signed. See `telemetry::envelope` and `telemetry::edge_event` for the full
+//! field-by-field shape of each nested object.
 //!
 //! **Signing procedure**, mirroring how a verifier must check a received record:
 //! 1. Build the record with `integrity.signature` set to an empty byte string (which
-//!    serializes as `""`) — the field is present, not omitted, during MAC computation.
+//!    serializes as `""`) — the field is present, not omitted, during signature
+//!    computation.
 //! 2. Render that record as canonical JSON (`telemetry::canonical`).
-//! 3. `signature = hex(HMAC-SHA256(key, canonical_json_bytes))`.
+//! 3. `signature = hex(sign(key, canonical_json_bytes))` — HMAC-SHA256 for
+//!    [`SigningCredential::Hmac`]; deterministic (RFC 6979) ECDSA-SHA256 over P-256,
+//!    encoded as fixed-width raw `r||s` (64 bytes), **not DER**, for
+//!    [`SigningCredential::EcdsaP256`]. Raw `r||s` was chosen — over the also-valid DER
+//!    encoding — because DER admits more than one byte sequence for the same signature
+//!    (non-minimal integers), which a byte-exact cross-repo golden vector cannot
+//!    tolerate; `r||s` has exactly one representation. A Python verifier must call
+//!    `cryptography`'s `utils.encode_dss_signature(r, s)` before `verify()` — documented
+//!    in the ECDSA golden fixture's own `_comment`, the same way the HMAC fixture
+//!    documents its recipe. RFC 6979 determinism is also why no RNG is needed here (or
+//!    anywhere in `vg-core` — this crate has no `rand`/`getrandom` dependency) and why
+//!    `sign_edge_event_record_is_deterministic_for_identical_input`'s existing guarantee
+//!    extends to the ECDSA path unchanged.
 //! 4. Rebuild the record with the real `signature` in place, and re-render — *this*
 //!    final canonical JSON is what actually goes on the wire.
 //!
 //! A verifier reverses this exactly: parse the record, read out `integrity.signature`,
-//! replace it with `""` in place, re-canonicalize, recompute the HMAC with the same key,
-//! and compare (constant-time) against the signature it read out.
+//! replace it with `""` in place, re-canonicalize, recompute the signature with the same
+//! key, and compare (constant-time for HMAC; standard ECDSA verification for the P-256
+//! path) against the signature it read out.
 //!
-//! **Key sourcing**: `VEIL_RECEIPT_KEY`, a hex-encoded string of at least 32 bytes,
+//! **HMAC key sourcing**: `VEIL_RECEIPT_KEY`, a hex-encoded string of at least 32 bytes,
 //! read via [`load_receipt_signing_key_from_env`]. `vg-vault`'s
 //! `load_or_create_actor_pseudonym_key` (OS-keychain-backed) is the ratified precedent
 //! for how a *real* per-device key should eventually be sourced — wiring the receipt
@@ -39,8 +61,16 @@
 //! TODO(follow-up): source the receipt signing key from the OS keychain via a
 //! `vg-vault`-style loader, the same way `ActorPseudonymKey` is meant to be, instead of
 //! `VEIL_RECEIPT_KEY`.
+//!
+//! **ECDSA key sourcing**: [`DeviceSigningCredential`] is constructed from an
+//! already-parsed `p256::ecdsa::SigningKey` plus its already-derived `KeyRef`/
+//! `DeviceRef` — this module never parses a certificate or a raw scalar itself.
+//! `vg-vault`'s `keychain::load_device_signing_credential` (load-only, never
+//! load-or-create: only the custodian CA can issue one) is the legitimate production
+//! path, matching `ActorPseudonymKey`'s precedent of returning an already-wrapped type.
 
 use hmac::{Hmac, Mac};
+use p256::ecdsa::signature::Signer;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use sha2::Sha256;
@@ -97,6 +127,91 @@ impl std::fmt::Debug for ReceiptSigningKey {
 impl Drop for ReceiptSigningKey {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+/// A custodian-issued (ADR-S) per-device ECDSA P-256 telemetry signing credential: the
+/// device's own private key plus the two identifiers derived from its certificate that
+/// accompany every record it signs. Security material, following
+/// `ReceiptSigningKey`/`ActorPseudonymKey`'s existing convention — redacted `Debug`, no
+/// `Hash`. Zeroize-on-drop is `p256::ecdsa::SigningKey`'s own unconditional `Drop` impl
+/// (`ecdsa` crate), not reimplemented here.
+///
+/// **`from_parts` takes an already-parsed key, the certificate's raw DER, and an
+/// already-derived `device_ref` — never a certificate object.** Deriving `device_ref`
+/// means parsing the certificate's SAN, which needs an X.509 parser this crate does not
+/// and should not depend on — that, plus full certificate-profile validation (Key
+/// Usage/EKU/CA/curve), is `vg-vault`'s job (`keychain::load_device_signing_credential`).
+/// `key_ref` is derived here, from `certificate_der`, rather than threaded through as a
+/// caller-supplied value — **a doubt-driven-development finding**: an earlier version
+/// accepted `key_ref: KeyRef` directly, which let nothing stop a caller from signing with
+/// one key while the wire advertised a `key_ref` derived from a different certificate
+/// entirely (`SigningCredential::EcdsaP256(cred).key_ref()` just returned whatever was
+/// passed in). Deriving it from the same `certificate_der` the caller must have already
+/// validated (`vg-vault`'s `validate_signing_certificate_pem`, which also cross-checks
+/// that this `signing_key`'s public half matches that certificate) makes the two
+/// structurally impossible to disagree — the actual contract interface-contracts v1.5 ->
+/// v1.6 claims for `Integrity::key_ref`, not merely tested for.
+///
+/// **`pub`, not `pub(crate)`**, for the identical reason `ActorPseudonymKey::from_bytes`
+/// is: this crate's own integration tests (`crates/vg-core/tests/telemetry.rs`) link as
+/// a separate compiled crate under `cargo test`'s rules and can only reach `pub` items.
+/// The real protection is not "nothing outside this module can construct one" — it is
+/// that only `vg-vault`'s keychain loader is the legitimate path to real key material in
+/// production.
+pub struct DeviceSigningCredential {
+    signing_key: p256::ecdsa::SigningKey,
+    key_ref: KeyRef,
+    device_ref: DeviceRef,
+}
+
+impl DeviceSigningCredential {
+    pub fn from_parts(
+        signing_key: p256::ecdsa::SigningKey,
+        certificate_der: &[u8],
+        device_ref: DeviceRef,
+    ) -> Self {
+        Self {
+            signing_key,
+            key_ref: KeyRef::from_certificate_der(certificate_der),
+            device_ref,
+        }
+    }
+
+    pub fn key_ref(&self) -> &KeyRef {
+        &self.key_ref
+    }
+
+    /// **Not read by [`sign_edge_event_record`]** — a doubt-driven-development finding
+    /// worth stating explicitly rather than leaving implicit: `Envelope::device_ref`
+    /// comes from `EdgeEventRecordInput::device_ref` (currently always `None` in
+    /// production — ratified Q1, `veil-custodian`'s enrolment registry doesn't exist
+    /// yet), *not* from this credential, even though the credential itself carries a
+    /// cryptographically-verified device identity. Wiring this credential's own
+    /// `device_ref` into the envelope is real, deliberately out-of-scope follow-up work
+    /// (`docs/next-actions.md`) — a decision about how Q1's registry-gating interacts
+    /// with "we already know the device from its certificate," not a gap that fell out
+    /// silently. This getter exists today only so callers (and this module's own tests)
+    /// can confirm the credential carries the identity its certificate claims.
+    pub fn device_ref(&self) -> DeviceRef {
+        self.device_ref
+    }
+
+    /// Deterministic (RFC 6979) ECDSA-SHA256 over `message`, encoded as fixed-width raw
+    /// `r||s` (64 bytes) — see this module's own doc for why raw, not DER.
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        let signature: p256::ecdsa::Signature = self.signing_key.sign(message);
+        signature.to_bytes().to_vec()
+    }
+}
+
+impl std::fmt::Debug for DeviceSigningCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSigningCredential")
+            .field("signing_key", &"<redacted>")
+            .field("key_ref", &"<redacted>")
+            .field("device_ref", &"<redacted>")
+            .finish()
     }
 }
 
@@ -170,8 +285,47 @@ pub struct EdgeEventRecordInput {
     /// signing exists more broadly). Serialized verbatim as lowercase hex.
     pub payload_sha256: [u8; 32],
     pub nonce: [u8; 16],
-    pub key_ref: Option<KeyRef>,
     pub edge_event: EdgeEvent,
+}
+
+/// Which credential [`sign_edge_event_record`] signs with — and therefore which
+/// `SigningAlgorithm` and `Integrity::key_ref` the resulting record carries.
+/// `EdgeEventRecordInput` used to carry its own `key_ref: Option<KeyRef>` field
+/// alongside a hard-coded `SigningAlgorithm::HmacSha256` literal, letting the two drift
+/// independently of the key that actually signed; both are now derived from this enum
+/// instead, so that disagreement is structurally impossible rather than merely tested
+/// against (interface-contracts v1.5 -> v1.6).
+pub enum SigningCredential<'a> {
+    Hmac(&'a ReceiptSigningKey),
+    EcdsaP256(&'a DeviceSigningCredential),
+}
+
+impl SigningCredential<'_> {
+    fn algorithm(&self) -> SigningAlgorithm {
+        match self {
+            Self::Hmac(_) => SigningAlgorithm::HmacSha256,
+            Self::EcdsaP256(_) => SigningAlgorithm::EcdsaSha256,
+        }
+    }
+
+    /// `None` for HMAC — no production HMAC call site has ever populated `key_ref`
+    /// (`crates/vg-audit/src/telemetry_sink.rs` hard-codes `None` today, and this
+    /// change does not alter that default). `Some`, always the credential's own
+    /// certificate-derived `KeyRef`, for ECDSA — a caller cannot substitute a different
+    /// one, which is the point.
+    fn key_ref(&self) -> Option<KeyRef> {
+        match self {
+            Self::Hmac(_) => None,
+            Self::EcdsaP256(cred) => Some(cred.key_ref.clone()),
+        }
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Hmac(key) => compute_hmac(key, message).to_vec(),
+            Self::EcdsaP256(cred) => cred.sign(message),
+        }
+    }
 }
 
 /// The result of a successful [`sign_edge_event_record`] call.
@@ -203,17 +357,20 @@ impl Serialize for EdgeEventWireRecord<'_> {
     }
 }
 
-/// Builds and HMAC-SHA256-signs one `veil.edge_event.v1` record — see this module's own
-/// doc comment for the exact wire shape and signing procedure.
+/// Builds and signs one `veil.edge_event.v1` record with `credential` — see this
+/// module's own doc comment for the exact wire shape and signing procedure, and
+/// [`SigningCredential`] for how `credential` determines `integrity.algorithm` and
+/// `integrity.key_ref`.
 pub fn sign_edge_event_record(
     input: EdgeEventRecordInput,
-    key: &ReceiptSigningKey,
+    credential: &SigningCredential<'_>,
 ) -> Result<SignedEdgeEventRecord, SigningError> {
+    let key_ref = credential.key_ref();
     let placeholder_integrity = Integrity::new(
         input.payload_sha256,
         input.nonce,
-        SigningAlgorithm::HmacSha256,
-        input.key_ref.clone(),
+        credential.algorithm(),
+        key_ref.clone(),
         Vec::new(),
     );
     let envelope_unsigned = Envelope::new(
@@ -232,15 +389,15 @@ pub fn sign_edge_event_record(
         edge_event: &input.edge_event,
     })?;
 
-    let mac_bytes = compute_hmac(key, canonical_unsigned.as_bytes());
-    let signature_hex = super::hexutil::encode(&mac_bytes);
+    let signature = credential.sign(canonical_unsigned.as_bytes());
+    let signature_hex = super::hexutil::encode(&signature);
 
     let final_integrity = Integrity::new(
         input.payload_sha256,
         input.nonce,
-        SigningAlgorithm::HmacSha256,
-        input.key_ref,
-        mac_bytes.to_vec(),
+        credential.algorithm(),
+        key_ref,
+        signature,
     );
     let envelope_signed = Envelope::new(
         SchemaVersion::EdgeEventV1,
@@ -299,13 +456,18 @@ mod tests {
             valid_until_us: 1_700_000_300_000_000,
             payload_sha256: [0u8; 32],
             nonce: [0u8; 16],
-            key_ref: None,
             edge_event,
         }
     }
 
     fn sample_key() -> ReceiptSigningKey {
         ReceiptSigningKey::from_bytes(vec![7u8; 32]).unwrap()
+    }
+
+    fn sample_ecdsa_credential(scalar_byte: u8) -> DeviceSigningCredential {
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[scalar_byte; 32]).unwrap();
+        let device_ref = DeviceRef::try_from([0xAAu8; 16].as_slice()).unwrap();
+        DeviceSigningCredential::from_parts(signing_key, b"test certificate der bytes", device_ref)
     }
 
     #[test]
@@ -371,7 +533,8 @@ mod tests {
             true,
             VersionToken::try_from("policy-v1").unwrap(),
         );
-        let signed = sign_edge_event_record(sample_input(event), &sample_key()).unwrap();
+        let credential = SigningCredential::Hmac(&sample_key());
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
 
         // Reproduce the verifier's side: parse the canonical JSON, strip the signature,
         // re-canonicalize, recompute, compare.
@@ -399,8 +562,9 @@ mod tests {
                 ActorPseudonym::from_bytes([2u8; 32]),
             )
         };
-        let a = sign_edge_event_record(sample_input(event()), &sample_key()).unwrap();
-        let b = sign_edge_event_record(sample_input(event()), &sample_key()).unwrap();
+        let credential = SigningCredential::Hmac(&sample_key());
+        let a = sign_edge_event_record(sample_input(event()), &credential).unwrap();
+        let b = sign_edge_event_record(sample_input(event()), &credential).unwrap();
         assert_eq!(a.canonical_json, b.canonical_json);
         assert_eq!(a.signature_hex, b.signature_hex);
     }
@@ -415,8 +579,108 @@ mod tests {
         };
         let key_a = ReceiptSigningKey::from_bytes(vec![1u8; 32]).unwrap();
         let key_b = ReceiptSigningKey::from_bytes(vec![2u8; 32]).unwrap();
-        let a = sign_edge_event_record(sample_input(event()), &key_a).unwrap();
-        let b = sign_edge_event_record(sample_input(event()), &key_b).unwrap();
+        let a = sign_edge_event_record(sample_input(event()), &SigningCredential::Hmac(&key_a))
+            .unwrap();
+        let b = sign_edge_event_record(sample_input(event()), &SigningCredential::Hmac(&key_b))
+            .unwrap();
         assert_ne!(a.signature_hex, b.signature_hex);
+    }
+
+    // -- ECDSA path (ADR-S) --
+
+    #[test]
+    fn sign_edge_event_record_ecdsa_tags_the_correct_algorithm_and_key_ref() {
+        let event = EdgeEvent::new_demask_decision(
+            Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([3u8; 32]),
+            true,
+            VersionToken::try_from("policy-v1").unwrap(),
+        );
+        let cred = sample_ecdsa_credential(9);
+        let credential = SigningCredential::EcdsaP256(&cred);
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&signed.canonical_json).unwrap();
+        assert_eq!(
+            value["envelope"]["integrity"]["algorithm"],
+            serde_json::json!("ECDSA_SHA_256")
+        );
+        assert_eq!(
+            value["envelope"]["integrity"]["key_ref"],
+            serde_json::to_value(cred.key_ref().clone()).unwrap()
+        );
+        // Raw r||s, not DER: exactly 64 bytes, 128 hex chars.
+        assert_eq!(signed.signature_hex.len(), 128);
+    }
+
+    #[test]
+    fn sign_edge_event_record_ecdsa_produces_a_signature_that_verifies_by_recomputation() {
+        use p256::ecdsa::signature::Verifier;
+
+        let event = EdgeEvent::new_blocked_attempt(
+            crate::telemetry::ids::ArtefactKindId::EnvFile,
+            crate::telemetry::ids::ReasonCode::from(1),
+        );
+        let cred = sample_ecdsa_credential(11);
+        let verifying_key = *cred.signing_key.verifying_key();
+        let credential = SigningCredential::EcdsaP256(&cred);
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
+
+        let mut value: serde_json::Value = serde_json::from_str(&signed.canonical_json).unwrap();
+        value["envelope"]["integrity"]["signature"] = serde_json::json!("");
+        let re_canonicalized = to_canonical_json(&value).unwrap();
+
+        let sig_bytes = super::super::hexutil::decode(&signed.signature_hex).unwrap();
+        let signature = p256::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
+        assert!(verifying_key
+            .verify(re_canonicalized.as_bytes(), &signature)
+            .is_ok());
+    }
+
+    #[test]
+    fn sign_edge_event_record_ecdsa_is_deterministic_for_identical_input_rfc6979() {
+        let event = || {
+            EdgeEvent::new_demask_request(
+                Destination::RemoteModelPrompt,
+                ActorPseudonym::from_bytes([4u8; 32]),
+            )
+        };
+        let cred = sample_ecdsa_credential(13);
+        let credential = SigningCredential::EcdsaP256(&cred);
+        let a = sign_edge_event_record(sample_input(event()), &credential).unwrap();
+        let b = sign_edge_event_record(sample_input(event()), &credential).unwrap();
+        assert_eq!(a.canonical_json, b.canonical_json);
+        assert_eq!(a.signature_hex, b.signature_hex);
+    }
+
+    #[test]
+    fn sign_edge_event_record_ecdsa_signature_changes_with_the_key() {
+        let event = || {
+            EdgeEvent::new_blocked_attempt(
+                crate::telemetry::ids::ArtefactKindId::EnvFile,
+                crate::telemetry::ids::ReasonCode::from(1),
+            )
+        };
+        let cred_a = sample_ecdsa_credential(21);
+        let cred_b = sample_ecdsa_credential(22);
+        let a = sign_edge_event_record(
+            sample_input(event()),
+            &SigningCredential::EcdsaP256(&cred_a),
+        )
+        .unwrap();
+        let b = sign_edge_event_record(
+            sample_input(event()),
+            &SigningCredential::EcdsaP256(&cred_b),
+        )
+        .unwrap();
+        assert_ne!(a.signature_hex, b.signature_hex);
+    }
+
+    #[test]
+    fn debug_never_prints_the_ecdsa_credential() {
+        let cred = sample_ecdsa_credential(1);
+        let debug_output = format!("{cred:?}");
+        assert!(debug_output.contains("redacted"));
+        assert!(!debug_output.contains("sk_"));
     }
 }

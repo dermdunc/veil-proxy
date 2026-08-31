@@ -1,0 +1,8 @@
+Vendored from veil-custodian, commit bedd8aded8f09f3c443529bcd176f3aabf5d3e7d (main,
+"Merge pull request #17 from dermdunc/agent/claude/adr-s-signing-key-issuance"),
+path docs/api/fixtures/signing-keys/.
+
+Upstream's own README.md is preserved here as UPSTREAM_README.md, unedited.
+
+Re-vendor by copying that directory's contents again at a newer commit and updating
+this file's commit hash — do not hand-edit any file in this directory.

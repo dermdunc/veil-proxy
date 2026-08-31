@@ -1,0 +1,20 @@
+{
+  "_comment": "Shape fixture — see README.md. The CSR's public key is RSA-2048, not P-256; this is a genuine RSA CSR generated with openssl, not a synthetic string, so a real parser must reject it on curve grounds, not on PEM-parse failure.",
+  "request": {
+    "method": "POST",
+    "path": "/devices/{pseudonym}/signing-keys",
+    "body": {
+      "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIICYTCCAUkCAQAwHDEaMBgGA1UEAwwRaWdub3JlZC1ieS1zZXJ2ZXIwggEiMA0G\nCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDIYwUSStHsWc8/ickDXSzsMivE3j+O\nAKtxIaTHLwrqGppOzb9KugcbkFeFndJTu8VJMmNmdAd8fJtUxevKCLKXF+HnOZfi\n5g8RLJoSWE1xh86fW8e/L1qXoPZ52BPPSiBZLion44scilSX8Qz0iiZuX4Z/mPw3\nc8Fes5j34LAyHZa9QjdJQVj6oDYbk5eFAA+JpgwqGjgQkp68c/mf+Yz/LZBnmTv5\nvm3eKy+NQ+rPvdouj5RDfX54IhjECJv5doSdgkHu0DrnYAPtsie3NqQ/eowcdbYu\nYm4m3v+RohJEuTdqLDUrqJ/Nnykzkvc0iwRJHWe3Ec/awPjNn4u/GrO7AgMBAAGg\nADANBgkqhkiG9w0BAQsFAAOCAQEARbN3KzuQxgIDQrejhU8c4auYcqUpCyGDn5Y7\ncysBPntovdFmcK0BlLaQgx38SyFo06bMMAmqUh4+X1q4WpmmPOt3XO9Ew13AYuXY\nMhnLdyHRLSIEncf8YHbhqEWEFSBO0VaZsUiwFuLwPwa2zghURuDL1d4+gfC/k/Nv\nm5qmAgl9CgKBz9UxYEyNqBHx43EgS/h+BKC56yBjlhq8yT+2H0qdxeFvZy6SWaEx\nudbP/LrVr9U1G3dTy2BsM4bzf6pRXkA4As880DQoiaWOI+SF2JeWIIMiidZzSEvQ\n6fU0aHmmpOMjlS3HYWehzB/nhzw2JUWcgwLXI+K3NSPqItXm8g==\n-----END CERTIFICATE REQUEST-----\n"
+    }
+  },
+  "response": {
+    "status": 422,
+    "content_type": "application/problem+json",
+    "shape": {
+      "type": { "type": "string", "format": "uri" },
+      "title": { "type": "string" },
+      "status": { "type": "integer", "const": 422 },
+      "detail": { "type": "string" }
+    }
+  }
+}

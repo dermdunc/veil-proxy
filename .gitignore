@@ -3,6 +3,11 @@
 *.env
 *.pem
 *.key
+# Exceptions: checked-in test fixtures, public certificates only -- never a private key.
+# ADR-S (crates/vg-vault/src/certificate.rs's own test suite, and the vendored
+# veil-custodian cross-repo fixture) needs these present for anyone who clones the repo.
+!crates/vg-core/tests/fixtures/custodian/*.pem
+!crates/vg-vault/tests/fixtures/*.pem
 *.log
 __pycache__/
 node_modules/

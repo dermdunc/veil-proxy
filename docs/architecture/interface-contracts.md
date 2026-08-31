@@ -1,6 +1,6 @@
-# VeilGremlin — Interface Contracts (v1.5)
+# VeilGremlin — Interface Contracts (v1.6)
 
-**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2); v1.5 (2026-08-23 — `TelemetryEvent` added, `vg-core`'s `telemetry::` module; see §1 and §7a). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
+**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2); v1.5 (2026-08-23 — `TelemetryEvent` added, `vg-core`'s `telemetry::` module; see §1 and §7a); v1.6 (2026-08-31 — ADR-S ECDSA signing: `sign_edge_event_record` re-signed to take a `SigningCredential`, `DeviceSigningCredential` added, see §7a). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
 
 These are the seams that let squads build in parallel. They are illustrative Rust signatures — Squad 0 owns the canonical definitions in `vg-core`. Other squads implement against these traits and **do not** depend on each other's internals.
 
@@ -278,6 +278,22 @@ Contract: append-only; **no raw values** in any variant (refs/counts/versions on
 
 ## 7a. `TelemetryEvent` (v1.5, owned by `vg-core`, `telemetry::` module)
 
+**v1.6 addendum (2026-08-31, ADR-S):** `telemetry::signing::sign_edge_event_record`'s second
+parameter changed from `key: &ReceiptSigningKey` to `credential: &SigningCredential<'_>` — a
+new enum (`Hmac(&ReceiptSigningKey)` / `EcdsaP256(&DeviceSigningCredential)`) that now derives
+`Integrity::algorithm` (and, for the ECDSA arm, `Integrity::key_ref`) from whichever credential
+actually signs, rather than those being an independently-hard-coded literal and an
+independently-caller-supplied `EdgeEventRecordInput::key_ref` field (removed) that could
+previously disagree with the signing key. New public types: `SigningCredential`,
+`DeviceSigningCredential` (a custodian-issued P-256 signing key plus its certificate-derived
+`key_ref`/`device_ref`, constructed via `DeviceSigningCredential::from_parts(signing_key,
+certificate_der, device_ref)` — `key_ref` is derived from `certificate_der` internally, not
+accepted as a parameter, so it cannot be supplied independent of the key that signs). Downstream:
+one call site, `vg-audit::telemetry_sink`'s `try_emit`, updated to wrap its existing
+`ReceiptSigningKey` in `SigningCredential::Hmac(..)` — production still signs HMAC only; the
+ECDSA arm is real and tested but not yet selected by any call site. See `../decisions.md`'s
+2026-08-31 entry for the full doubt-driven-development history.
+
 ```rust
 pub enum TelemetryEvent {
     Receipt(Envelope, Box<Receipt>),   // veil.receipt.v2 — one per governed Bedrock invocation
@@ -334,4 +350,5 @@ implements. No JSON Schema artifact is published yet — schema generation is se
 - **v1.3** — 2026-07-18 (Task T09 doubt-pass). §8's hook exit-code scheme corrected to the platform's real semantics: transform = exit 0 + JSON (`updatedInput` / `updatedToolOutput` / `decision:block`-with-masked-resubmit), block = exit 2. The frozen `0/2/1` scheme was inverted and failed open. No `vg-core` type changed; this is an adapter-boundary correction.
 - **v1.4** — 2026-07-18 (Task T10). `benchmark` gained a `ctx: &Context` parameter (`benchmark(corpus, ctx, policy)`) so the eval harness can reach the detectors/parsers it scores the corpus against — the same gap and same sanctioned fix as `mask` at v1.1. `Metrics` unchanged. See §2's inline contract-change note and `../decisions.md`'s 2026-07-18 T10 entry. Downstream: no current caller existed.
 - **v1.5** — 2026-08-23. `TelemetryEvent` added: a new public enum in `vg-core`'s `telemetry::` module (`Receipt`/`Alert`/`EdgeEvent` payload kinds plus their supporting types — see §1's forward reference and §7a's full contract, and `docs/architecture/implementation-plan.md` §3.2a for the complete type inventory). Purely additive — no existing public type or trait above changed. Downstream: no current caller existed (`TryFrom<&AuditEvent> for TelemetryEvent` rejects every variant today; nothing in production constructs a `TelemetryEvent`). Built against the ratified `docs/architecture/telemetry-receipt-reconciliation-plan.md`, across four rounds of adversarial review (`../decisions.md`'s 2026-08-23 entries) — the most severe finding was a proven `#[derive(Hash)]` side-channel on `String`-backed token types, closed by removing `Hash` from every type wrapping variable content.
+- **v1.6** — 2026-08-31 (ADR-S, `veil-custodian`'s per-device telemetry signing-key issuance). `sign_edge_event_record`'s second parameter changed from `&ReceiptSigningKey` to `&SigningCredential<'_>` (a non-additive, breaking signature change — the one prior caller, `vg-audit::telemetry_sink`, was updated in the same change). New public types `SigningCredential`/`DeviceSigningCredential` in `vg-core`; new `vg-vault` surface (`certificate::validate_signing_certificate_pem`, `keychain::load_device_signing_credential`) not previously part of this contract. See §7a's addendum for the full shape and `../decisions.md`'s 2026-08-31 entry for the acceptance review and doubt-driven-development history (five findings, all fixed).
 - Increment on any breaking change to a public type/trait above. Record the bump in `../decisions.md` and notify downstream squads.

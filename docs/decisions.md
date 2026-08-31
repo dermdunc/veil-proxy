@@ -3844,3 +3844,129 @@ process never exits between emit and assertion.
 --workspace` all pass, zero regressions (three existing call sites in `vg-audit`'s own test
 module needed `.unwrap()` added for `connect`'s new `Result` return type — mechanical, no
 behavior change).
+
+## 2026-08-31 — ADR-S (`veil-custodian`'s per-device telemetry signing-key issuance) reviewed and accepted-with-edits; ECDSA-P256 signing path built
+
+**This session is the acceptance review `veil-custodian`'s own `docs/next-actions.md` names as
+blocking ADR-S's flip from Proposed to Ratified.** ADR-S exists because this repo's own
+`docs/next-actions.md:439` asked for "a per-device signing keypair minted alongside the mTLS
+cert" — the custodian designed the contract, and accepting it here (with real code proving the
+acceptance is informed, not a rubber stamp) is what closes the loop. Verdict: **accept, with
+one addition the custodian's ADR left undefined** (the signature-encoding decision below) and
+**two findings to report back** (below) — nothing in ADR-S itself needed to change.
+
+**Built**, in `vg-core`:
+
+- `telemetry::ids::KeyRef::from_certificate_der` — ADR-S's `key_ref` derivation
+  (`"sk_" + hex(sha256(der))[0..40]`), pinned against a vendored `veil-custodian` fixture
+  (`tests/fixtures/custodian/`, commit `bedd8aded`) — the cross-repo assertion that this repo's
+  derivation and the custodian's agree byte-for-byte.
+- `telemetry::signing::DeviceSigningCredential` — a custodian-issued P-256 signing key plus its
+  certificate-derived `key_ref`/`device_ref`. `p256` added to `vg-core` (default features off:
+  `ecdsa` + `sha256` only — no `getrandom`, since deterministic RFC 6979 signing needs no RNG and
+  this crate has never had one).
+- `telemetry::signing::SigningCredential` — an enum (`Hmac`/`EcdsaP256`) that now derives
+  `Integrity::algorithm` (and, for ECDSA, `Integrity::key_ref`) from the credential that actually
+  signs, replacing two independently-settable values (`sign_edge_event_record`'s hard-coded
+  `SigningAlgorithm::HmacSha256` literal and `EdgeEventRecordInput::key_ref`) that could
+  previously disagree with each other. Production (`vg-audit`'s `telemetry_sink.rs`) still signs
+  HMAC only — the ECDSA path is real, fully tested, and not yet selected by any call site,
+  matching this repo's own precedent for landing "a real, tested, not-yet-wired piece"
+  (Phase 1/2/3's own history).
+- A second golden vector, `tests/fixtures/edge_event_v1_ecdsa_golden.json`, the vector ADR-S's
+  own text names as this repo's owed follow-on (the preimage is this crate's own
+  envelope-canonicalisation artifact, not something the custodian's API contract could produce).
+
+**Built, in `vg-vault`** (X.509 parsing lives here, not `vg-core` — keeps the parser out of
+every dependent's build graph): `certificate::validate_signing_certificate_pem` (Key Usage =
+DigitalSignature-only, Extended Key Usage = exactly the ADR-S placeholder OID
+`1.3.6.1.4.1.55555.1.1.1`, never `ClientAuth`, `BasicConstraints.cA = FALSE`, public key is
+`id-ecPublicKey`/P-256) and `keychain::load_device_signing_credential` — **load-only, never
+load-or-create**, unlike every other loader in this file: only the custodian CA can issue a
+signing certificate, so a missing keychain entry is a typed absence, not a trigger to fabricate
+one. The loader cross-checks the loaded private key's own public half against the certificate's
+`SubjectPublicKeyInfo` before returning, catching a keychain left in an inconsistent state.
+
+**Decided here, not left to the custodian: ECDSA signature encoding is fixed-width raw `r||s`
+(64 bytes), not DER.** ADR-S names the algorithm (`ECDSA_SHA_256`, chosen to match this repo's
+own wire token exactly) but has no opinion on signature encoding — `veil-custodian`'s own
+`docs/api/fixtures/signing-keys/README.md` says so explicitly. DER admits more than one valid
+byte sequence for the same signature (non-minimal integers); a byte-exact golden vector needs
+exactly one, so raw `r||s` was chosen. Cost: a Python verifier must call `cryptography`'s
+`utils.encode_dss_signature(r, s)` before `verify()` — two lines, documented in the golden
+fixture's own `_comment`. Needs `veil-custodian`/`veil-observatory` sign-off before any real
+cross-repo signing happens; recorded here so the decision is reviewable, not implicit in a
+fixture.
+
+**Doubt-driven-development: single-model review agent stalled twice on infrastructure
+(no-progress-for-600s), not content — proceeded with a Codex cross-model round alone**, which
+found five real issues, all fixed:
+
+1. **`KeyRef` could disagree with the key that actually signed.** `DeviceSigningCredential::from_parts`
+   originally took an arbitrary caller-supplied `KeyRef`, decoupled from `signing_key` — nothing
+   stopped signing with one key while the wire advertised a `key_ref` derived from a different
+   certificate. Fixed: `from_parts` now takes the certificate's raw DER and derives `key_ref`
+   internally, the same way `validate_signing_certificate_pem`'s own test does — structurally
+   impossible to disagree, not merely tested against. (`ValidatedSigningCertificate`'s `key_ref`
+   field was removed as a result — redundant with `der`, which is what both the keychain loader
+   and this module's own test now derive from directly.)
+2. **`DeviceSigningCredential::device_ref()` is extracted, stored, tested — and never read by
+   signing.** `sign_edge_event_record` populates `Envelope::device_ref` from
+   `EdgeEventRecordInput::device_ref` (always `None` today — ratified Q1, the enrolment registry
+   doesn't exist), never from the credential, even though the credential carries a
+   cryptographically-verified device identity. Not fixed — documented as a deliberate,
+   named trade-off (`DeviceSigningCredential::device_ref`'s own doc comment now says so
+   explicitly) rather than left as a silent, confusing gap; wiring it in is real follow-up work,
+   filed in `docs/next-actions.md`.
+3. **The private-key/certificate cross-check compared raw point bytes only, not algorithm
+   semantics.** A certificate whose `SubjectPublicKeyInfo` named a different algorithm entirely
+   but happened to carry same-length bytes would have passed
+   `load_device_signing_credential`'s "matches certificate" check undetected. Fixed:
+   `validate_signing_certificate_pem` now checks `SubjectPublicKeyInfo.algorithm` is
+   `id-ecPublicKey` on `prime256v1` before anything else touches the raw bytes. New negative
+   control: `wrong_curve.pem` (an otherwise-fully-compliant certificate on P-384).
+4. **Every certificate fixture in `vg-vault/tests/fixtures/` was `CA:TRUE`.** None of the
+   `openssl req -x509` commands that generated them set `basicConstraints` explicitly, so
+   openssl's default (`CA:TRUE`) slipped through unnoticed — and `validate_signing_certificate_pem`
+   never checked `BasicConstraints` at all, the same class of gap `veil-custodian`'s own
+   `key-ref-golden.json` fixture comment names as a defect their adversarial review caught and
+   fixed. Fixed: added the CA:FALSE check, regenerated all five fixtures with
+   `basicConstraints=critical,CA:FALSE` explicit, and added `ca_true.pem` as a dedicated negative
+   control (an otherwise-fully-compliant certificate, deliberately `CA:TRUE`) so the new check is
+   itself exercised, not just added.
+5. **The ECDSA golden fixture's Python reproduction recipe was misleading about determinism.**
+   It read as if `cryptography`'s `ec.ECDSA(hashes.SHA256())` would reproduce the pinned
+   `signature_hex` byte-for-byte; standard `cryptography` does not expose RFC 6979 deterministic
+   ECDSA, so following that recipe literally would produce a different, equally-valid signature,
+   not these bytes. Fixed: the fixture's `_comment` now states plainly that Python's role is
+   verification (which doesn't need determinism), not regeneration (which requires re-running the
+   Rust test and transcribing its output — the only process this fixture was ever actually built
+   by).
+
+Also confirmed independently (Rust ASN.1 stack, not hand-verified crypto math): the `FlagSet<KeyUsages>`
+comparison bug found and fixed *during* implementation, before this review round — an original
+`key_usage.0.bits() != KeyUsages::DigitalSignature as u16` cast on the `flags!`-macro-generated
+enum silently evaluated to `0` rather than the bit value, making the check nearly-always-true;
+caught only because the positive-path test happened to fail loudly. Fixed by comparing
+`FlagSet`s directly (`key_usage.0 != KeyUsages::DigitalSignature`) rather than casting through an
+integer. Named here as the reason the doubt-driven-development round scrutinized every other
+cast/bit-comparison touching `der`/`x509-cert`/`p256`/`ecdsa` library types — finding 3 above is
+a second instance of exactly this class.
+
+**Two findings to report back to `veil-custodian`** (not this repo's to fix): `docs/api/openapi.yaml`'s
+201 example `certificate_fingerprint` value doesn't match its own `^[a-f0-9]{64}$` pattern; and
+`src/domain/pseudonym.rs`'s module docstring still claims the `dev_`-prefixed wire form "matches
+veilgremlin's `DeviceRef` exactly" — the 2026-08-30 correction pass fixed this claim in
+`decisions.md` and `docs/api/README.md` but missed this one file. Both cosmetic, not blocking
+acceptance.
+
+**Not built, and out of scope for this session, same as ADR-S's own non-goals list:** CSR
+generation, calling the custodian's enrolment API, and the `veil-enrol` operator tool itself —
+all custodian-side per ADR-D/ADR-N ("a device never calls this API"). How a real cert+key first
+lands in this device's keychain is a later phase's problem; this session only builds what
+consumes one once it's there.
+
+`cargo build --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D
+warnings`, `cargo fmt --all --check`, `cargo test --workspace --locked` (36 test binaries, 0
+failures), `cargo deny check` (advisories/bans/licenses/sources all ok), and `cargo audit` all
+clean.

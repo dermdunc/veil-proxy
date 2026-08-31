@@ -113,9 +113,9 @@ pub use receipt::{
 };
 pub use reject::TelemetryReject;
 pub use signing::{
-    load_receipt_signing_key_from_env, sign_edge_event_record, EdgeEventRecordInput,
-    ReceiptSigningKey, SignedEdgeEventRecord, SigningError, MIN_SIGNING_KEY_LEN,
-    VEIL_RECEIPT_KEY_ENV_VAR,
+    load_receipt_signing_key_from_env, sign_edge_event_record, DeviceSigningCredential,
+    EdgeEventRecordInput, ReceiptSigningKey, SignedEdgeEventRecord, SigningCredential,
+    SigningError, MIN_SIGNING_KEY_LEN, VEIL_RECEIPT_KEY_ENV_VAR,
 };
 
 use crate::audit::AuditEvent;

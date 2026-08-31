@@ -1,0 +1,7 @@
+{
+  "_comment": "Deterministic golden vector — see README.md. Do not regenerate; the certificate this derives from is fixed-certificate.pem. Regenerated 2026-08-30 (adversarial review) to actually match ADR-S's own certificate profile: CA:FALSE, Key Usage digitalSignature-only, Extended Key Usage the ADR-S placeholder OID — the first version of this fixture was CA:TRUE with no EKU at all.",
+  "certificate_fixture": "fixed-certificate.pem",
+  "certificate_der_sha256": "90875e5a4a9d72cfcffc23c73f3038c4aea76af007281dab75273539df9ca755",
+  "key_ref": "sk_90875e5a4a9d72cfcffc23c73f3038c4aea76af0",
+  "derivation": "key_ref = \"sk_\" + certificate_der_sha256[0:40]"
+}
