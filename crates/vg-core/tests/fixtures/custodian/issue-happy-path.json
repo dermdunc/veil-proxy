@@ -1,0 +1,25 @@
+{
+  "_comment": "Shape fixture — see README.md. Not byte-exact: certificate/fingerprint/timestamps are real crypto output and vary per run.",
+  "request": {
+    "method": "POST",
+    "path": "/devices/{pseudonym}/signing-keys",
+    "body": {
+      "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHWMH4CAQAwHDEaMBgGA1UEAwwRaWdub3JlZC1ieS1zZXJ2ZXIwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAAQI3hAh9ijAvRK/M7owH13vUx8wEn+dKgjezG87V4F0\nrgq2PLCsZn05wluiNObcBNX1UCrlXxehwwvi9Iku1I0ToAAwCgYIKoZIzj0EAwID\nSAAwRQIgU0LjTUMhnWMgkno1ZtVn+pB1s8+CxfylSXkyxtfui7kCIQDqle/Qpqd4\niRlbfXKGbVce7ZSuIHzh+0RQPoXrnf3wkw==\n-----END CERTIFICATE REQUEST-----\n"
+    }
+  },
+  "response": {
+    "status": 201,
+    "shape": {
+      "key_ref": { "type": "string", "pattern": "^sk_[a-f0-9]{40}$" },
+      "device_pseudonym": { "type": "string", "pattern": "^dev_[a-f0-9]{32}$" },
+      "certificate_fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+      "certificate": { "type": "string", "format": "pem" },
+      "public_key_spki": { "type": "string", "format": "pem" },
+      "algorithm": { "type": "string", "enum": ["ECDSA_SHA_256"] },
+      "curve": { "type": "string", "enum": ["P-256"] },
+      "not_before": { "type": "string", "format": "date-time" },
+      "not_after": { "type": "string", "format": "date-time" },
+      "status": { "type": "string", "enum": ["active"] }
+    }
+  }
+}

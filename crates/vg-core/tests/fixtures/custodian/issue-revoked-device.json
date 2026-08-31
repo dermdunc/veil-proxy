@@ -1,0 +1,20 @@
+{
+  "_comment": "Shape fixture — see README.md. Device mapping status is offboarded/lost/shredded/rotated, mirroring the existing renewal 409 rule.",
+  "request": {
+    "method": "POST",
+    "path": "/devices/{pseudonym}/signing-keys",
+    "body": {
+      "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIHWMH4CAQAwHDEaMBgGA1UEAwwRaWdub3JlZC1ieS1zZXJ2ZXIwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAAQI3hAh9ijAvRK/M7owH13vUx8wEn+dKgjezG87V4F0\nrgq2PLCsZn05wluiNObcBNX1UCrlXxehwwvi9Iku1I0ToAAwCgYIKoZIzj0EAwID\nSAAwRQIgU0LjTUMhnWMgkno1ZtVn+pB1s8+CxfylSXkyxtfui7kCIQDqle/Qpqd4\niRlbfXKGbVce7ZSuIHzh+0RQPoXrnf3wkw==\n-----END CERTIFICATE REQUEST-----\n"
+    }
+  },
+  "response": {
+    "status": 409,
+    "content_type": "application/problem+json",
+    "shape": {
+      "type": { "type": "string", "format": "uri" },
+      "title": { "type": "string" },
+      "status": { "type": "integer", "const": 409 },
+      "detail": { "type": "string" }
+    }
+  }
+}

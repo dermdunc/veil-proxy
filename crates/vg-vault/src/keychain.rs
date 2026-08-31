@@ -12,9 +12,10 @@
 use keyring::{Entry, Error as KeyringError};
 use zeroize::Zeroizing;
 
+use crate::certificate::validate_signing_certificate_pem;
 use crate::error::{crypto_err, VaultError};
 use crate::random::fill_random;
-use vg_core::telemetry::ActorPseudonymKey;
+use vg_core::telemetry::{ActorPseudonymKey, DeviceSigningCredential};
 
 /// Returns the DB encryption key for `(service, account)`, generating and storing a fresh
 /// random 32-byte key in the OS keychain the first time (when no entry exists yet).
@@ -115,6 +116,106 @@ pub fn load_or_create_actor_pseudonym_key() -> Result<ActorPseudonymKey, VaultEr
         .map(ActorPseudonymKey::from_bytes)
 }
 
+/// The OS-keychain service names under which a custodian-issued (ADR-S) device telemetry
+/// signing credential is stored: the raw P-256 private scalar and its certificate are two
+/// separate entries (the existing `load_or_create_db_key`/`decode_key` helpers this file
+/// already has are hardwired to a fixed 32-byte secret, which fits the scalar but not a
+/// variable-length PEM certificate). One account, `"default"`, per device — same
+/// reasoning as [`ACTOR_PSEUDONYM_ACCOUNT`]: this doesn't fragment per vault path.
+const DEVICE_SIGNING_KEY_SERVICE: &str = "com.veilgremlin.device-signing-key";
+const DEVICE_SIGNING_CERT_SERVICE: &str = "com.veilgremlin.device-signing-cert";
+const DEVICE_SIGNING_ACCOUNT: &str = "default";
+
+/// Test-only escape hatch, same shape and same unconditional (not `#[cfg(test)]`-gated)
+/// reasoning as [`ACTOR_PSEUDONYM_KEY_ENV`]'s own doc comment. Two env vars, not one: a
+/// signing credential is a (key, certificate) pair, and [`load_device_signing_credential`]
+/// treats "exactly one of the two is set" as a configuration error rather than silently
+/// picking a source per field.
+const DEVICE_SIGNING_KEY_ENV: &str = "VG_DEVICE_SIGNING_KEY_HEX";
+const DEVICE_SIGNING_CERT_ENV: &str = "VG_DEVICE_SIGNING_CERT_PEM";
+
+/// Loads this device's custodian-issued (ADR-S) telemetry signing credential from the OS
+/// keychain. **Load-only, never load-or-create** — unlike every other loader in this
+/// file, there is no legitimate "generate one locally" fallback: only `veil-custodian`'s
+/// CA can issue a certificate for a signing key, so a missing entry is a typed absence
+/// (device not yet enrolled), not a trigger to fabricate one.
+///
+/// Cross-checks the loaded private key's own public half against the certificate's
+/// `SubjectPublicKeyInfo` before returning — catching a keychain left in an inconsistent
+/// state (e.g. a certificate re-issued after key rotation without the matching private
+/// key entry being updated) here, at load time, rather than as a mysterious signature
+/// -verification failure far downstream.
+pub fn load_device_signing_credential() -> Result<DeviceSigningCredential, VaultError> {
+    let (key_hex, cert_pem) = match (
+        std::env::var(DEVICE_SIGNING_KEY_ENV),
+        std::env::var(DEVICE_SIGNING_CERT_ENV),
+    ) {
+        (Ok(key_hex), Ok(cert_pem)) => {
+            eprintln!(
+                "veilgremlin: WARNING {DEVICE_SIGNING_KEY_ENV}/{DEVICE_SIGNING_CERT_ENV} are \
+                 set — device signing credential taken from the environment, NOT the OS \
+                 keychain. This is a test seam; unset both for real sessions."
+            );
+            (Zeroizing::new(key_hex), cert_pem)
+        }
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            let key_entry = Entry::new(DEVICE_SIGNING_KEY_SERVICE, DEVICE_SIGNING_ACCOUNT)
+                .map_err(|e| crypto_err(format!("keychain entry init failed: {e}")))?;
+            let cert_entry = Entry::new(DEVICE_SIGNING_CERT_SERVICE, DEVICE_SIGNING_ACCOUNT)
+                .map_err(|e| crypto_err(format!("keychain entry init failed: {e}")))?;
+
+            let key_hex = key_entry.get_password().map_err(|e| match e {
+                KeyringError::NoEntry => crypto_err(
+                    "no device signing key in the OS keychain -- this device has not been \
+                     enrolled for telemetry signing (ADR-S); this loader never mints one \
+                     itself, only the custodian CA can issue one",
+                ),
+                e => crypto_err(format!("keychain read failed: {e}")),
+            })?;
+            let cert_pem = cert_entry.get_password().map_err(|e| match e {
+                KeyringError::NoEntry => crypto_err(
+                    "device signing key exists in the OS keychain but its certificate does \
+                     not -- keychain is in an inconsistent state",
+                ),
+                e => crypto_err(format!("keychain read failed: {e}")),
+            })?;
+            (Zeroizing::new(key_hex), cert_pem)
+        }
+        _ => {
+            return Err(crypto_err(format!(
+                "{DEVICE_SIGNING_KEY_ENV} and {DEVICE_SIGNING_CERT_ENV} must both be set or \
+                 both unset"
+            )));
+        }
+    };
+
+    let key_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        decode_hex(key_hex.trim())
+            .ok_or_else(|| crypto_err("stored device signing key is not valid hex"))?,
+    );
+    let signing_key = p256::ecdsa::SigningKey::from_slice(&key_bytes).map_err(|e| {
+        crypto_err(format!(
+            "stored device signing key is not a valid P-256 scalar: {e}"
+        ))
+    })?;
+
+    let validated = validate_signing_certificate_pem(&cert_pem)?;
+
+    let actual_public_key = signing_key.verifying_key().to_sec1_bytes();
+    if actual_public_key.as_ref() != validated.subject_public_key_bytes.as_slice() {
+        return Err(crypto_err(
+            "device signing key does not match its own certificate's public key -- \
+             keychain is in an inconsistent state",
+        ));
+    }
+
+    Ok(DeviceSigningCredential::from_parts(
+        signing_key,
+        &validated.der,
+        validated.device_ref,
+    ))
+}
+
 /// Returns a zeroize-on-drop hex `String` — a doubt-driven-development finding (Codex
 /// cross-model): the plaintext hex this crate builds on the way to/from the OS keychain
 /// had no zeroize coverage at all; only the final `[u8; 32]`'s callers were ever
@@ -143,7 +244,10 @@ fn decode_key(label: &str, hex: &str) -> Result<[u8; 32], VaultError> {
 }
 
 /// Decodes an even-length lowercase/uppercase hex string, or `None` on any non-hex byte.
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+/// `pub(crate)`, not private: `crate::certificate` reuses this to decode the device
+/// pseudonym out of a signing certificate's SAN, rather than a second hand-rolled hex
+/// decoder in this crate.
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -212,5 +316,65 @@ mod tests {
             std::env::remove_var(ACTOR_PSEUDONYM_KEY_ENV);
         }
         assert!(result.is_err());
+    }
+
+    /// A real ADR-S-profile certificate whose private key actually matches it —
+    /// generated together (`tests/fixtures/README.md` documents the exact `openssl`
+    /// commands). Not the vendored `veil-custodian` fixture: that one has no known
+    /// private key (it exists only to pin `key_ref`'s derivation).
+    const MATCHING_CERT_PEM: &str =
+        include_str!("../tests/fixtures/loader_matching_certificate.pem");
+    const MATCHING_KEY_HEX: &str =
+        "d2fabd5b420e79a77994de5154396484ae1b260dabecb100eae9b01cc2785fd0";
+    /// A different, unrelated, but still-valid P-256 scalar — matches no certificate's
+    /// public key.
+    const MISMATCHED_KEY_HEX: &str =
+        "0909090909090909090909090909090909090909090909090909090909090909";
+
+    /// All three env-seam cases for `load_device_signing_credential` in one test
+    /// function, not three, for the identical cross-test-race reason
+    /// `actor_pseudonym_key_env_seam_round_trips_and_rejects_malformed_hex` documents —
+    /// this seam mutates the same two process-global env vars every case below.
+    #[test]
+    fn device_signing_credential_env_seam_round_trips_and_rejects_mismatches() {
+        unsafe {
+            std::env::set_var(DEVICE_SIGNING_KEY_ENV, MATCHING_KEY_HEX);
+            std::env::set_var(DEVICE_SIGNING_CERT_ENV, MATCHING_CERT_PEM);
+        }
+        let happy_path = load_device_signing_credential();
+        unsafe {
+            std::env::remove_var(DEVICE_SIGNING_KEY_ENV);
+            std::env::remove_var(DEVICE_SIGNING_CERT_ENV);
+        }
+        // `key_ref`'s exact derivation is `certificate.rs`'s own test, pinned against the
+        // vendored custodian fixture; this test's job is proving the loader wires a real,
+        // *matching* credential through end to end, which the public-key cross-check
+        // below (implicitly, by the happy path not erroring) and the `device_ref` check
+        // together establish.
+        let credential = happy_path.unwrap();
+        let expected_device_bytes = decode_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let expected_device_ref =
+            vg_core::telemetry::DeviceRef::try_from(expected_device_bytes.as_slice()).unwrap();
+        assert!(credential.device_ref() == expected_device_ref);
+
+        unsafe {
+            std::env::set_var(DEVICE_SIGNING_KEY_ENV, MISMATCHED_KEY_HEX);
+            std::env::set_var(DEVICE_SIGNING_CERT_ENV, MATCHING_CERT_PEM);
+        }
+        let mismatch_result = load_device_signing_credential();
+        unsafe {
+            std::env::remove_var(DEVICE_SIGNING_KEY_ENV);
+            std::env::remove_var(DEVICE_SIGNING_CERT_ENV);
+        }
+        assert!(mismatch_result.is_err());
+
+        unsafe {
+            std::env::set_var(DEVICE_SIGNING_KEY_ENV, MATCHING_KEY_HEX);
+        }
+        let partial_result = load_device_signing_credential();
+        unsafe {
+            std::env::remove_var(DEVICE_SIGNING_KEY_ENV);
+        }
+        assert!(partial_result.is_err());
     }
 }

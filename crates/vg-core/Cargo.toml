@@ -15,6 +15,15 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 hmac = "0.12"
 sha2 = "0.10"
+# `telemetry::signing`'s ECDSA-P256/SHA-256 path (ADR-S, veil-custodian's per-device
+# telemetry signing-key issuance): the custodian issues a P-256 keypair, so this is the
+# curve, not a choice. Default features disabled: `getrandom`/`std`/`pkcs8`/`pem` are all
+# unneeded here -- `vg-core` has no RNG dependency today and signs deterministically
+# (RFC 6979, `SigningKey::sign`'s default), and certificate/PEM parsing is `vg-vault`'s
+# job (`x509-cert`), not this crate's -- only a raw P-256 scalar and DER bytes ever reach
+# `vg-core`. `sha256` selects the fixed SHA-256 digest binding `ecdsa::SigningKey<NistP256>:
+# Signer<Signature>` needs; `ecdsa` is the signing/verifying-key module itself.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "sha256"] }
 # `telemetry::{envelope,edge_event,ids}`'s wire-serialization contract (this crate's own
 # `Serialize` impls are all hand-written, field-by-field -- no `#[derive(Serialize)]`
 # anywhere in `telemetry`, so the "derive" feature is not needed). `serde_json` backs

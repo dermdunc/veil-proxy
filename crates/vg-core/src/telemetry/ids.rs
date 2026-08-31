@@ -38,6 +38,7 @@
 //! is real future work, not done here.
 
 use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -225,6 +226,31 @@ bounded_token!(
     KeyRef,
     "A validated opaque signing-key identifier (`Integrity::key_ref`)."
 );
+
+impl KeyRef {
+    /// `veil-custodian`'s ADR-S `key_ref` derivation (`docs/api/openapi.yaml`'s
+    /// `SigningKeyRef` schema, pattern `^sk_[a-f0-9]{40}$`): `"sk_"` followed by the
+    /// first 40 hex characters (160 bits) of the signing certificate's own SHA-256
+    /// fingerprint over its DER encoding — the same fingerprint algorithm
+    /// `certificate_fingerprint` uses in full, truncated here to fit this type's
+    /// existing `<=64`-byte bound with room to spare (ADR-S sized the truncation for
+    /// exactly that). Cross-repo assertion: `tests/fixtures/custodian/key-ref-golden.json`
+    /// pins the exact `key_ref` this function must produce for the vendored
+    /// `fixed-certificate.pem`.
+    ///
+    /// Infallible: the derived string is always exactly 43 bytes of `[a-z0-9_]`, which
+    /// `validate_token`'s bound (non-empty, <=64 bytes, `[A-Za-z0-9._-]`) already
+    /// accepts — routed through `TryFrom` and asserted rather than constructed directly,
+    /// so a future change to either bound fails loudly here instead of silently
+    /// producing an unreachable branch.
+    pub fn from_certificate_der(der: &[u8]) -> Self {
+        let digest = Sha256::digest(der);
+        let hex = hexutil::encode(&digest);
+        let value = format!("sk_{}", &hex[..40]);
+        Self::try_from(value.as_str())
+            .expect("sk_<40 lowercase hex> always satisfies KeyRef's own charset/length bound")
+    }
+}
 bounded_token!(
     RegistryRef,
     "A charset/length-bounded reference (`CallerContext::repository_id` / \
@@ -622,5 +648,30 @@ mod tests {
             serde_json::to_value(KeyRef::try_from("device-key-001").unwrap()).unwrap(),
             serde_json::json!("device-key-001")
         );
+    }
+
+    /// Hand-computed expected string, not "it looks like a hex prefix" — same discipline
+    /// `telemetry::canonical`'s own tests document. `sha256(b"hello world")` is
+    /// `b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9`
+    /// (verified independently via `python3 -c "import hashlib;
+    /// print(hashlib.sha256(b'hello world').hexdigest())"`), so the first 40 hex chars,
+    /// `sk_`-prefixed, must be exactly this. The real cross-repo assertion — that this
+    /// function reproduces ADR-S's own `key_ref` for the vendored
+    /// `fixed-certificate.pem` — lives in `vg-vault`, the crate that actually parses PEM
+    /// to DER (`tests/fixtures/custodian/key-ref-golden.json`).
+    #[test]
+    fn key_ref_from_certificate_der_matches_a_hand_computed_sha256_prefix() {
+        let key_ref = KeyRef::from_certificate_der(b"hello world");
+        assert_eq!(
+            serde_json::to_value(key_ref).unwrap(),
+            serde_json::json!("sk_b94d27b9934d3e08a52e52d7da7dabfac484efe3")
+        );
+    }
+
+    #[test]
+    fn key_ref_from_certificate_der_is_deterministic() {
+        let a = KeyRef::from_certificate_der(b"some certificate der bytes");
+        let b = KeyRef::from_certificate_der(b"some certificate der bytes");
+        assert!(a == b);
     }
 }

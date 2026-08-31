@@ -1,0 +1,25 @@
+{
+  "_comment": "Shape fixture — see README.md.",
+  "request": {
+    "method": "GET",
+    "path": "/signing-keys/{key_ref}"
+  },
+  "response": {
+    "status": 200,
+    "shape": {
+      "key_ref": { "type": "string", "pattern": "^sk_[a-f0-9]{40}$" },
+      "device_pseudonym": { "type": "string", "pattern": "^dev_[a-f0-9]{32}$" },
+      "public_key_spki": { "type": "string", "format": "pem" },
+      "algorithm": { "type": "string", "enum": ["ECDSA_SHA_256"] },
+      "curve": { "type": "string", "enum": ["P-256"] },
+      "not_before": { "type": "string", "format": "date-time" },
+      "not_after": { "type": "string", "format": "date-time" },
+      "status": { "type": "string", "enum": ["active", "revoked", "expired"] },
+      "revoked_at": { "type": ["string", "null"], "format": "date-time" }
+    },
+    "forbidden_fields": [
+      "device_binding",
+      "user_binding"
+    ]
+  }
+}

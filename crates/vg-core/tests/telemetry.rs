@@ -15,8 +15,8 @@ use uuid::Uuid;
 use vg_core::telemetry::{
     sign_edge_event_record, ActorPseudonymKey, AlertRuleId, ArtefactKindId, DetectorSetId,
     DeviceRef, DeviceRefError, EdgeEvent, EdgeEventRecordInput, EntityClassId, ExceptionRuleId,
-    KeyRef, ReceiptSigningKey, RecordId, RegistryRef, TelemetryEvent, TelemetryReject, TenantId,
-    VersionToken,
+    KeyRef, ReceiptSigningKey, RecordId, RegistryRef, SigningCredential, TelemetryEvent,
+    TelemetryReject, TenantId, VersionToken,
 };
 use vg_core::{
     conformance::assert_telemetry_token_rejects_raw_value, ActorId, ArtefactKind, AuditEvent,
@@ -519,11 +519,14 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
         valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
         payload_sha256: [0u8; 32],           // input.payload_sha256_hex = "00" * 32
         nonce,
-        key_ref: None, // input.key_ref
         edge_event,
     };
 
-    let signed = sign_edge_event_record(input, &signing_key).unwrap();
+    // input.key_ref = null -- always true for `SigningCredential::Hmac` (see
+    // `telemetry::signing`'s own doc): no production HMAC call site has ever populated
+    // `key_ref`, and the credential enum makes that the only possible outcome now.
+    let credential = SigningCredential::Hmac(&signing_key);
+    let signed = sign_edge_event_record(input, &credential).unwrap();
 
     assert_eq!(
         signed.canonical_json,
@@ -535,6 +538,112 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
         fixture["signature_hex"].as_str().unwrap(),
         "HMAC signature drifted from the pinned golden vector"
     );
+    // The signature is also embedded in the canonical JSON -- both must agree.
+    assert!(signed.canonical_json.contains(&signed.signature_hex));
+}
+
+// -- Wire serialization / canonical JSON / ECDSA signing (ADR-S) --
+
+/// Cross-language contract test, the ECDSA counterpart to
+/// `edge_event_v1_golden_vector_matches_the_fixture` above: reconstructs the exact
+/// `veil.edge_event.v1` record pinned in `tests/fixtures/edge_event_v1_ecdsa_golden.json`
+/// via the *production* path (`AuditEvent` -> `EdgeEvent::try_from_audit_event` ->
+/// `sign_edge_event_record`, this time with a `SigningCredential::EcdsaP256`) and asserts
+/// byte-exact equality against the fixture's `canonical_json` and `signature_hex`. This
+/// is the vector ADR-S's own text names as veilgremlin's owed follow-on (the preimage is
+/// this crate's own envelope-canonicalisation artifact, not something the custodian's API
+/// contract can produce) — a downstream Python/`cryptography` verifier must reproduce
+/// this byte-for-byte, exactly as the HMAC vector's own fixture documents for its case.
+///
+/// Deterministic by construction (RFC 6979) — same reason the HMAC vector above is
+/// deterministic, extended to ECDSA: `p256::ecdsa::SigningKey::sign`'s default is
+/// deterministic, not randomized, so this fixture is stable across regenerations with the
+/// same inputs, not merely reproducible once.
+///
+/// The concrete input values below must match
+/// `tests/fixtures/edge_event_v1_ecdsa_golden.json`'s own `input` object exactly — same
+/// discipline as the HMAC vector, and for the same reason (not parsed back out of the
+/// fixture file).
+#[test]
+fn edge_event_v1_ecdsa_golden_vector_matches_the_fixture() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/edge_event_v1_ecdsa_golden.json")).unwrap();
+
+    // input.actor_pseudonym_key_hex = "09" * 32 -- same value the HMAC vector uses, kept
+    // identical deliberately so the only thing that varies between the two fixtures is
+    // the signing credential, not an incidental second difference.
+    let actor_key = ActorPseudonymKey::from_bytes([0x09u8; 32]);
+    // input.audit_event -- identical to the HMAC vector's, same reason as above.
+    let event = AuditEvent::DemaskDecision {
+        dest: Destination::RemoteModelPrompt,
+        actor: ActorId("jane.doe".to_string()),
+        allowed: true,
+        policy_version: "policy-v1".to_string(),
+    };
+    let edge_event = EdgeEvent::try_from_audit_event(&event, &actor_key).unwrap();
+
+    // input.signing_key_scalar_hex = 01 02 ... 20 (32 sequential bytes) -- a P-256
+    // private scalar, not an HMAC key; this is the ADR-S device signing credential's raw
+    // key material (test-only, not a real custodian-issued key).
+    let signing_key_bytes: Vec<u8> = (1u8..=32u8).collect();
+    let signing_key = p256::ecdsa::SigningKey::from_slice(&signing_key_bytes).unwrap();
+    // input.certificate_der_hex = 01 02 ... 40 (64 sequential bytes) -- a placeholder,
+    // not a real certificate (this test constructs a credential directly, the same way
+    // `signing.rs`'s own `sample_ecdsa_credential` does, not through `vg-vault`'s
+    // certificate parser). `DeviceSigningCredential::from_parts` derives `key_ref` from
+    // this itself (a doubt-driven-development fix: an earlier version of this constructor
+    // took an arbitrary caller-supplied `KeyRef`, decoupled from the key that actually
+    // signs -- see that type's own doc). input.key_ref below is this derivation's
+    // result, not an independently chosen value.
+    let certificate_der: Vec<u8> = (1u8..=64u8).collect();
+    // input.device_ref_hex = 01 02 ... 10 (16 sequential bytes)
+    let device_ref_bytes: [u8; 16] = (1u8..=16u8).collect::<Vec<_>>().try_into().unwrap();
+    let device_ref = DeviceRef::try_from(device_ref_bytes.as_slice()).unwrap();
+    let device_credential = vg_core::telemetry::DeviceSigningCredential::from_parts(
+        signing_key,
+        &certificate_der,
+        device_ref,
+    );
+
+    // input.record_id
+    let record_id =
+        RecordId::from(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+    // input.nonce_hex = 01 02 ... 10 (16 sequential bytes) -- same pattern as the HMAC
+    // vector's nonce, distinct value space from device_ref_hex above only by field, not
+    // by an attempt at cross-field distinctness.
+    let nonce: [u8; 16] = (1u8..=16u8).collect::<Vec<_>>().try_into().unwrap();
+
+    let input = EdgeEventRecordInput {
+        contract_revision: 1, // input.contract_revision
+        record_id,
+        issued_at_us: 1_700_000_000_000_000, // input.issued_at_us
+        device_ref: None,                    // input.device_ref -- Envelope::device_ref, not
+        // the SigningCredential's own device_ref above; ADR-S's enrolment registry
+        // (Q1) doesn't exist yet, same reason the HMAC vector also leaves this `None`.
+        tenant_id: None,                       // input.tenant_id
+        sequence: 0,                           // input.sequence
+        valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
+        payload_sha256: [0u8; 32],             // input.payload_sha256_hex = "00" * 32
+        nonce,
+        edge_event,
+    };
+
+    let credential = SigningCredential::EcdsaP256(&device_credential);
+    let signed = sign_edge_event_record(input, &credential).unwrap();
+
+    assert_eq!(
+        signed.canonical_json,
+        fixture["canonical_json"].as_str().unwrap(),
+        "canonical JSON drifted from the pinned golden vector"
+    );
+    assert_eq!(
+        signed.signature_hex,
+        fixture["signature_hex"].as_str().unwrap(),
+        "ECDSA signature drifted from the pinned golden vector"
+    );
+    // Raw r||s (128 hex chars), not DER -- see `telemetry::signing`'s own module doc for
+    // why.
+    assert_eq!(signed.signature_hex.len(), 128);
     // The signature is also embedded in the canonical JSON -- both must agree.
     assert!(signed.canonical_json.contains(&signed.signature_hex));
 }
@@ -599,10 +708,9 @@ fn edge_event_serialization_never_leaks_raw_forbidden_values() {
             valid_until_us: 1_700_000_300_000_000,
             payload_sha256: [0u8; 32],
             nonce: [0u8; 16],
-            key_ref: None,
             edge_event,
         };
-        let signed = sign_edge_event_record(input, &signing_key).unwrap();
+        let signed = sign_edge_event_record(input, &SigningCredential::Hmac(&signing_key)).unwrap();
 
         assert!(
             !signed.canonical_json.contains(FORBIDDEN_USERNAME),

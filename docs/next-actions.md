@@ -436,11 +436,49 @@ needs from it is named in the item below.
       `Hash` has no raw bytes to expose) — the concern is purely convention consistency with
       the rest of `telemetry::`'s "no `Hash`" rule. Small, low-risk, self-contained cleanup for
       a future session.
-- [ ] **`veil-custodian`: build the device enrolment registry and signing-key issuance** (Q1, Q3
-      ratifications). Extends the existing mTLS device-cert issuance (`docs/decisions.md:2894`)
-      with: an enrolment registry `veil-observatory` can query for governed-inventory membership
-      without resolving identity, and a per-device signing keypair minted alongside the mTLS cert.
-      Blocks `veil-proxy`'s receipt-signing work and `veil-observatory`'s bypass-detection rule.
+- [x] ~~**`veil-custodian`: build the device enrolment registry and signing-key issuance**~~
+      **Signing-key half designed and reviewed 2026-08-31** — `veil-custodian` proposed ADR-S
+      (per-device telemetry signing-key issuance) on 2026-08-30, and this repo completed the
+      acceptance review ADR-S's own text names as blocking its flip to Ratified (accepted, with
+      edits — see `docs/decisions.md`'s 2026-08-31 entry). **Still open, both sides:** ADR-S
+      itself remains docs-only on the custodian side (no `signing_keys` migration, no handler, no
+      signing-cert profile in its CA yet) — this repo's `telemetry::signing::DeviceSigningCredential`/
+      `SigningCredential::EcdsaP256` consume the *contract*, not a real issued certificate, and
+      are not wired into any production call site. The enrolment-registry half (Q1) is untouched
+      by this work. Blocks `veil-proxy`'s receipt-signing work and `veil-observatory`'s
+      bypass-detection rule until both the custodian builds the real endpoints and this repo
+      wires the ECDSA path into `vg-audit::telemetry_sink` against a real credential.
+- [ ] **Wire the ECDSA signing path into production** (`vg-audit::telemetry_sink`), once a real
+      device signing key/certificate can actually be enrolled. Requires: `veil-custodian`'s ADR-S
+      endpoints built for real (see above); a decision on how the enrolled key+certificate first
+      lands in this device's OS keychain (`vg-vault::keychain::load_device_signing_credential` is
+      load-only by design — enrolment itself is out of scope, deliberately, per ADR-D/ADR-N: "a
+      device never calls this API"); and a policy/config surface to select `EcdsaP256` over the
+      current `Hmac` default (no such flag exists yet — `SigningCredential`'s two arms are chosen
+      by whichever value the caller constructs, not by config).
+- [ ] **Decide whether `Envelope::device_ref` should be populated from
+      `DeviceSigningCredential::device_ref()` when signing with ECDSA**, rather than staying tied
+      to the separate, still-always-`None` `EdgeEventRecordInput::device_ref` (ratified Q1 gates
+      that field on the enrolment registry existing). A doubt-driven-development review round
+      (2026-08-31) flagged that the credential now carries a cryptographically-verified device
+      identity that signing never uses — not a bug (nothing currently depends on it), but a real
+      design question once the ECDSA path is actually wired into production (item above).
+      `docs/decisions.md`'s 2026-08-31 entry has the full finding.
+- [ ] **Report two findings back to `veil-custodian`**, surfaced during ADR-S's acceptance review
+      (2026-08-31): `docs/api/openapi.yaml`'s 201 example `certificate_fingerprint` value doesn't
+      match its own `^[a-f0-9]{64}$` pattern (will fail an example-validating linter); and
+      `src/domain/pseudonym.rs`'s module docstring still claims the `dev_`-prefixed wire form
+      "matches veilgremlin's `DeviceRef` exactly" — the 2026-08-30 correction pass fixed this
+      claim in `decisions.md` and `docs/api/README.md` but missed this file. Both cosmetic, not
+      blocking, no urgency.
+- [ ] **Get ADR-S's signature encoding decided jointly, not unilaterally.** This repo chose raw
+      `r||s` (64 bytes) over DER for the ECDSA signature wire encoding — ADR-S itself has no
+      opinion (`veil-custodian`'s own fixtures README says so explicitly) — because a byte-exact
+      golden vector needs exactly one valid encoding per signature, which DER doesn't guarantee.
+      Recorded as a decision here (`docs/decisions.md`'s 2026-08-31 entry), but needs
+      `veil-custodian`/`veil-observatory` sign-off before any real cross-repo ECDSA signing
+      happens — a Python verifier needs `utils.encode_dss_signature(r, s)` before `verify()`,
+      which is a real, if small, integration cost on that side.
 - [ ] **Write the Q10 telemetry-metadata privacy section** (retention, residency, permitted joins,
       re-identification path) into the ratification packet, alongside the Q1 registry work — the
       plan explicitly deferred this write-up, it is not yet done

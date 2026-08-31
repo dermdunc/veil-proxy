@@ -1,0 +1,16 @@
+{
+  "_comment": "Shape fixture — see README.md.",
+  "request": {
+    "method": "GET",
+    "path": "/signing-keys/{key_ref}"
+  },
+  "response": {
+    "status": 404,
+    "content_type": "application/problem+json",
+    "shape": {
+      "type": { "type": "string", "format": "uri" },
+      "title": { "type": "string" },
+      "status": { "type": "integer", "const": 404 }
+    }
+  }
+}

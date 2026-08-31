@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use vg_core::telemetry::{
     edge_event_emitter_from_env, sign_edge_event_record, ActorPseudonymKey, EdgeEvent,
-    EdgeEventEmitterHandle, EdgeEventRecordInput, RecordId,
+    EdgeEventEmitterHandle, EdgeEventRecordInput, RecordId, SigningCredential,
 };
 use vg_core::{AuditError, AuditEvent, AuditId, AuditSink};
 
@@ -194,10 +194,14 @@ impl TelemetryCountingAuditSink {
             // `vg-core`'s own golden-vector test uses (`signing.rs`'s doc on this field).
             payload_sha256: [0u8; 32],
             nonce: *Uuid::new_v4().as_bytes(),
-            key_ref: None,
             edge_event,
         };
-        if let Ok(signed) = sign_edge_event_record(input, emitter.signing_key()) {
+        // HMAC only, in production, today -- see `vg_core::telemetry::signing`'s own
+        // module doc: the ECDSA/ADR-S path is real and tested but not yet selected by
+        // any production call site. `SigningCredential::Hmac`'s `key_ref()` is always
+        // `None`, matching this call site's pre-existing behaviour exactly.
+        let credential = SigningCredential::Hmac(emitter.signing_key());
+        if let Ok(signed) = sign_edge_event_record(input, &credential) {
             emitter.try_emit(signed.canonical_json);
         }
     }
