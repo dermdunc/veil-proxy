@@ -1,9 +1,15 @@
 //! Builds and signs a `veil.edge_event.v1` wire record, with either of two credentials
 //! ([`SigningCredential`]): the pre-existing env-var HMAC key, or (ADR-S,
 //! `veil-custodian`'s per-device telemetry signing-key issuance) a custodian-issued
-//! ECDSA P-256 device credential ([`DeviceSigningCredential`]). Production still signs
-//! with HMAC only — see `telemetry::emitter`'s doc — the ECDSA path is real and fully
-//! tested but not yet selected by any production call site.
+//! ECDSA P-256 device credential ([`DeviceSigningCredential`]). Production
+//! auto-detects between the two: `vg-adapters-claude::runtime::Engine::open` selects
+//! `EcdsaP256` when a real device credential is present in the OS keychain
+//! (`vg_vault::load_device_signing_credential`), falling back to the `Hmac` default
+//! otherwise — no explicit config flag, since the credential's presence is itself the
+//! signal. Today this still means HMAC universally in practice, since no real
+//! enrolment flow exists yet to put a credential in the keychain in the first place —
+//! but the selection logic itself, unlike an earlier version of this doc comment
+//! claimed, is real and live, not merely built-and-unwired.
 //!
 //! **Wire shape.** The signed record is a JSON object with exactly two top-level keys:
 //!
@@ -324,6 +330,29 @@ impl SigningCredential<'_> {
         match self {
             Self::Hmac(key) => compute_hmac(key, message).to_vec(),
             Self::EcdsaP256(cred) => cred.sign(message),
+        }
+    }
+}
+
+/// The owned counterpart to [`SigningCredential`], for a caller that needs to *store* a
+/// credential (e.g. `telemetry::emitter::EdgeEventEmitterHandle`, which lives for the
+/// process's lifetime) rather than borrow one for the duration of a single
+/// [`sign_edge_event_record`] call. `SigningCredential<'a>` itself deliberately stays a
+/// borrowing enum — it exists for that one short-lived call, not for long-lived storage,
+/// so this is a separate type rather than `SigningCredential<'static>` (which would force
+/// every field it borrows from to be `'static` too, an unrelated and unwanted constraint).
+pub enum OwnedSigningCredential {
+    Hmac(ReceiptSigningKey),
+    EcdsaP256(DeviceSigningCredential),
+}
+
+impl OwnedSigningCredential {
+    /// Borrows this credential as the short-lived [`SigningCredential`]
+    /// [`sign_edge_event_record`] actually takes.
+    pub fn as_ref(&self) -> SigningCredential<'_> {
+        match self {
+            Self::Hmac(key) => SigningCredential::Hmac(key),
+            Self::EcdsaP256(cred) => SigningCredential::EcdsaP256(cred),
         }
     }
 }

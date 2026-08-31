@@ -3,9 +3,10 @@
 //! changing the audit log's own behaviour or content in any way. As of the network
 //! emitter (`vg_core::telemetry::emitter`), it also — best-effort, fire-and-forget — signs
 //! every successfully-converted `EdgeEvent` and hands it to a background HTTP POSTer, but
-//! only when an organisation has opted in to *both* `VEIL_RECEIPT_KEY` and
-//! `VEIL_OBSERVATORY_ENDPOINT`; see [`TelemetryCountingAuditSink::new`] and this module's
-//! own tests for the opt-in-off-by-default contract.
+//! only when an organisation has opted in to `VEIL_OBSERVATORY_ENDPOINT` plus a signing
+//! credential — either a real per-device ECDSA credential auto-detected from the OS
+//! keychain, or (falling back) `VEIL_RECEIPT_KEY`; see [`TelemetryCountingAuditSink::new`]
+//! and this module's own tests for the opt-in-off-by-default contract.
 //!
 //! Lives here, not `vg-adapters-claude`: this wraps `AuditSink`, a `vg-core` trait
 //! `vg-audit` already owns the real implementation of (`JsonlAuditSink`), and references
@@ -52,8 +53,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use vg_core::telemetry::{
-    edge_event_emitter_from_env, sign_edge_event_record, ActorPseudonymKey, EdgeEvent,
-    EdgeEventEmitterHandle, EdgeEventRecordInput, RecordId, SigningCredential,
+    edge_event_emitter_from_env_with_credential, sign_edge_event_record, ActorPseudonymKey,
+    EdgeEvent, EdgeEventEmitterHandle, EdgeEventRecordInput, OwnedSigningCredential, RecordId,
 };
 use vg_core::{AuditError, AuditEvent, AuditId, AuditSink};
 
@@ -109,10 +110,11 @@ pub struct TelemetryCountingAuditSink {
     inner: Box<dyn AuditSink>,
     actor_key: ActorPseudonymKey,
     counts: Mutex<TelemetryConversionCounts>,
-    /// `None` unless an organisation has opted in to *both* `VEIL_RECEIPT_KEY` and
-    /// `VEIL_OBSERVATORY_ENDPOINT` (see [`Self::new`]) — the default, off, path leaves
-    /// this `None` and every write below takes the same zero-cost `if let Some` miss it
-    /// always did before the emitter existed.
+    /// `None` unless an organisation has opted in to `VEIL_OBSERVATORY_ENDPOINT` plus a
+    /// signing credential — either a real device credential or `VEIL_RECEIPT_KEY` (see
+    /// [`Self::new`]) — the default, off, path leaves this `None` and every write below
+    /// takes the same zero-cost `if let Some` miss it always did before the emitter
+    /// existed.
     emitter: Option<EdgeEventEmitterHandle>,
     /// Monotonic per-sink counter feeding `EdgeEventRecordInput::sequence`. Never reset,
     /// never persisted — a receiver-side ordering hint within one process's lifetime
@@ -121,18 +123,32 @@ pub struct TelemetryCountingAuditSink {
 }
 
 impl TelemetryCountingAuditSink {
-    /// Builds a counting sink. Also attempts to build a network emitter from
-    /// `VEIL_RECEIPT_KEY`/`VEIL_OBSERVATORY_ENDPOINT` (see
-    /// `vg_core::telemetry::edge_event_emitter_from_env`): if either is unset, this is
-    /// silently `None` (the documented, tested default) — not an error, not a panic, and
-    /// no channel/thread/HTTP client is constructed at all in that case (the guarantee is
-    /// structural on `vg-core`'s side; see that function's own module doc). If both are
-    /// set but one is malformed (bad hex key, invalid URL), that's a real misconfiguration
+    /// Builds a counting sink. Also attempts to build a network emitter (see
+    /// `vg_core::telemetry::edge_event_emitter_from_env_with_credential`).
+    ///
+    /// `device_credential`, when `Some`, is signed with instead of the default
+    /// `VEIL_RECEIPT_KEY`-sourced HMAC key — the caller's (`vg-adapters-claude::runtime::Engine::open`)
+    /// auto-detect result: a real device ECDSA credential if one was found in the OS
+    /// keychain, `None` if not (today's universal case, since no real enrolment flow
+    /// exists yet). This sink does not look for a credential itself — see
+    /// `vg_core::telemetry::signing`'s own module doc on why OS-keychain access
+    /// deliberately does not live in this crate.
+    ///
+    /// Either way, `VEIL_OBSERVATORY_ENDPOINT` is still required to actually opt in to
+    /// transport: if unset, this is silently `None` (the documented, tested default) —
+    /// not an error, not a panic, and no channel/thread/HTTP client is constructed at all
+    /// in that case (the guarantee is structural on `vg-core`'s side; see that function's
+    /// own module doc). If the endpoint is set but malformed, or `device_credential` is
+    /// `None` and `VEIL_RECEIPT_KEY` is set but malformed, that's a real misconfiguration
     /// of an already-opted-in feature — logged to stderr and treated as "no emitter" for
     /// this process, rather than failing sink construction (and therefore the whole
     /// engine) over a telemetry-only config error.
-    pub fn new(inner: Box<dyn AuditSink>, actor_key: ActorPseudonymKey) -> Self {
-        let emitter = match edge_event_emitter_from_env() {
+    pub fn new(
+        inner: Box<dyn AuditSink>,
+        actor_key: ActorPseudonymKey,
+        device_credential: Option<OwnedSigningCredential>,
+    ) -> Self {
+        let emitter = match edge_event_emitter_from_env_with_credential(device_credential) {
             Ok(emitter) => emitter,
             Err(err) => {
                 eprintln!(
@@ -196,11 +212,11 @@ impl TelemetryCountingAuditSink {
             nonce: *Uuid::new_v4().as_bytes(),
             edge_event,
         };
-        // HMAC only, in production, today -- see `vg_core::telemetry::signing`'s own
-        // module doc: the ECDSA/ADR-S path is real and tested but not yet selected by
-        // any production call site. `SigningCredential::Hmac`'s `key_ref()` is always
-        // `None`, matching this call site's pre-existing behaviour exactly.
-        let credential = SigningCredential::Hmac(emitter.signing_key());
+        // Whichever credential this emitter was built from -- HMAC by default, or a real
+        // device ECDSA credential if `Engine::open` (`vg-adapters-claude::runtime`) found
+        // one in the OS keychain when constructing this sink. See `TelemetryCountingAuditSink::new`'s
+        // own doc for the auto-detect contract.
+        let credential = emitter.credential();
         if let Ok(signed) = sign_edge_event_record(input, &credential) {
             emitter.try_emit(signed.canonical_json);
         }
@@ -341,7 +357,7 @@ mod tests {
 
     #[test]
     fn write_delegates_to_the_inner_sink_unchanged() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         let event = AuditEvent::Scan {
             counts: EntityCounts::default(),
             detector_version: "detectors-v1".to_string(),
@@ -357,7 +373,7 @@ mod tests {
 
     #[test]
     fn get_is_a_pure_delegation_and_is_not_counted() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         assert!(sink.get(AuditId(uuid::Uuid::nil())).is_none());
         // No write happened, so no variant should have been recorded.
         assert_eq!(sink.counts().get("Scan"), VariantCounts::default());
@@ -365,7 +381,7 @@ mod tests {
 
     #[test]
     fn demask_decision_counts_ok_with_a_valid_actor_key_and_policy_version() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         sink.write(AuditEvent::DemaskDecision {
             dest: Destination::ObservabilitySink,
             actor: vg_core::ActorId("jane.doe".to_string()),
@@ -384,7 +400,7 @@ mod tests {
         // Distinct from the actor-key-independent reject reason
         // (TelemetryReject::InvalidField) -- still a rejection from this sink's point
         // of view, since it only counts ok-vs-not, not the specific reason.
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         sink.write(AuditEvent::DemaskDecision {
             dest: Destination::ObservabilitySink,
             actor: vg_core::ActorId("jane.doe".to_string()),
@@ -406,7 +422,7 @@ mod tests {
         // what this fixture's reason string is (see
         // `block_reason_recognized_by_the_registry_counts_ok_through_the_wrapper` below
         // for the recognized case).
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         sink.write(AuditEvent::Scan {
             counts: EntityCounts::default(),
             detector_version: "detectors-v1".to_string(),
@@ -451,7 +467,7 @@ mod tests {
         // `crates/vg-core/tests/telemetry.rs` and `crates/vg-core/tests/pipeline.rs`
         // (the latter proves the *real* `mask()`-emitted event resolves; this test
         // proves the wrapper counts it correctly once it does).
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         sink.write(AuditEvent::Block {
             artefact: ArtefactKind::EnvFile,
             reason: "artefact class is Block in resolved policy".to_string(),
@@ -465,7 +481,7 @@ mod tests {
 
     #[test]
     fn demask_request_counts_ok_with_a_valid_actor_key() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         sink.write(AuditEvent::DemaskRequest {
             dest: Destination::RemoteModelPrompt,
             actor: vg_core::ActorId("jane.doe".to_string()),
@@ -479,7 +495,7 @@ mod tests {
 
     #[test]
     fn counts_accumulate_across_multiple_writes_of_the_same_variant() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         for _ in 0..3 {
             sink.write(AuditEvent::DemaskRequest {
                 dest: Destination::RemoteModelPrompt,
@@ -495,7 +511,7 @@ mod tests {
 
     #[test]
     fn an_unrecorded_variant_reports_zero_not_a_panic() {
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         assert_eq!(sink.counts().get("Block"), VariantCounts::default());
     }
 
@@ -547,7 +563,7 @@ mod tests {
                 && std::env::var("VEIL_OBSERVATORY_ENDPOINT").is_err(),
             "test assumes neither telemetry env var is set in this process"
         );
-        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key());
+        let sink = TelemetryCountingAuditSink::new(Box::new(StubSink::new()), key(), None);
         assert!(
             sink.emitter.is_none(),
             "no emitter should be constructed with both vars unset"
@@ -608,7 +624,7 @@ mod tests {
             format!("http://{addr}/v1/edge-events").parse().unwrap();
         const RAW_KEY: [u8; 32] = [9u8; 32];
         let emitter = EdgeEventEmitterHandle::connect(
-            ReceiptSigningKey::from_bytes(RAW_KEY.to_vec()).unwrap(),
+            OwnedSigningCredential::Hmac(ReceiptSigningKey::from_bytes(RAW_KEY.to_vec()).unwrap()),
             endpoint,
         )
         .unwrap();
@@ -684,7 +700,9 @@ mod tests {
         };
         let endpoint: ObservatoryEndpoint =
             format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint).unwrap();
+        let emitter =
+            EdgeEventEmitterHandle::connect(OwnedSigningCredential::Hmac(signing_key()), endpoint)
+                .unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
             key(),
@@ -717,7 +735,9 @@ mod tests {
     #[test]
     fn a_burst_of_writes_past_channel_capacity_drops_rather_than_blocking() {
         let endpoint: ObservatoryEndpoint = "http://192.0.2.1:9/v1/edge-events".parse().unwrap();
-        let emitter = EdgeEventEmitterHandle::connect(signing_key(), endpoint).unwrap();
+        let emitter =
+            EdgeEventEmitterHandle::connect(OwnedSigningCredential::Hmac(signing_key()), endpoint)
+                .unwrap();
         let sink = TelemetryCountingAuditSink::with_emitter(
             Box::new(StubSink::new()),
             key(),

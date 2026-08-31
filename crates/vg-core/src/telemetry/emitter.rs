@@ -42,9 +42,17 @@
 //! [`super::signing::sign_edge_event_record`] both happen in the caller
 //! (`vg-audit::telemetry_sink`), which is not bound by that rule. This module only ever
 //! receives an already-signed `canonical_json` `String` and transports it; it exposes the
-//! caller's [`ReceiptSigningKey`] back out via [`EdgeEventEmitterHandle::signing_key`] so
-//! the caller can sign with the same key this handle was built from, without a second
-//! `VEIL_RECEIPT_KEY` read.
+//! caller's [`OwnedSigningCredential`] back out (borrowed, as a [`SigningCredential`]) via
+//! [`EdgeEventEmitterHandle::credential`] so the caller can sign with the exact credential
+//! this handle was built from, without re-resolving it.
+//!
+//! **Which credential a handle is built from is this module's caller's decision, not
+//! this module's** — see [`edge_event_emitter_from_env_with_credential`]: pass `Some` to
+//! sign with an already-resolved credential (e.g. a real device certificate a caller
+//! found in the OS keychain — `vg-core` has no keychain access itself, see
+//! `telemetry::signing`'s own module doc on why), or `None` for today's default,
+//! `VEIL_RECEIPT_KEY`-sourced HMAC path. [`edge_event_emitter_from_env`] is the `None`
+//! case, kept as its own function since it's still every existing caller's entry point.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -58,7 +66,8 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 
 use super::signing::{
-    parse_receipt_signing_key, ReceiptSigningKey, SigningError, VEIL_RECEIPT_KEY_ENV_VAR,
+    parse_receipt_signing_key, OwnedSigningCredential, SigningCredential, SigningError,
+    VEIL_RECEIPT_KEY_ENV_VAR,
 };
 
 /// The env var [`edge_event_emitter_from_env`] reads for the observatory's full URL
@@ -149,17 +158,20 @@ struct EmitterStatsInner {
     send_failed: AtomicU64,
 }
 
-/// A live, opted-in edge-event emitter: a signing key (for the caller to sign with) plus
-/// a handle onto a bounded channel feeding a dedicated background poster thread/runtime.
-/// Constructed only by [`edge_event_emitter_from_env`] (env-gated) or
+/// A live, opted-in edge-event emitter: a signing credential (for the caller to sign
+/// with) plus a handle onto a bounded channel feeding a dedicated background poster
+/// thread/runtime. Constructed only by [`edge_event_emitter_from_env_with_credential`]
+/// (env-gated, or credential-gated when a credential is supplied) or
 /// [`EdgeEventEmitterHandle::connect`] (explicit, for tests) — never implicitly.
 ///
 /// `Send + Sync`: `mpsc::SyncSender<String>` is `Send + Sync` for a `Send` payload (`String`)
 /// on this crate's Rust edition (std's mpsc has been `Sync` since the 1.72 rewrite), and
-/// every other field is a plain `Arc`/key value — required for use behind
-/// `Box<dyn AuditSink>` (`AuditSink: Send + Sync`, `crate::traits`).
+/// every other field is a plain `Arc`/credential value — required for use behind
+/// `Box<dyn AuditSink>` (`AuditSink: Send + Sync`, `crate::traits`). `OwnedSigningCredential`'s
+/// two variants (`ReceiptSigningKey`, `DeviceSigningCredential`) are both plain owned data
+/// with no interior mutability, so this holds regardless of which variant is stored.
 pub struct EdgeEventEmitterHandle {
-    key: ReceiptSigningKey,
+    credential: OwnedSigningCredential,
     // `Option` so `Drop` can close the channel (by taking and dropping the sender) before
     // joining the background thread -- the thread's `recv()` loop only returns `Err` and
     // exits once every sender side is gone, so joining first would hang forever.
@@ -182,13 +194,16 @@ impl EdgeEventEmitterHandle {
     /// Fallible, deliberately: under OS thread exhaustion (`ulimit` hit, `ENOMEM`/`EAGAIN`
     /// from `pthread_create` -- realistic under load on a busy `vg-proxy` host), spawning
     /// can fail. This module's whole reason to exist is "fail open, never panic" for a
-    /// telemetry-only condition; the caller (`edge_event_emitter_from_env`, ultimately
-    /// `vg-audit`'s `TelemetryCountingAuditSink::new`) already has a real error path for
-    /// "this opted-in feature is misconfigured, disable it and keep going" -- panicking here
-    /// instead of returning into that path would let a telemetry-only failure crash an
-    /// entire hook invocation or daemon startup, precisely under the resource pressure where
-    /// inert-by-default matters most.
-    pub fn connect(key: ReceiptSigningKey, endpoint: ObservatoryEndpoint) -> std::io::Result<Self> {
+    /// telemetry-only condition; the caller (`edge_event_emitter_from_env_with_credential`,
+    /// ultimately `vg-audit`'s `TelemetryCountingAuditSink::new`) already has a real error
+    /// path for "this opted-in feature is misconfigured, disable it and keep going" --
+    /// panicking here instead of returning into that path would let a telemetry-only
+    /// failure crash an entire hook invocation or daemon startup, precisely under the
+    /// resource pressure where inert-by-default matters most.
+    pub fn connect(
+        credential: OwnedSigningCredential,
+        endpoint: ObservatoryEndpoint,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<String>(CHANNEL_CAPACITY);
         let stats = Arc::new(EmitterStatsInner::default());
         let worker_stats = Arc::clone(&stats);
@@ -198,7 +213,7 @@ impl EdgeEventEmitterHandle {
             .name("veil-edge-event-emitter".to_string())
             .spawn(move || run_poster_loop(endpoint, receiver, worker_stats))?;
         Ok(Self {
-            key,
+            credential,
             sender: Some(sender),
             stats,
             enqueued: AtomicU64::new(0),
@@ -206,11 +221,12 @@ impl EdgeEventEmitterHandle {
         })
     }
 
-    /// The signing key this handle was built from, so the caller (`vg-audit`) can sign an
-    /// `EdgeEventRecordInput` with the exact same key without re-reading
-    /// `VEIL_RECEIPT_KEY` itself.
-    pub fn signing_key(&self) -> &ReceiptSigningKey {
-        &self.key
+    /// The signing credential this handle was built from, borrowed as the
+    /// [`SigningCredential`] [`super::signing::sign_edge_event_record`] takes directly, so
+    /// the caller (`vg-audit`) can sign an `EdgeEventRecordInput` with the exact credential
+    /// this handle was built from without re-resolving it.
+    pub fn credential(&self) -> SigningCredential<'_> {
+        self.credential.as_ref()
     }
 
     /// Hands `canonical_json` (a [`super::signing::SignedEdgeEventRecord::canonical_json`])
@@ -440,49 +456,121 @@ async fn post_edge_event_inner(
 /// [`VEIL_OBSERVATORY_ENDPOINT_ENV_VAR`] from the process environment and, if both are
 /// present and valid, builds a live [`EdgeEventEmitterHandle`]. Returns `Ok(None)` — never
 /// an error — if either var is absent: see this module's own doc for why that's a
-/// structural, not merely conventional, opt-out.
+/// structural, not merely conventional, opt-out. A thin wrapper — see
+/// [`edge_event_emitter_from_env_with_credential`], the `None` case of which this is.
 pub fn edge_event_emitter_from_env() -> Result<Option<EdgeEventEmitterHandle>, EmitterInitError> {
+    edge_event_emitter_from_env_with_credential(None)
+}
+
+/// Like [`edge_event_emitter_from_env`], but lets the caller supply an already-resolved
+/// signing credential instead of sourcing one from [`VEIL_RECEIPT_KEY_ENV_VAR`] — e.g. a
+/// real device certificate a caller (`vg-adapters-claude::runtime::Engine::open`) found in
+/// the OS keychain. [`VEIL_OBSERVATORY_ENDPOINT_ENV_VAR`] is read either way — the
+/// transport endpoint is orthogonal to which credential signs, and stays required
+/// regardless of the credential's source.
+///
+/// `credential = None` reproduces [`edge_event_emitter_from_env`]'s exact behavior,
+/// including reading [`VEIL_RECEIPT_KEY_ENV_VAR`]. `credential = Some(..)` skips that read
+/// entirely (not merely ignores its value — see this function's own body) and narrows the
+/// opt-in gate from "both vars present" to "endpoint present."
+pub fn edge_event_emitter_from_env_with_credential(
+    credential: Option<OwnedSigningCredential>,
+) -> Result<Option<EdgeEventEmitterHandle>, EmitterInitError> {
+    // `VEIL_RECEIPT_KEY_ENV_VAR` is only actually read (the `std::env::var` call made) when
+    // no credential was supplied -- not merely read-then-ignored. When a credential *is*
+    // supplied, this is a `Err(NotPresent)` placeholder `build_edge_event_emitter`'s own
+    // `Some(credential)` arm never inspects.
+    let key_var = if credential.is_none() {
+        std::env::var(VEIL_RECEIPT_KEY_ENV_VAR)
+    } else {
+        Err(std::env::VarError::NotPresent)
+    };
     build_edge_event_emitter(
-        std::env::var(VEIL_RECEIPT_KEY_ENV_VAR),
+        credential,
+        key_var,
         std::env::var(VEIL_OBSERVATORY_ENDPOINT_ENV_VAR),
     )
 }
 
-/// The testable core of [`edge_event_emitter_from_env`]: given the two env vars' already-
-/// read raw results, decides whether to build an emitter at all and, if so, builds it.
-/// Split out for the same parallel-`cargo test`-safety reason
-/// `signing::parse_receipt_signing_key` was: lets a test exercise every branch (both
-/// unset, one unset, both set-and-valid, both set-and-invalid) without mutating real
+/// Classifies one env var's already-read result into presence (`Option`) fully
+/// decoupled from validity (`Result`): `None` means "not set" (`VarError::NotPresent`);
+/// `Some(Ok(v))` means "set, to valid UTF-8"; `Some(Err(_))` means "set, but not valid
+/// UTF-8." Exists so a caller can gate on *presence alone* for two vars together
+/// without either var's own invalidity ever short-circuiting ahead of the other var's
+/// simple absence — see `build_edge_event_emitter`'s own doc on the doubt-driven-
+/// development finding this fixes.
+fn classify_env_var(
+    var: Result<String, std::env::VarError>,
+    if_not_unicode: EmitterInitError,
+) -> Option<Result<String, EmitterInitError>> {
+    match var {
+        Ok(v) => Some(Ok(v)),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some(Err(if_not_unicode)),
+    }
+}
+
+/// The testable core of [`edge_event_emitter_from_env_with_credential`]: given an optional
+/// already-resolved credential plus the two env vars' already-read raw results, decides
+/// whether to build an emitter at all and, if so, builds it. Split out for the same
+/// parallel-`cargo test`-safety reason `signing::parse_receipt_signing_key` was: lets a
+/// test exercise every branch (both unset, one unset, both set-and-valid, both
+/// set-and-invalid, credential-supplied-with-and-without-endpoint) without mutating real
 /// process environment state.
 fn build_edge_event_emitter(
+    credential: Option<OwnedSigningCredential>,
     key_var: Result<String, std::env::VarError>,
     endpoint_var: Result<String, std::env::VarError>,
 ) -> Result<Option<EdgeEventEmitterHandle>, EmitterInitError> {
-    use std::env::VarError;
+    let endpoint_state = classify_env_var(endpoint_var, EmitterInitError::EndpointEnvVarNotUnicode);
 
-    let key_raw = match key_var {
-        Ok(v) => Some(v),
-        Err(VarError::NotPresent) => None,
-        Err(VarError::NotUnicode(_)) => return Err(EmitterInitError::KeyEnvVarNotUnicode),
-    };
-    let endpoint_raw = match endpoint_var {
-        Ok(v) => Some(v),
-        Err(VarError::NotPresent) => None,
-        Err(VarError::NotUnicode(_)) => return Err(EmitterInitError::EndpointEnvVarNotUnicode),
+    let credential = match credential {
+        // `key_var` deliberately never matched on in this arm -- proves (by control flow,
+        // the same discipline `both_env_vars_unset_is_a_structural_no_op` already uses for
+        // a different guarantee) that a supplied credential really does bypass
+        // `VEIL_RECEIPT_KEY_ENV_VAR`, not merely happen to take precedence over a valid one.
+        Some(credential) => credential,
+        None => {
+            let key_state = classify_env_var(key_var, EmitterInitError::KeyEnvVarNotUnicode);
+            // The opt-in gate for the no-credential path, restored to match the
+            // pre-auto-detect behavior exactly: gate on key AND endpoint *both* being
+            // present -- checked as presence alone, via `classify_env_var`'s `Option`
+            // layer, before either one's *validity* (the inner `Result`) is inspected
+            // at all. Two doubt-driven-development findings live in this one gate:
+            // (1) an earlier version attempted to parse a present-but-malformed key
+            // before checking the endpoint's presence at all, so a stale malformed key
+            // plus a never-configured endpoint surfaced a real `Err` instead of the
+            // documented silent `Ok(None)`; (2) a version fixing that still let either
+            // var's `NotUnicode` case return early *before* the other var's presence was
+            // checked (both `classify_env_var` calls happened, but each matched on its
+            // own `NotUnicode` arm immediately) -- so "endpoint unset + key set to
+            // non-UTF-8" (or the symmetric case) still incorrectly returned `Err`
+            // instead of `Ok(None)`. Gating on the `Option` layer of both classified
+            // values together, before ever unwrapping either inner `Result`, closes
+            // both at once: neither var's invalidity can be inspected until both are
+            // confirmed present.
+            let (Some(key_result), Some(_)) = (key_state, &endpoint_state) else {
+                return Ok(None);
+            };
+            let key_raw = key_result?;
+            let key =
+                parse_receipt_signing_key(Some(key_raw)).map_err(EmitterInitError::Signing)?;
+            OwnedSigningCredential::Hmac(key)
+        }
     };
 
-    // The opt-in gate itself: *either* var absent is a documented no-op, full stop --
-    // this branch returns before `EdgeEventEmitterHandle::connect` (channel + thread +
-    // client construction) is ever reached, which is exactly the structural guarantee
-    // this module's doc comment describes.
-    let (key_raw, endpoint_raw) = match (key_raw, endpoint_raw) {
-        (Some(k), Some(e)) => (k, e),
-        _ => return Ok(None),
+    // The endpoint gate applies regardless of the credential's source -- transport is
+    // opted into separately from signing. For the no-credential path above, this is
+    // provably unreachable as a `None` (already gated on both being present before
+    // parsing the key) -- kept anyway, both for the credential-supplied path (where
+    // this is the only gate) and so this function's own control flow doesn't rely on
+    // an invariant enforced fifty lines away.
+    let Some(endpoint_result) = endpoint_state else {
+        return Ok(None);
     };
-
-    let key = parse_receipt_signing_key(Some(key_raw)).map_err(EmitterInitError::Signing)?;
+    let endpoint_raw = endpoint_result?;
     let endpoint = parse_observatory_endpoint(&endpoint_raw)?;
-    let handle = EdgeEventEmitterHandle::connect(key, endpoint)
+    let handle = EdgeEventEmitterHandle::connect(credential, endpoint)
         .map_err(EmitterInitError::ThreadSpawnFailed)?;
     Ok(Some(handle))
 }
@@ -511,8 +599,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    use super::super::signing::ReceiptSigningKey;
+
     fn sample_key() -> ReceiptSigningKey {
         ReceiptSigningKey::from_bytes(vec![7u8; 32]).unwrap()
+    }
+
+    fn sample_credential() -> OwnedSigningCredential {
+        OwnedSigningCredential::Hmac(sample_key())
     }
 
     // -- opt-in gating (structural, not merely behavioural) --
@@ -525,6 +619,7 @@ mod tests {
         // therefore the channel, the background thread, and the HTTP client -- is never
         // reached, not merely that nothing ends up being sent.
         let result = build_edge_event_emitter(
+            None,
             Err(std::env::VarError::NotPresent),
             Err(std::env::VarError::NotPresent),
         );
@@ -533,14 +628,43 @@ mod tests {
 
     #[test]
     fn key_set_but_endpoint_unset_is_still_a_no_op() {
-        let result =
-            build_edge_event_emitter(Ok("ab".repeat(32)), Err(std::env::VarError::NotPresent));
+        let result = build_edge_event_emitter(
+            None,
+            Ok("ab".repeat(32)),
+            Err(std::env::VarError::NotPresent),
+        );
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// A doubt-driven-development regression test: an earlier version of
+    /// `build_edge_event_emitter` checked "is a key present" and, if so, parsed it
+    /// (which can itself fail on malformed hex) *before* checking whether the endpoint
+    /// was present at all -- so a process that had never opted in to telemetry (no
+    /// endpoint configured) but happened to have a stale, malformed `VEIL_RECEIPT_KEY`
+    /// left over in its environment got a real `Err` instead of the documented silent
+    /// `Ok(None)`. A malformed-but-*valid-length* key on its own must never surface as
+    /// an error unless the endpoint is also actually present -- matching
+    /// `key_set_but_endpoint_unset_is_still_a_no_op` above, but with an invalid key
+    /// value instead of a valid one, so this test would have failed against the buggy
+    /// reordering even though that test alone did not.
+    #[test]
+    fn malformed_key_with_endpoint_unset_is_still_a_no_op_not_an_error() {
+        let result = build_edge_event_emitter(
+            None,
+            Ok("not-hex".to_string()),
+            Err(std::env::VarError::NotPresent),
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "a malformed key must not surface as an error when the endpoint was never \
+             configured"
+        );
     }
 
     #[test]
     fn endpoint_set_but_key_unset_is_still_a_no_op() {
         let result = build_edge_event_emitter(
+            None,
             Err(std::env::VarError::NotPresent),
             Ok("http://127.0.0.1:8787/v1/edge-events".to_string()),
         );
@@ -550,6 +674,7 @@ mod tests {
     #[test]
     fn both_set_and_valid_builds_a_live_handle() {
         let result = build_edge_event_emitter(
+            None,
             Ok("ab".repeat(32)),
             Ok("http://127.0.0.1:8787/v1/edge-events".to_string()),
         );
@@ -559,6 +684,7 @@ mod tests {
     #[test]
     fn both_set_but_key_invalid_is_a_real_error_not_a_silent_no_op() {
         let result = build_edge_event_emitter(
+            None,
             Ok("not-hex".to_string()),
             Ok("http://127.0.0.1:8787/v1/edge-events".to_string()),
         );
@@ -567,8 +693,39 @@ mod tests {
 
     #[test]
     fn both_set_but_endpoint_missing_scheme_is_a_real_error() {
-        let result = build_edge_event_emitter(Ok("ab".repeat(32)), Ok("not a url".to_string()));
+        let result =
+            build_edge_event_emitter(None, Ok("ab".repeat(32)), Ok("not a url".to_string()));
         assert!(result.is_err());
+    }
+
+    // -- credential-supplied path (auto-detect: a resolved credential bypasses the env key) --
+
+    #[test]
+    fn supplied_credential_with_endpoint_set_builds_a_live_handle_and_never_reads_the_key_var() {
+        // `key_var` is `NotUnicode` -- if `build_edge_event_emitter`'s `Some(credential)`
+        // arm inspected it at all, this would return `Err(KeyEnvVarNotUnicode)`. Getting
+        // `Ok(Some(_))` instead proves the key var is structurally never matched on, not
+        // merely that a valid credential takes precedence over a valid key.
+        let poisoned_key_var = Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+            "not utf-8 if this were ever decoded",
+        )));
+        let result = build_edge_event_emitter(
+            Some(sample_credential()),
+            poisoned_key_var,
+            Ok("http://127.0.0.1:8787/v1/edge-events".to_string()),
+        );
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    #[test]
+    fn supplied_credential_with_endpoint_unset_is_still_a_no_op() {
+        // The endpoint gate applies regardless of the credential's source.
+        let result = build_edge_event_emitter(
+            Some(sample_credential()),
+            Err(std::env::VarError::NotPresent),
+            Err(std::env::VarError::NotPresent),
+        );
+        assert!(matches!(result, Ok(None)));
     }
 
     #[test]
@@ -638,7 +795,7 @@ mod tests {
         let (addr, rx) = spawn_single_request_test_server();
         let endpoint: ObservatoryEndpoint =
             format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
+        let handle = EdgeEventEmitterHandle::connect(sample_credential(), endpoint).unwrap();
 
         let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
         assert!(handle.try_emit(sent_body.clone()));
@@ -676,7 +833,7 @@ mod tests {
         let sent_body = r#"{"envelope":{},"edge_event":{}}"#.to_string();
 
         {
-            let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
+            let handle = EdgeEventEmitterHandle::connect(sample_credential(), endpoint).unwrap();
             assert!(handle.try_emit(sent_body.clone()));
             // `handle` drops here, at the end of this block -- no `wait_for`, no sleep.
         }
@@ -700,7 +857,7 @@ mod tests {
         };
         let endpoint: ObservatoryEndpoint =
             format!("http://{addr}/v1/edge-events").parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
+        let handle = EdgeEventEmitterHandle::connect(sample_credential(), endpoint).unwrap();
 
         let started = std::time::Instant::now();
         let queued = handle.try_emit("{}".to_string());
@@ -732,7 +889,7 @@ mod tests {
         // documentation/testing, guaranteed unroutable, so the connect attempt blocks
         // instead of getting a fast "connection refused."
         let endpoint: ObservatoryEndpoint = "http://192.0.2.1:9/v1/edge-events".parse().unwrap();
-        let handle = EdgeEventEmitterHandle::connect(sample_key(), endpoint).unwrap();
+        let handle = EdgeEventEmitterHandle::connect(sample_credential(), endpoint).unwrap();
 
         let mut queued = 0;
         let mut dropped = 0;

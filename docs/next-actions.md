@@ -448,14 +448,27 @@ needs from it is named in the item below.
       by this work. Blocks `veil-proxy`'s receipt-signing work and `veil-observatory`'s
       bypass-detection rule until both the custodian builds the real endpoints and this repo
       wires the ECDSA path into `vg-audit::telemetry_sink` against a real credential.
-- [ ] **Wire the ECDSA signing path into production** (`vg-audit::telemetry_sink`), once a real
-      device signing key/certificate can actually be enrolled. Requires: `veil-custodian`'s ADR-S
-      endpoints built for real (see above); a decision on how the enrolled key+certificate first
-      lands in this device's OS keychain (`vg-vault::keychain::load_device_signing_credential` is
-      load-only by design — enrolment itself is out of scope, deliberately, per ADR-D/ADR-N: "a
-      device never calls this API"); and a policy/config surface to select `EcdsaP256` over the
-      current `Hmac` default (no such flag exists yet — `SigningCredential`'s two arms are chosen
-      by whichever value the caller constructs, not by config).
+- [x] **Build the policy/config surface to select `EcdsaP256` over the current `Hmac` default
+      (2026-08-31).** Auto-detect from credential presence, no explicit flag: `Engine::open`
+      (`vg-adapters-claude::runtime`) calls `vg_vault::load_device_signing_credential()` — gated
+      on `VEIL_OBSERVATORY_ENDPOINT` actually being set, so a process that never opted into
+      transport never touches the OS keychain for this — and passes the result down through a
+      new `OwnedSigningCredential` (owned-storage counterpart to the borrowing
+      `SigningCredential<'a>`) into `TelemetryCountingAuditSink::new`. `Ok(Some(cred))` signs
+      ECDSA; `Ok(None)` (not yet enrolled — today's universal case) or `Err` (genuine
+      misconfiguration, logged and never fatal to `Engine::open`) falls back to the existing
+      `VEIL_RECEIPT_KEY`-sourced HMAC path unchanged. Hardened by a single-model +
+      Codex doubt-driven-development round (4 + 5 findings, all fixed) — see `docs/decisions.md`'s
+      2026-08-31 entry.
+- [ ] **Wire the ECDSA signing path into production against a *real* issued credential**, once a
+      device signing key/certificate can actually be enrolled. The auto-detect plumbing above is
+      real and tested (via the existing `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
+      env-var test seam), but no enrolment flow exists yet, so `Ok(None)` — HMAC fallback — is
+      still every real device's outcome today. Requires: `veil-custodian`'s ADR-S endpoints built
+      for real (see above); and a decision on how the enrolled key+certificate first lands in this
+      device's OS keychain (`vg-vault::keychain::load_device_signing_credential` is load-only by
+      design — enrolment itself is out of scope, deliberately, per ADR-D/ADR-N: "a device never
+      calls this API").
 - [ ] **Decide whether `Envelope::device_ref` should be populated from
       `DeviceSigningCredential::device_ref()` when signing with ECDSA**, rather than staying tied
       to the separate, still-always-`None` `EdgeEventRecordInput::device_ref` (ratified Q1 gates
@@ -464,13 +477,14 @@ needs from it is named in the item below.
       identity that signing never uses — not a bug (nothing currently depends on it), but a real
       design question once the ECDSA path is actually wired into production (item above).
       `docs/decisions.md`'s 2026-08-31 entry has the full finding.
-- [ ] **Report two findings back to `veil-custodian`**, surfaced during ADR-S's acceptance review
+- [x] **Report two findings back to `veil-custodian`**, surfaced during ADR-S's acceptance review
       (2026-08-31): `docs/api/openapi.yaml`'s 201 example `certificate_fingerprint` value doesn't
       match its own `^[a-f0-9]{64}$` pattern (will fail an example-validating linter); and
       `src/domain/pseudonym.rs`'s module docstring still claims the `dev_`-prefixed wire form
       "matches veilgremlin's `DeviceRef` exactly" — the 2026-08-30 correction pass fixed this
       claim in `decisions.md` and `docs/api/README.md` but missed this file. Both cosmetic, not
-      blocking, no urgency.
+      blocking, no urgency. Fixed in `veil-custodian` PR #18 (branch
+      `agent/claude/adr-s-cosmetic-fixes`), open as of 2026-08-31, not yet merged.
 - [ ] **Get ADR-S's signature encoding decided jointly, not unilaterally.** This repo chose raw
       `r||s` (64 bytes) over DER for the ECDSA signature wire encoding — ADR-S itself has no
       opinion (`veil-custodian`'s own fixtures README says so explicitly) — because a byte-exact

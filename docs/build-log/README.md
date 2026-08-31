@@ -62,3 +62,4 @@ That can grow into a published site later if it earns one — see
 - [2026-08-29 — The same string, two different keys](2026-08-29-the-same-string-two-different-keys.md)
 - [2026-08-30 — A guarantee the tests never tested](2026-08-30-a-guarantee-the-tests-never-tested.md)
 - [2026-08-31 — The cast that always agreed](2026-08-31-the-cast-that-always-agreed.md)
+- [2026-08-31 — The same gate, broken twice](2026-08-31-the-same-gate-broken-twice.md)

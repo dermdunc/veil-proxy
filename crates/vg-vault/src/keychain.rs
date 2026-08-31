@@ -138,14 +138,21 @@ const DEVICE_SIGNING_CERT_ENV: &str = "VG_DEVICE_SIGNING_CERT_PEM";
 /// keychain. **Load-only, never load-or-create** — unlike every other loader in this
 /// file, there is no legitimate "generate one locally" fallback: only `veil-custodian`'s
 /// CA can issue a certificate for a signing key, so a missing entry is a typed absence
-/// (device not yet enrolled), not a trigger to fabricate one.
+/// (device not yet enrolled), not a trigger to fabricate one — reflected in the return
+/// type itself: `Ok(None)` means "not enrolled yet" (today's universal case, since no
+/// real enrolment flow exists), reserving `Err` for a *genuine* misconfiguration (a
+/// partially-set env seam, a certificate entry missing while the key entry exists, a
+/// malformed value, or a key/certificate mismatch) — distinguishable by callers without
+/// string-matching `VaultError::Crypto`'s message text, which every other failure path
+/// here still uses (that error type is deliberately frozen at three variants; see
+/// `vg-core`'s own doc on it).
 ///
 /// Cross-checks the loaded private key's own public half against the certificate's
 /// `SubjectPublicKeyInfo` before returning — catching a keychain left in an inconsistent
 /// state (e.g. a certificate re-issued after key rotation without the matching private
 /// key entry being updated) here, at load time, rather than as a mysterious signature
 /// -verification failure far downstream.
-pub fn load_device_signing_credential() -> Result<DeviceSigningCredential, VaultError> {
+pub fn load_device_signing_credential() -> Result<Option<DeviceSigningCredential>, VaultError> {
     let (key_hex, cert_pem) = match (
         std::env::var(DEVICE_SIGNING_KEY_ENV),
         std::env::var(DEVICE_SIGNING_CERT_ENV),
@@ -164,14 +171,14 @@ pub fn load_device_signing_credential() -> Result<DeviceSigningCredential, Vault
             let cert_entry = Entry::new(DEVICE_SIGNING_CERT_SERVICE, DEVICE_SIGNING_ACCOUNT)
                 .map_err(|e| crypto_err(format!("keychain entry init failed: {e}")))?;
 
-            let key_hex = key_entry.get_password().map_err(|e| match e {
-                KeyringError::NoEntry => crypto_err(
-                    "no device signing key in the OS keychain -- this device has not been \
-                     enrolled for telemetry signing (ADR-S); this loader never mints one \
-                     itself, only the custodian CA can issue one",
-                ),
-                e => crypto_err(format!("keychain read failed: {e}")),
-            })?;
+            let key_hex = match key_entry.get_password() {
+                Ok(v) => v,
+                // Not yet enrolled -- the expected, universal-today state. Distinct from
+                // every other branch in this function: this is the one case that reports
+                // absence as `Ok(None)`, not `Err`.
+                Err(KeyringError::NoEntry) => return Ok(None),
+                Err(e) => return Err(crypto_err(format!("keychain read failed: {e}"))),
+            };
             let cert_pem = cert_entry.get_password().map_err(|e| match e {
                 KeyringError::NoEntry => crypto_err(
                     "device signing key exists in the OS keychain but its certificate does \
@@ -209,11 +216,11 @@ pub fn load_device_signing_credential() -> Result<DeviceSigningCredential, Vault
         ));
     }
 
-    Ok(DeviceSigningCredential::from_parts(
+    Ok(Some(DeviceSigningCredential::from_parts(
         signing_key,
         &validated.der,
         validated.device_ref,
-    ))
+    )))
 }
 
 /// Returns a zeroize-on-drop hex `String` — a doubt-driven-development finding (Codex
@@ -351,7 +358,10 @@ mod tests {
         // *matching* credential through end to end, which the public-key cross-check
         // below (implicitly, by the happy path not erroring) and the `device_ref` check
         // together establish.
-        let credential = happy_path.unwrap();
+        let credential = happy_path.unwrap().expect(
+            "the env seam supplies both key and cert, so this must be Some, never the \
+             not-yet-enrolled Ok(None) case",
+        );
         let expected_device_bytes = decode_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let expected_device_ref =
             vg_core::telemetry::DeviceRef::try_from(expected_device_bytes.as_slice()).unwrap();

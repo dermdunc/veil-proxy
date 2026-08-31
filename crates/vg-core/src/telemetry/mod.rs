@@ -97,8 +97,9 @@ mod signing;
 pub use alert::{Alert, Severity};
 pub use edge_event::EdgeEvent;
 pub use emitter::{
-    edge_event_emitter_from_env, EdgeEventEmitterHandle, EmitterInitError, EmitterStats,
-    ObservatoryEndpoint, VEIL_OBSERVATORY_ENDPOINT_ENV_VAR,
+    edge_event_emitter_from_env, edge_event_emitter_from_env_with_credential,
+    EdgeEventEmitterHandle, EmitterInitError, EmitterStats, ObservatoryEndpoint,
+    VEIL_OBSERVATORY_ENDPOINT_ENV_VAR,
 };
 pub use envelope::{Envelope, EnvelopeInvariantError, Integrity, SchemaVersion, SigningAlgorithm};
 pub use ids::{
@@ -114,8 +115,8 @@ pub use receipt::{
 pub use reject::TelemetryReject;
 pub use signing::{
     load_receipt_signing_key_from_env, sign_edge_event_record, DeviceSigningCredential,
-    EdgeEventRecordInput, ReceiptSigningKey, SignedEdgeEventRecord, SigningCredential,
-    SigningError, MIN_SIGNING_KEY_LEN, VEIL_RECEIPT_KEY_ENV_VAR,
+    EdgeEventRecordInput, OwnedSigningCredential, ReceiptSigningKey, SignedEdgeEventRecord,
+    SigningCredential, SigningError, MIN_SIGNING_KEY_LEN, VEIL_RECEIPT_KEY_ENV_VAR,
 };
 
 use crate::audit::AuditEvent;
