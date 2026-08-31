@@ -3970,3 +3970,93 @@ consumes one once it's there.
 warnings`, `cargo fmt --all --check`, `cargo test --workspace --locked` (36 test binaries, 0
 failures), `cargo deny check` (advisories/bans/licenses/sources all ok), and `cargo audit` all
 clean.
+
+## 2026-08-31 — Config surface for selecting `EcdsaP256` over `Hmac`: auto-detect from credential presence, no explicit flag
+
+`docs/next-actions.md` had flagged, since the ADR-S session earlier the same day, that the real
+ECDSA-P256 signing path built there had no way to actually be selected in production — telemetry
+was still wired to HMAC only. Interviewed on scope and mechanism before building: confirmed
+"design + implement the plumbing now" (not design-only) and "auto-detect from credential
+presence" over an explicit config flag — a real device signing credential sitting in the OS
+keychain *is* the signal; there is no separate knob to keep in sync with what's actually
+enrolled, and nothing to misconfigure by leaving stale.
+
+**Structural constraint, from the existing dependency graph:** `vg-audit` (owns the emitter/
+signing call site) does not depend on `vg-vault` (owns OS-keychain access) — only
+`vg-adapters-claude` depends on both. So the credential lookup lives in `Engine::open`
+(`vg-adapters-claude::runtime`), the same place `ActorPseudonymKey` is already resolved, and the
+result is passed down into `vg-audit`'s constructor — not looked up inside `vg-audit` or
+`vg-core` themselves.
+
+**What was built:**
+
+- `vg-core::telemetry::signing::OwnedSigningCredential` — an owned-storage counterpart to the
+  existing borrowing `SigningCredential<'a>` (which stays borrowing, unchanged: it exists for the
+  short-lived `sign_edge_event_record` call, not long-lived storage). `as_ref()` bridges the two.
+- `EdgeEventEmitterHandle` now holds an `OwnedSigningCredential` instead of a bare
+  `ReceiptSigningKey`; `edge_event_emitter_from_env_with_credential(Option<OwnedSigningCredential>)`
+  is the new entry point — `Some` skips `VEIL_RECEIPT_KEY` entirely but still requires
+  `VEIL_OBSERVATORY_ENDPOINT` (transport opt-in is orthogonal to which credential signs).
+  `edge_event_emitter_from_env()` (every existing caller) becomes a one-line `None` wrapper —
+  byte-for-byte unchanged behavior.
+- `vg-vault::keychain::load_device_signing_credential`'s return type sharpened from
+  `Result<DeviceSigningCredential, VaultError>` to `Result<Option<DeviceSigningCredential>,
+  VaultError>` — splits "not yet enrolled" (`Ok(None)`, today's universal case, since no real
+  enrolment flow exists) from genuine misconfiguration (`Err`), which previously both surfaced as
+  the same `VaultError::Crypto(String)` shape. A breaking change to a function merged hours
+  earlier in PR #61 — acceptable, no real callers yet besides its own tests.
+- `Engine::open`: after resolving `actor_key`, and gated on `VEIL_OBSERVATORY_ENDPOINT` actually
+  being set (so a process that never opted into transport never touches the OS keychain for
+  this), calls `load_device_signing_credential()`. `Ok(Some(cred))` → ECDSA;
+  `Ok(None)` or `Err` (logged, never fatal) → HMAC fallback, matching this file's existing
+  fail-open posture for the F3 provenance warning right above it.
+
+**Doubt-driven-development, two rounds, both offered and run (single-model, then Codex), 9
+findings total, all fixed:**
+
+Single-model round (4 findings):
+1. Real regression: the no-credential branch checked "is a key present" before checking whether
+   the endpoint was present at all, so a stale malformed `VEIL_RECEIPT_KEY` plus a
+   never-configured endpoint now surfaced a real `Err` instead of the documented silent
+   `Ok(None)` — reordered to gate on both being present before parsing either.
+2. Stale module doc in `signing.rs` still claimed HMAC was "not yet selected by any production
+   call site" — no longer true; corrected.
+3. Missing test coverage for `Engine::open`'s `Err`-fallback branch — added (later found
+   insufficient by the Codex round, see below).
+4. A stray untracked worktree (`.claude/worktrees/agent-a9869ec2363020f3e/`) noticed during
+   review — flagged to the user, not touched; not part of this task.
+
+Codex round (5 findings):
+1. The env-var `NotUnicode` checks for each var could still return `Err` before the *other*
+   var's mere presence was checked — pre-existing pattern (not a regression introduced this
+   session), but fixed while already inside this exact function: introduced `classify_env_var`,
+   decoupling presence (`Option`) from validity (`Result`) so the "both present" gate operates on
+   presence alone before either var's validity is inspected.
+2. `Engine::open` did the credential lookup unconditionally whenever `telemetry_enabled`, touching
+   the OS keychain (and potentially logging a spurious misconfiguration warning) even for
+   processes that never set `VEIL_OBSERVATORY_ENDPOINT` and therefore could never emit anything —
+   fixed by gating the lookup on the endpoint var's presence, as described above.
+3. The two new `Engine::open` tests each mutated the same process-global env vars
+   (`VAULT_KEY_ENV`/`ACTOR_PSEUDONYM_KEY_ENV`/the device-signing-seam vars), racing under
+   `cargo test`'s default parallel execution — merged into one test function,
+   `telemetry_auto_detect_selects_ecdsa_or_falls_back_to_hmac`, sequencing both cases.
+4. The fallback test only proved `Engine::open` didn't panic or error — not that HMAC signing
+   actually occurred. Strengthened: the merged test's fallback case now sets `VEIL_RECEIPT_KEY`
+   and the endpoint, and asserts the received wire record's `integrity.algorithm` is literally
+   `"HMAC_SHA_256"`.
+5. Stale doc comments in `vg-audit::telemetry_sink` (module doc and
+   `TelemetryCountingAuditSink::emitter`'s field doc) still claimed both `VEIL_RECEIPT_KEY` and
+   `VEIL_OBSERVATORY_ENDPOINT` are always required — corrected to describe the auto-detect
+   reality (endpoint plus *a* signing credential, either source).
+
+`cargo build --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D
+warnings`, `cargo fmt --all --check`, `cargo test --workspace --locked` (all green, including the
+new merged auto-detect test), `cargo deny check` (advisories/bans/licenses/sources all ok), and
+`cargo audit` (no vulnerabilities) all clean, re-run after all 9 fixes.
+
+**Out of scope, unchanged from ADR-S's own non-goals:** real credential enrolment (CSR
+generation, calling the custodian API). This session validated the auto-detect plumbing
+end-to-end only via the existing `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` env-var
+test seam — no real device has an enrolled credential yet, so `Ok(None)`/HMAC fallback remains
+every real device's outcome today. See `docs/next-actions.md` for what's still needed before that
+changes.

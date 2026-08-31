@@ -9,7 +9,7 @@
 
 use std::io;
 
-use vg_core::telemetry::TraceId;
+use vg_core::telemetry::{OwnedSigningCredential, TraceId};
 use vg_core::{
     mask as core_mask, rehydrate as core_rehydrate, scan as core_scan, Actor, ArtefactHint,
     AuditEvent, Context, Destination, Detector, EntityType, Finding, HandlingClass, Input,
@@ -185,9 +185,44 @@ impl Engine {
         let (audit, telemetry_sink): (Box<dyn vg_core::AuditSink>, Option<SharedTelemetrySink>) =
             if telemetry_enabled {
                 let actor_key = vg_vault::load_or_create_actor_pseudonym_key()?;
+                // Auto-detect: a real device signing credential in the OS keychain wins
+                // over the default HMAC-from-`VEIL_RECEIPT_KEY` path -- no explicit flag,
+                // since the credential's presence is itself the signal (ADR-S,
+                // `docs/decisions.md`). `Ok(None)` (not yet enrolled) is today's universal,
+                // expected case and stays silent; only a genuine misconfiguration logs a
+                // warning, and even then this falls back rather than aborting `Engine::open`
+                // -- a credential-lookup problem must never take down the whole engine over
+                // what is still an opt-in, best-effort telemetry feature.
+                //
+                // Gated on the endpoint var being set at all (a doubt-driven-development
+                // finding): every process with `telemetry_enabled: true` reaches this branch
+                // regardless of whether it ever opted into the transport side, so an
+                // unconditional keychain lookup here would touch the OS keychain -- and
+                // potentially log a spurious misconfiguration warning -- for processes that
+                // never intend to emit telemetry at all (no `VEIL_OBSERVATORY_ENDPOINT`, so
+                // `edge_event_emitter_from_env_with_credential` was always going to return
+                // `Ok(None)` regardless of the credential passed in).
+                let device_credential =
+                    if std::env::var(vg_core::telemetry::VEIL_OBSERVATORY_ENDPOINT_ENV_VAR).is_ok()
+                    {
+                        match vg_vault::load_device_signing_credential() {
+                            Ok(Some(cred)) => Some(OwnedSigningCredential::EcdsaP256(cred)),
+                            Ok(None) => None,
+                            Err(e) => {
+                                eprintln!(
+                                "veilgremlin: WARNING device signing credential misconfigured, \
+                                 falling back to HMAC: {e}"
+                            );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 let sink = SharedTelemetrySink::new(TelemetryCountingAuditSink::new(
                     Box::new(plain_audit),
                     actor_key,
+                    device_credential,
                 ));
                 (Box::new(sink.clone()), Some(sink))
             } else {
@@ -498,5 +533,218 @@ mod telemetry_wiring_tests {
             1,
             "the denial's DemaskDecision must have converted Ok via the actor-key entry point"
         );
+    }
+
+    // -- auto-detect: a real device signing credential wins over the HMAC default --
+
+    const DEVICE_SIGNING_KEY_ENV: &str = "VG_DEVICE_SIGNING_KEY_HEX";
+    const DEVICE_SIGNING_CERT_ENV: &str = "VG_DEVICE_SIGNING_CERT_PEM";
+    /// The exact matching (key, certificate) pair `vg-vault`'s own
+    /// `keychain::tests::device_signing_credential_env_seam_round_trips_and_rejects_mismatches`
+    /// test uses — reused here rather than generating a second pair, since this test's
+    /// only job is proving `Engine::open` wires whatever `vg_vault::load_device_signing_credential`
+    /// returns through to a real signed wire record, not re-proving that function's own
+    /// correctness (already covered by `vg-vault`'s own test suite).
+    const DEVICE_SIGNING_KEY_HEX: &str =
+        "d2fabd5b420e79a77994de5154396484ae1b260dabecb100eae9b01cc2785fd0";
+    const DEVICE_SIGNING_CERT_PEM: &str =
+        include_str!("../../vg-vault/tests/fixtures/loader_matching_certificate.pem");
+
+    /// Unsets every env var this test touches, unconditionally, on drop -- same
+    /// `EnvVarGuard` reasoning as above, extended to the two device-signing-credential
+    /// seam vars and the emitter's own two env vars this test also sets.
+    struct AutoDetectEnvVarGuard;
+
+    impl Drop for AutoDetectEnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(VAULT_KEY_ENV);
+                std::env::remove_var(ACTOR_PSEUDONYM_KEY_ENV);
+                std::env::remove_var(DEVICE_SIGNING_KEY_ENV);
+                std::env::remove_var(DEVICE_SIGNING_CERT_ENV);
+                std::env::remove_var(vg_core::telemetry::VEIL_RECEIPT_KEY_ENV_VAR);
+                std::env::remove_var(vg_core::telemetry::VEIL_OBSERVATORY_ENDPOINT_ENV_VAR);
+            }
+        }
+    }
+
+    /// A minimal, single-request HTTP/1.1 server -- the same shape `vg-core::telemetry::emitter`'s
+    /// and `vg-audit::telemetry_sink`'s own test servers use, duplicated rather than
+    /// shared (each crate's own test-only helper, matching existing precedent), since
+    /// this crate has no other reason to depend on `hyper` for a server role.
+    fn spawn_single_request_test_server(
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (headers_end, content_length) = loop {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_text = String::from_utf8_lossy(&buf[..pos]);
+                    let len = header_text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break (pos + 4, len);
+                }
+            };
+            while buf.len() < headers_end + content_length {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = buf[headers_end..headers_end + content_length].to_vec();
+            let _ = tx.send(body);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+        });
+        (addr, rx)
+    }
+
+    /// Triggers the same hard-deny path every other telemetry test in this module uses
+    /// (a real `AuditEvent::DemaskDecision` write, guaranteed to convert `Ok` via the
+    /// actor-key entry point) and returns the raw body the test server received.
+    fn trigger_and_receive(
+        engine: &Engine,
+        rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> serde_json::Value {
+        let pack = MaskedPack {
+            text: String::new(),
+            mapping_refs: Vec::new(),
+            bindings: Vec::new(),
+            stats: vg_core::MaskStats {
+                counts: vg_core::EntityCounts::default(),
+                blocked_artefacts: 0,
+            },
+            policy_version: engine.policy_version(),
+        };
+        let actor = Actor {
+            id: vg_core::ActorId("test-actor".to_string()),
+            roles: Vec::new(),
+        };
+        let _ = engine.rehydrate(
+            &pack,
+            engine.namespace(),
+            Destination::RemoteModelPrompt,
+            &actor,
+        );
+        let received_body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("test server never received the emitted record");
+        serde_json::from_slice(&received_body).expect("received body must be valid JSON")
+    }
+
+    /// Covers both the real-credential and genuinely-misconfigured branches of the
+    /// `Engine::open` auto-detect gate in a single test function -- a doubt-driven-
+    /// development finding: two separate `#[test]` functions each mutating the same
+    /// process-global `VAULT_KEY_ENV`/`ACTOR_PSEUDONYM_KEY_ENV`/device-signing-seam vars
+    /// race under `cargo test`'s default parallel execution, the same hazard this
+    /// module's own `AutoDetectEnvVarGuard` comment already names for the vars it
+    /// unsets. Sequencing both cases inside one function, each behind its own
+    /// `AutoDetectEnvVarGuard` scope, removes the race outright rather than relying on
+    /// test-binary scheduling luck.
+    ///
+    /// The misconfigured case is also strengthened here versus its original form: it now
+    /// sets `VEIL_RECEIPT_KEY` and the endpoint, and asserts the wire record is actually
+    /// `HMAC_SHA_256` -- not merely that `Engine::open` doesn't panic or error. Proving
+    /// only "didn't crash" would have passed even if the fallback silently produced no
+    /// emitter at all, which is a materially weaker guarantee than the one this test's
+    /// name claims.
+    #[test]
+    fn telemetry_auto_detect_selects_ecdsa_or_falls_back_to_hmac() {
+        // -- case 1: a real device signing credential in the OS keychain (env seam) wins --
+        {
+            let (addr, rx) = spawn_single_request_test_server();
+            unsafe {
+                std::env::set_var(VAULT_KEY_ENV, TEST_KEY_HEX);
+                std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
+                std::env::set_var(DEVICE_SIGNING_KEY_ENV, DEVICE_SIGNING_KEY_HEX);
+                std::env::set_var(DEVICE_SIGNING_CERT_ENV, DEVICE_SIGNING_CERT_PEM);
+                // `VEIL_RECEIPT_KEY` is deliberately left unset: the whole point of this
+                // case is proving the device credential is used *without* an HMAC key
+                // ever being configured, not merely that it's preferred over one.
+                std::env::set_var(
+                    vg_core::telemetry::VEIL_OBSERVATORY_ENDPOINT_ENV_VAR,
+                    format!("http://{addr}/v1/edge-events"),
+                );
+            }
+            let _cleanup = AutoDetectEnvVarGuard;
+
+            let (_dir, engine) = open_engine_in_temp_dir(Some(r#"{"telemetry_enabled": true}"#));
+            let value = trigger_and_receive(&engine, &rx);
+            assert_eq!(
+                value["envelope"]["integrity"]["algorithm"],
+                serde_json::json!("ECDSA_SHA_256"),
+                "a real device signing credential in the OS keychain (env seam) must be \
+                 auto-detected and used, in preference to the unset VEIL_RECEIPT_KEY HMAC \
+                 path"
+            );
+        }
+
+        // -- case 2: a genuinely misconfigured credential falls back to real HMAC signing --
+        {
+            // A valid-shaped but non-matching P-256 scalar -- `vg-vault`'s own
+            // `keychain::tests` module uses this exact value for the identical purpose
+            // (forcing the public-key/certificate cross-check to fail, not a
+            // malformed-input error), reused rather than inventing a second one.
+            const MISMATCHED_KEY_HEX: &str =
+                "0909090909090909090909090909090909090909090909090909090909090909";
+
+            let (addr, rx) = spawn_single_request_test_server();
+            unsafe {
+                std::env::set_var(VAULT_KEY_ENV, TEST_KEY_HEX);
+                std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
+                std::env::set_var(DEVICE_SIGNING_KEY_ENV, MISMATCHED_KEY_HEX);
+                std::env::set_var(DEVICE_SIGNING_CERT_ENV, DEVICE_SIGNING_CERT_PEM);
+                std::env::set_var(vg_core::telemetry::VEIL_RECEIPT_KEY_ENV_VAR, TEST_KEY_HEX);
+                std::env::set_var(
+                    vg_core::telemetry::VEIL_OBSERVATORY_ENDPOINT_ENV_VAR,
+                    format!("http://{addr}/v1/edge-events"),
+                );
+            }
+            let _cleanup = AutoDetectEnvVarGuard;
+
+            let (_dir, engine) = open_engine_in_temp_dir(Some(r#"{"telemetry_enabled": true}"#));
+            let value = trigger_and_receive(&engine, &rx);
+            assert_eq!(
+                value["envelope"]["integrity"]["algorithm"],
+                serde_json::json!("HMAC_SHA_256"),
+                "a genuinely misconfigured device credential (key/certificate mismatch) \
+                 must fall back to real HMAC signing via VEIL_RECEIPT_KEY, not merely \
+                 leave Engine::open able to start without crashing"
+            );
+
+            let counts = engine
+                .telemetry_counts()
+                .expect("telemetry must still be enabled despite the credential mismatch");
+            assert_eq!(
+                counts.get("DemaskDecision").ok,
+                1,
+                "the denial's DemaskDecision must have converted Ok via the actor-key entry point"
+            );
+        }
     }
 }

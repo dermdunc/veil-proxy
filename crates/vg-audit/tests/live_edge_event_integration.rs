@@ -54,7 +54,7 @@ fn a_real_demask_decision_reaches_a_real_running_veil_observatory() {
     let inner = JsonlAuditSink::open(&audit_log_path).expect("failed to open JsonlAuditSink");
 
     let actor_key = ActorPseudonymKey::from_bytes([0xAB; 32]);
-    let sink = TelemetryCountingAuditSink::new(Box::new(inner), actor_key);
+    let sink = TelemetryCountingAuditSink::new(Box::new(inner), actor_key, None);
 
     let event = AuditEvent::DemaskDecision {
         dest: Destination::RemoteModelPrompt,
