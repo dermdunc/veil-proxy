@@ -444,15 +444,23 @@ needs from it is named in the item below.
       `veil-custodian`'s own PR #19 (merged 2026-09-02) then built the real issuance/lookup
       endpoints, the `signing_keys` migration, the CSR P-256/signing-cert-profile validation in
       its CA, and the revocation cascade — ADR-S is no longer docs-only on the custodian side.
-      **Still open:** this repo's `telemetry::signing::DeviceSigningCredential`/
+      ~~**Still open:** this repo's `telemetry::signing::DeviceSigningCredential`/
       `SigningCredential::EcdsaP256` consume the *contract* and are proven end-to-end only via
       the `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` test seam — no real device has
       actually called the now-real endpoints, since the small operator tool that would do so
-      (`veil-custodian`'s `veil-enrol`) still doesn't exist. The enrolment-registry half (Q1) is
-      also still untouched. Once `veil-enrol` exists and a real device is enrolled, this repo's
-      own auto-detect plumbing (see the entry below) picks up the real credential with no code
-      change needed here — that path is already built and tested, just waiting for something
-      real to detect.
+      (`veil-custodian`'s `veil-enrol`) still doesn't exist.~~ — **done, corrected 2026-09-05:**
+      `veil-enrol` now exists and was used for real (`veil-enrol` repo, merged through PR #4)
+      — `veil-demo`'s `scripts/ecdsa-signing-proof.sh` enrolled a real device against a real
+      local `veil-custodian`, obtained a real ADR-S-issued signing key/certificate via real
+      `veil-enrol` CLI calls, and fed that real credential into this repo's actual production
+      `Engine::open` auto-detect path (via the same `VG_DEVICE_SIGNING_KEY_HEX`/
+      `VG_DEVICE_SIGNING_CERT_PEM` seam named above — no code that writes an enrolled credential
+      into the OS keychain exists yet, so the seam is still how the real credential reached `vg`,
+      not the OS keychain itself) to produce a real ECDSA-P256-signed `veil.edge_event.v1`,
+      independently verified by a from-scratch DER-wrapping verifier that also correctly rejected
+      a tampered signature. See `docs/decisions.md`'s 2026-09-05 entry. The
+      enrolment-**registry** half (Q1) is still untouched, and nothing yet writes a device's
+      enrolled credential into its OS keychain automatically — see the corrected entry below.
 - [x] **Build the policy/config surface to select `EcdsaP256` over the current `Hmac` default
       (2026-08-31).** Auto-detect from credential presence, no explicit flag: `Engine::open`
       (`vg-adapters-claude::runtime`) calls `vg_vault::load_device_signing_credential()` — gated
@@ -465,17 +473,29 @@ needs from it is named in the item below.
       `VEIL_RECEIPT_KEY`-sourced HMAC path unchanged. Hardened by a single-model +
       Codex doubt-driven-development round (4 + 5 findings, all fixed) — see `docs/decisions.md`'s
       2026-08-31 entry.
-- [ ] **Wire the ECDSA signing path into production against a *real* issued credential**, once a
-      device signing key/certificate can actually be enrolled. The auto-detect plumbing above is
+- [x] ~~**Wire the ECDSA signing path into production against a *real* issued credential**, once
+      a device signing key/certificate can actually be enrolled. The auto-detect plumbing above is
       real and tested (via the existing `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
       env-var test seam), but no enrolment flow exists yet, so `Ok(None)` — HMAC fallback — is
-      still every real device's outcome today. **`veil-custodian`'s ADR-S endpoints are now built
-      for real (PR #19, merged 2026-09-02)** — the remaining requirement is `veil-custodian`'s
-      `veil-enrol` operator tool (the only intended caller of the issuance endpoint, per
-      ADR-D/ADR-N) plus a decision on how the enrolled key+certificate first lands in this
-      device's OS keychain (`vg-vault::keychain::load_device_signing_credential` is load-only by
-      design — enrolment itself is out of scope here, deliberately, per ADR-D/ADR-N: "a device
-      never calls this API"). Neither is this repo's to build.
+      still every real device's outcome today.~~ — **done, corrected 2026-09-05:** proven for
+      real. `veil-demo`'s `scripts/ecdsa-signing-proof.sh` enrolled a real device via a real,
+      local `veil-custodian` and the now-real `veil-enrol` CLI, and that real ADR-S-issued
+      credential drove this repo's actual production `Engine::open` auto-detect code path
+      (`vg-adapters-claude::runtime`) end-to-end: a real ECDSA-P256-signed `veil.edge_event.v1`
+      was produced and sent over real HTTP, then independently verified (including a negative
+      control that correctly rejected a tampered signature). This is what grounded the
+      raw-`r||s`-encoding sign-off recorded in `docs/decisions.md`'s 2026-09-05 entry.
+      **Still genuinely open, not resolved by this:** nothing yet writes a real enrolled
+      credential into a device's OS keychain automatically — the proof reached `Engine::open`
+      via the same `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` test seam, with the
+      raw key scalar extracted by hand from `veil-enrol`'s output, not stored in the keychain by
+      any tool. `vg-vault::keychain::load_device_signing_credential` is load-only by design
+      (enrolment itself is out of scope here, per ADR-D/ADR-N: "a device never calls this API"),
+      so until something — `veil-enrol` or a separate device-side tool — writes the credential
+      into the OS keychain, `Ok(None)`/HMAC fallback remains the outcome for any device that
+      hasn't had a credential manually threaded in via the env-var seam. Also still open:
+      `veil-observatory` has no real ECDSA verification path (confirmed live by the same proof,
+      a `401` naming the exact reason) and the enrolment-registry half (Q1) is untouched.
 - [ ] **Decide whether `Envelope::device_ref` should be populated from
       `DeviceSigningCredential::device_ref()` when signing with ECDSA**, rather than staying tied
       to the separate, still-always-`None` `EdgeEventRecordInput::device_ref` (ratified Q1 gates

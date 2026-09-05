@@ -4061,6 +4061,43 @@ test seam — no real device has an enrolled credential yet, so `Ok(None)`/HMAC 
 every real device's outcome today. See `docs/next-actions.md` for what's still needed before that
 changes.
 
+## 2026-09-05 — ECDSA auto-detect signing path proven end-to-end with a real device credential
+
+The 2026-08-31 entries above validated this repo's `Engine::open` auto-detect plumbing only via
+the `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` test seam with a synthetic key/cert
+pair, and `docs/next-actions.md` accordingly listed real-credential wiring as still open, blocked
+on `veil-custodian`'s `veil-enrol` operator tool not existing.
+
+Both of those are now out of date. `veil-enrol` has since been built (its own repo, merged
+through PR #4), and `veil-demo`'s `scripts/ecdsa-signing-proof.sh` used it for a real,
+independent end-to-end proof: a real device enrolled against a real local `veil-custodian`,
+a real ADR-S-issued P-256 signing key and certificate obtained via real `veil-enrol` CLI calls,
+that real credential driving this repo's actual production `Engine::open` auto-detect code path
+(`vg-adapters-claude::runtime`) to produce a real ECDSA-P256-signed `veil.edge_event.v1`, sent
+over real HTTP to a real local `veil-observatory`. The signature was independently verified by a
+from-scratch DER-wrapping verifier (`veil-demo`'s `scripts/verify_edge_event_signature.py`,
+no cryptography library used for the DER step) that also correctly rejected a deliberately
+tampered signature — proving the wiring both works and fails correctly. This proof is also what
+grounded the raw-`r||s`-vs-DER sign-off recorded separately (see the `XREPO-004` entry tracked
+in this file's history and closed via PR #64).
+
+One real wrinkle worth recording: the real credential still reached `Engine::open` via the same
+`VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` env-var seam as the earlier synthetic
+test, not via the OS keychain — the proof's operator extracted the raw private-key scalar from
+`veil-enrol`'s output by hand and set it as an env var, because no tool yet writes an enrolled
+credential into a device's OS keychain (`vg-vault::keychain::load_device_signing_credential`
+remains deliberately load-only, per ADR-D/ADR-N). So while the signing path itself is now proven
+against a real, cryptographically valid credential, `Ok(None)`/HMAC fallback is still what any
+device relying on the OS keychain actually gets today — that specific gap (nothing populates the
+keychain) is the one piece of "still needs a real enrolled device" left standing, and it is
+narrower than what `docs/next-actions.md` previously described. Also still open and unaffected by
+this: `veil-observatory` has no real ECDSA verification path (the same proof got a live `401`
+confirming it correctly refuses an ECDSA-signed record rather than accepting it unverified), and
+the enrolment-registry half (Q1) is untouched.
+
+`docs/next-actions.md`'s two affected items have been corrected in place (struck through, not
+deleted) rather than silently edited.
+
 ## 2026-09-05 — ECDSA raw r||s signature encoding: human sign-off given (XREPO-004 closed)
 
 The 2026-08-31 decision above (raw `r||s`, not DER) named its own sign-off requirement
