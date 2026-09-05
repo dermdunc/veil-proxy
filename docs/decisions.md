@@ -4060,3 +4060,20 @@ end-to-end only via the existing `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_
 test seam — no real device has an enrolled credential yet, so `Ok(None)`/HMAC fallback remains
 every real device's outcome today. See `docs/next-actions.md` for what's still needed before that
 changes.
+
+## 2026-09-05 — ECDSA raw r||s signature encoding: human sign-off given (XREPO-004 closed)
+
+The 2026-08-31 decision above (raw `r||s`, not DER) named its own sign-off requirement
+explicitly rather than treating it as implicit. That sign-off was given today, on the
+strength of a real, independent proof built in `veil-demo` (`scripts/ecdsa-signing-proof.sh`):
+a real ADR-S-issued signing certificate, used by a real `vg` process to produce a real
+ECDSA-signed `veil.edge_event.v1`, verified by a from-scratch DER-wrapping verifier that
+also correctly rejects a deliberately tampered signature — proving the encoding both works
+and fails correctly, not just that it happens to look right. Tracked as `XREPO-004` in
+veil-ecosystem's `.hekton/cross-repo-deps.yaml`, now `status: closed`.
+
+**Not resolved by this sign-off:** `veil-observatory` still has no real ECDSA verification
+path — its `verification.py` explicitly and correctly refuses an ECDSA-signed record today
+(confirmed live by the same proof, a `401` naming the exact reason) rather than accepting it
+unverified. Closing the encoding question removes the blocking uncertainty a real verifier
+would otherwise be built against; it does not schedule building one.
