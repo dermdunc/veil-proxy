@@ -512,14 +512,17 @@ needs from it is named in the item below.
       claim in `decisions.md` and `docs/api/README.md` but missed this file. Both cosmetic, not
       blocking, no urgency. Fixed in `veil-custodian` PR #18 (branch
       `agent/claude/adr-s-cosmetic-fixes`), open as of 2026-08-31, not yet merged.
-- [ ] **Get ADR-S's signature encoding decided jointly, not unilaterally.** This repo chose raw
-      `r||s` (64 bytes) over DER for the ECDSA signature wire encoding — ADR-S itself has no
-      opinion (`veil-custodian`'s own fixtures README says so explicitly) — because a byte-exact
-      golden vector needs exactly one valid encoding per signature, which DER doesn't guarantee.
-      Recorded as a decision here (`docs/decisions.md`'s 2026-08-31 entry), but needs
-      `veil-custodian`/`veil-observatory` sign-off before any real cross-repo ECDSA signing
-      happens — a Python verifier needs `utils.encode_dss_signature(r, s)` before `verify()`,
-      which is a real, if small, integration cost on that side.
+- [x] ~~**Get ADR-S's signature encoding decided jointly, not unilaterally.**~~ — **sign-off
+      given 2026-09-05** (tracked as `XREPO-004` in veil-ecosystem's
+      `.hekton/cross-repo-deps.yaml`, now `status: closed`), on the strength of a real ECDSA
+      signing proof built in veil-demo: a from-scratch DER-wrapping verifier (the exact
+      `utils.encode_dss_signature(r, s)`-shaped conversion this entry itself named as the
+      real integration cost) independently confirmed the raw `r||s` encoding is
+      cryptographically sound, including correctly rejecting a tampered signature. Raw
+      `r||s` is accepted as this repo's ECDSA wire encoding for cross-repo signing. **Not
+      resolved by this**: `veil-observatory` still has no real ECDSA verification path built
+      (KMS Verify or a native P-256 library) — the encoding question is settled, that
+      integration work is separate and still unscheduled.
 - [ ] **Write the Q10 telemetry-metadata privacy section** (retention, residency, permitted joins,
       re-identification path) into the ratification packet, alongside the Q1 registry work — the
       plan explicitly deferred this write-up, it is not yet done
