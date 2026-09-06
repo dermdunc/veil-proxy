@@ -410,6 +410,23 @@ mod telemetry_wiring_tests {
     const TEST_KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const ACTOR_PSEUDONYM_KEY_ENV: &str = "VG_ACTOR_PSEUDONYM_KEY_HEX";
 
+    /// Serializes every test in this module that mutates `VAULT_KEY_ENV`/
+    /// `ACTOR_PSEUDONYM_KEY_ENV` (and, transitively, the device-signing-seam vars set
+    /// alongside them). `telemetry_enabled_wires_the_counting_sink_and_counts_a_real_write`'s
+    /// own doc comment claimed it was "the one test in this crate's suite that touches"
+    /// these vars, reasoning that made it safe under `cargo test`'s default parallelism --
+    /// true when written, but silently invalidated once
+    /// `telemetry_auto_detect_selects_ecdsa_or_falls_back_to_hmac` was added/extended to
+    /// touch the same process-global names, with no code left enforcing the invariant the
+    /// comment asserted. Observed in CI 2026-09-06: two different tests failed on two
+    /// separate runs of the identical commit (a timing-budget test, then this module's
+    /// auto-detect test asserting `ECDSA_SHA_256` where `HMAC_SHA_256` was expected) --
+    /// the signature of cross-thread env-var corruption, not a real logic regression.
+    /// `.lock().unwrap_or_else(PoisonError::into_inner)` recovers the lock if a prior test
+    /// panicked while holding it, matching this module's existing "clean up regardless of
+    /// how the test exits" philosophy (see `EnvVarGuard`/`AutoDetectEnvVarGuard` below).
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn open_engine_in_temp_dir(policy_json: Option<&str>) -> (tempfile::TempDir, Engine) {
         open_engine_with_provenance(policy_json, crate::state::Provenance::Pinned)
     }
@@ -483,13 +500,16 @@ mod telemetry_wiring_tests {
         }
     }
 
-    /// The one test in this crate's suite that touches `VAULT_KEY_ENV`/
-    /// `VG_ACTOR_PSEUDONYM_KEY_HEX` — sound for the same reason `vg-vault`'s own
-    /// `keychain.rs` tests give: these names are unique to this test, and no other test
-    /// in this binary reads or writes them, so there is no cross-test race despite
-    /// `cargo test`'s default parallelism.
+    /// No longer the only test touching `VAULT_KEY_ENV`/`VG_ACTOR_PSEUDONYM_KEY_HEX` --
+    /// `telemetry_auto_detect_selects_ecdsa_or_falls_back_to_hmac` below touches the same
+    /// process-global names. Both now serialize on `ENV_MUTEX` (held for the whole
+    /// function body) rather than relying on name-uniqueness, which this comment
+    /// previously (and, it turned out, incorrectly) claimed made that unnecessary.
     #[test]
     fn telemetry_enabled_wires_the_counting_sink_and_counts_a_real_write() {
+        let _env_lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var(VAULT_KEY_ENV, TEST_KEY_HEX);
             std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
@@ -664,8 +684,18 @@ mod telemetry_wiring_tests {
     /// race under `cargo test`'s default parallel execution, the same hazard this
     /// module's own `AutoDetectEnvVarGuard` comment already names for the vars it
     /// unsets. Sequencing both cases inside one function, each behind its own
-    /// `AutoDetectEnvVarGuard` scope, removes the race outright rather than relying on
-    /// test-binary scheduling luck.
+    /// `AutoDetectEnvVarGuard` scope, removes the *intra*-function race outright rather
+    /// than relying on test-binary scheduling luck.
+    ///
+    /// That fix didn't cover the *inter*-function race with
+    /// `telemetry_enabled_wires_the_counting_sink_and_counts_a_real_write` above, which
+    /// touches the same `VAULT_KEY_ENV`/`ACTOR_PSEUDONYM_KEY_ENV` names on its own thread
+    /// under `cargo test`'s default parallelism -- confirmed as the actual cause of two
+    /// different, non-reproducing-locally CI failures on 2026-09-06 (a timing-budget test
+    /// and this test's own algorithm assertion, on two separate runs of the identical
+    /// commit). Both functions now hold `ENV_MUTEX` for their whole body, which is what
+    /// actually removes the race; the intra-function sequencing above remains correct and
+    /// necessary on its own terms, but was never sufficient by itself.
     ///
     /// The misconfigured case is also strengthened here versus its original form: it now
     /// sets `VEIL_RECEIPT_KEY` and the endpoint, and asserts the wire record is actually
@@ -675,6 +705,9 @@ mod telemetry_wiring_tests {
     /// name claims.
     #[test]
     fn telemetry_auto_detect_selects_ecdsa_or_falls_back_to_hmac() {
+        let _env_lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // -- case 1: a real device signing credential in the OS keychain (env seam) wins --
         {
             let (addr, rx) = spawn_single_request_test_server();
