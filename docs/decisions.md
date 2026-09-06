@@ -4114,3 +4114,33 @@ path — its `verification.py` explicitly and correctly refuses an ECDSA-signed 
 (confirmed live by the same proof, a `401` naming the exact reason) rather than accepting it
 unverified. Closing the encoding question removes the blocking uncertainty a real verifier
 would otherwise be built against; it does not schedule building one.
+
+## 2026-09-06 — XREPO-005 ratified on both sides: `veil-observatory` adopts this repo's 2026-08-23 conclusion
+
+The 2026-08-23 entry above (`docs/next-actions.md:536-553`) reached, and struck its own item
+through on, a conclusion this repo never formally ratified as a cross-repo decision — it
+recorded a critique's answer, not a signed-off one, and said so plainly ("**Deferred, not
+ratified**, until a first generated schema artifact exists"). `veil-observatory` never saw
+that answer reflected in its own backlog and carried the ADR-0014/ADR-0012 CI-veto question
+as three separate open items until today.
+
+`veil-observatory`'s ADR-0019 (`docs/decisions/ADR-0019-correlation-contract-gate.md` in that
+repo) now ratifies the same conclusion this repo reached first, independently confirmed by a
+second, 2026-09-05 Codex consult run on the `veil-observatory` side that reproduced it without
+having read this entry: don't give `test_pipeline.py`'s full suite a formal veto; build a
+narrow, purpose-built correlation-contract gate instead, covering exactly the seven facts this
+repo's own note named (exact-trace linkage, Tier-1 no-attach, Tier-2 never-attaches-alone,
+duplicate-trace fail-closed, account/region mismatch, deterministic replay, and
+`bedrock-mantle`'s uncorrelatable status). That gate now exists:
+`veil-observatory/tests/correlation/test_correlation_contract_gate.py`, asserting against the
+production `Correlator` (not the `query_time.py` prototype ADR-0016 explicitly bars from
+production status — a distinction this repo's own note did not need to make, since it doesn't
+carry veil-observatory's internal architecture context, but matters for what the gate actually
+proves).
+
+Tracked as `XREPO-005` in veil-ecosystem's `.hekton/cross-repo-deps.yaml`, now
+`status: closed`. **Not resolved by this closure**, same shape as `XREPO-004`'s: the gate is
+not yet wired into any real cross-repo CI on either side — both this repo's original note and
+veil-observatory's ADR-0019 name the same precondition (a generated `veil.receipt.v2`/
+`veil.alert.v1`/`veil.edge_event.v1` schema artifact on this repo's side) as the reason,
+unmet as of this entry.

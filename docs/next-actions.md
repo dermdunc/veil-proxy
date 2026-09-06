@@ -551,6 +551,9 @@ needs from it is named in the item below.
       unmonitored-path) that `veil-proxy` CI can run against `veil-observatory`'s adapters without
       needing live pipeline data. Not blocking anything today — no schema artifact exists on
       either side yet.
+      **Ratified on both sides 2026-09-06** (`XREPO-005` closed) — see `docs/decisions.md`'s
+      2026-09-06 entry: `veil-observatory`'s ADR-0019 built exactly this gate. Cross-repo CI
+      wiring remains deferred on the same still-unmet schema-artifact precondition.
 
 M3 (request masking) remains the standing product priority; the leak fix is small and should not
 displace it for long.
