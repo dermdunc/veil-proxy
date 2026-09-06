@@ -615,3 +615,7 @@ displace it for long.
       goes away, without meaningfully slowing down the common case. New test
       (`dropping_the_handle_right_after_emit_still_delivers_the_record`) exercises exactly
       the race the other tests' `wait_for` polling never touched.
+
+## Session Update: 2026-09-06 — Retire/promote review; fix yanked crate and a real test race
+
+- [ ] No action needed right now; CI is green
