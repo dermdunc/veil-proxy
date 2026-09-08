@@ -226,6 +226,24 @@ fn device_ref_from_san(names: &[GeneralName]) -> Result<DeviceRef, VaultError> {
         ))
     })?;
 
+    // **Correction, found by a Codex adversarial review round against the shipped
+    // implementation: `decode_hex` (shared with the env-seam's human-typed-hex-key
+    // parsing, where case-insensitivity is a deliberate convenience) accepts BOTH
+    // upper- and lowercase hex digits via `char::to_digit(16)`. Custodian's own
+    // `DevicePseudonym::FromStr` explicitly rejects any uppercase byte
+    // (`veil-custodian/src/domain/pseudonym.rs`), so a certificate whose SAN carries
+    // uppercase hex is not a shape custodian's own CA would ever issue.** This is a
+    // certificate claiming an identity, not an operator-typed convenience value — it
+    // must be exactly as strict as the wire form it claims to carry, not looser.
+    if !suffix
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(crypto_err(
+            "signing certificate SAN device pseudonym is not lowercase hex",
+        ));
+    }
+
     let bytes = decode_hex(suffix)
         .ok_or_else(|| crypto_err("signing certificate SAN device pseudonym is not valid hex"))?;
 
@@ -274,6 +292,17 @@ mod tests {
         fn rejects_a_non_hex_suffix() {
             let names = vec![uri_san(
                 "urn:veil:device:dev_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            )];
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_uppercase_hex_even_though_it_is_valid_hex() {
+            // Custodian's own DevicePseudonym::FromStr rejects uppercase explicitly --
+            // this loader must be exactly as strict, not looser, since it is validating
+            // a certificate's claimed identity, not a human-typed convenience value.
+            let names = vec![uri_san(
+                "urn:veil:device:dev_0102030405060708090A0B0C0D0E0F10",
             )];
             assert!(device_ref_from_san(&names).is_err());
         }

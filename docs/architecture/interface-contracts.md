@@ -284,8 +284,12 @@ lost its `device_ref: Option<DeviceRef>` field (non-additive, breaking — the o
 `device_ref(&self) -> Option<DeviceRef>` method (private, mirroring `algorithm()`/`key_ref()` —
 not itself a public-contract addition) alongside its existing `key_ref()`: `None` for `Hmac`,
 `Some(cred.device_ref())` for `EcdsaP256`. `sign_edge_event_record` now derives
-`Envelope::device_ref` from the credential the same structural way it already derived `key_ref`,
-and declares `SchemaVersion::EdgeEventV2` (wire string `"veil.edge_event.v2"`) rather than
+`Envelope::device_ref` from the credential the same way it already derived `key_ref` — **both
+guaranteed to agree with the certificate only via the production loader path
+(`vg-vault::keychain::load_device_signing_credential`'s own public-key cross-check), not by
+`DeviceSigningCredential::from_parts` alone, which is `pub` and cross-checks neither value against
+the other; see `../decisions.md`'s ADR-016 §3, corrected on this exact point by a Codex round
+against the shipped code** — and declares `SchemaVersion::EdgeEventV2` (wire string `"veil.edge_event.v2"`) rather than
 `EdgeEventV1` at both of its `Envelope::new` call sites — `SchemaVersion` itself gained the
 `EdgeEventV2` variant (`EdgeEventV1` kept, not removed: `#[non_exhaustive]` already anticipates
 more variants and no real `EdgeEventV1` record was ever emitted with a populated `device_ref`).

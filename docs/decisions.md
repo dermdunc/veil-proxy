@@ -4145,9 +4145,16 @@ veil-observatory's ADR-0019 name the same precondition (a generated `veil.receip
 `veil.alert.v1`/`veil.edge_event.v1` schema artifact on this repo's side) as the reason,
 unmet as of this entry.
 
-## 2026-09-07 — ADR-016 (PROPOSED, human confirmation pending): populate `Envelope::device_ref` structurally from the signing credential (`XREPO-007`)
+## 2026-09-07 — ADR-016 (ACCEPTED, human-confirmed 2026-09-08): populate `Envelope::device_ref` structurally from the signing credential (`XREPO-007`)
 
-**Status: proposed.** Written as Phase 1a of the plan closing `veil-ecosystem`'s `XREPO-007`
+**Status: accepted, implemented on `agent/claude/xrepo-007-device-ref-derivation`, not yet
+merged.** Human-confirmed 2026-09-08 (the project owner's "move to 1b" instruction, after this
+entry's two adversarial review rounds below and the four Phase 0 decisions were each confirmed in
+turn), then implemented per §6, then subjected to a third adversarial round against the shipped
+code itself (not just this text) — see the implementation commits on that branch for what changed
+and the corrections that round produced. PR and merge are still pending explicit confirmation, per
+this repo's own discipline. Originally written as Phase 1a of the plan closing `veil-ecosystem`'s
+`XREPO-007`
 (`.hekton/cross-repo-deps.yaml:188-213`) — this repo's `TelemetryCountingAuditSink` has
 hard-coded every real edge event's `device_ref` to `None` since the field was added
 (`vg-audit/src/telemetry_sink.rs:205`), so no consumer of this repo's signed telemetry has ever
@@ -4265,6 +4272,22 @@ with "the production loader path (`load_device_signing_credential` →
 own certificate's SAN" — a true, checkable claim — plus an explicit, separate test that
 `SigningCredential::device_ref()` merely reflects whatever `DeviceSigningCredential` it is given,
 which is trivially true and does not by itself guarantee certificate agreement.
+
+**Second correction, found by a later Codex round against the shipped implementation, not just
+this text: `key_ref` has the identically-shaped residual, and the "unlike `key_ref`" phrasing
+above invites the wrong reading.** `from_parts` derives `key_ref` from whatever `certificate_der`
+bytes it is given (`KeyRef::from_certificate_der(certificate_der)`) — true, and that much really is
+structural, `key_ref` cannot be independently supplied. But `from_parts` never cross-checks that
+`certificate_der` corresponds to `signing_key` at all; its own test helper constructs exactly this
+mismatch deliberately (`signing.rs`, `sample_ecdsa_credential`, using placeholder DER unrelated to
+the test key). So "`key_ref` cannot disagree with the key that actually signs" is *not* guaranteed
+by `from_parts` alone — it is guaranteed the same way `device_ref` agreement is: only by the
+production loader's own separate check, `validate_signing_certificate_pem` cross-checking the
+loaded private key's public half against the certificate's `SubjectPublicKeyInfo`
+(`vg-vault/src/certificate.rs`) before `keychain.rs:219-223` ever calls `from_parts`. Read "unlike
+`key_ref`" above as scoped narrowly — `key_ref` cannot be overridden as an independent parameter,
+which `device_ref` (pre-this-ADR) could — not as a claim that `key_ref` has no `from_parts`
+residual at all. It has the same one, for the same reason, closed by the same one production path.
 
 **Minimum-acceptable fallback considered and not needed:** rejecting a caller-supplied value
 that disagrees with the credential, rather than removing the field outright, was the fallback
@@ -4528,13 +4551,22 @@ change alters records already emitted.
 - Credential-load error behaviour proving §10's posture: an `Err` from
   `load_device_signing_credential` where the key entry is present but something else is wrong
   (partial env-seam, key/certificate mismatch) results in the degraded/quarantined signal, HMAC
-  emission continuing, and no change whatsoever to any masking-path test. **Plus tests that
-  document, rather than silently leave undiscovered, §10's named limitation (corrected per the
-  Fable round to cover both directions, not just "both entries deleted")**: (a) deleting both
-  keychain entries, and (b) deleting only the **key** entry while leaving an orphaned certificate
-  entry behind, both produce `Ok(None)`, both are indistinguishable from never-enrolled, and
-  neither triggers the degraded signal — asserted explicitly so a future change cannot accidentally
-  start assuming either case is covered.
+  emission continuing, and no change whatsoever to any masking-path test. Plus a test proving
+  `TelemetryAuthenticity`'s *default* value (`Nominal`) when the credential-lookup branch is
+  skipped entirely (no `VEIL_OBSERVATORY_ENDPOINT` set).
+  **Correction, found by a Codex adversarial review round against the shipped implementation,
+  not just this ADR's text: the bullet that previously stood here claimed tests existed proving
+  §10's named limitation (a device whose key keychain entry is absent, alone or alongside an
+  orphaned certificate). No such tests exist, and none can, with the infrastructure Phase 1 has.**
+  The env-seam is all-or-nothing (both `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
+  set, or both unset) — it cannot represent "one specific OS-keychain entry present, the other
+  absent"; setting only one seam var instead hits the loader's *different* "both must be set or
+  unset" `Err` branch, which is already covered but is not the same scenario. Exercising the
+  loader's real `Ok(None)` return (via the actual OS keychain, `VEIL_OBSERVATORY_ENDPOINT` set,
+  both seam vars unset) and §10's named limitation itself both require a gated real-keychain
+  integration test — exactly the kind of testing the governing plan's §10.3 already scopes to
+  Phase 3, not Phase 1. This ADR's own §10 correctly describes the limitation in prose; it should
+  not have also claimed automated coverage that was never built.
 - Observatory-side schema/storage fixture for the canonical `dev_` form, on the `veil.edge_event.v2`
   schema (companion ADR, §8).
 - **Replay/nonce partitioning test.** `veil-observatory` folds `device_ref` into `nonce_scope`
@@ -4559,8 +4591,11 @@ null records.
 
 `docs/architecture/telemetry-receipt-reconciliation-plan.md` §4b (Q10) and
 `docs/next-actions.md`'s corresponding item were written/updated the same session as part of
-this ADR's own P0-2. This ADR itself is **pending human confirmation** before any code is
-written, per this repo's own established discipline (ADR-S, ADR-013/014/015 and every closed
-`XREPO-00N` item to date all had a written, confirmed decision record before implementation
-began) — no branch has been opened and no source file outside `docs/` has been touched as of
-this entry.
+this ADR's own P0-2. **Corrected 2026-09-08: this ADR was confirmed before any code was written,
+per this repo's own established discipline (ADR-S, ADR-013/014/015 and every closed `XREPO-00N`
+item to date all had a written, confirmed decision record before implementation began) — an
+earlier version of this closing paragraph, now stale, said no branch existed yet. Implementation
+has since landed** on `agent/claude/xrepo-007-device-ref-derivation` (§6, this repo's own
+`build`/`test`/`clippy`/`fmt`/`deny`/`audit` gates all clean, plus a further Codex adversarial
+round against the shipped code — see that branch's commit history). PR and merge remain pending
+explicit human confirmation, and Phase 1c's live-run proof has not yet been performed.

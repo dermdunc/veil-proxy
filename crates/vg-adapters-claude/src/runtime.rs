@@ -836,11 +836,18 @@ mod telemetry_wiring_tests {
         }
     }
 
-    /// ADR-016 §10's named limitation, made into an explicit regression test rather than
-    /// left to be silently assumed covered: a device that was never enrolled (`Ok(None)`)
-    /// must never be reported as degraded -- it is not an error state.
+    /// **Corrected, found by a Codex adversarial review round against the shipped
+    /// implementation (not just the ADR text): the previous version of this test, and
+    /// its name, overclaimed what it proves.** With no `VEIL_OBSERVATORY_ENDPOINT` set,
+    /// `Engine::open`'s endpoint-gating check means `load_device_signing_credential` is
+    /// never even called — this exercises the *default* value of `telemetry_authenticity`
+    /// when the credential-lookup branch is skipped entirely, not the loader's real
+    /// `Ok(None)` return path. That distinction matters: it is a real, useful test (the
+    /// default must be `Nominal`, not some other value that happens to look right only
+    /// by accident), but it does not prove what "never enrolled" means once the loader
+    /// actually runs.
     #[test]
-    fn telemetry_authenticity_is_nominal_when_never_enrolled() {
+    fn telemetry_authenticity_defaults_to_nominal_when_the_credential_lookup_is_skipped() {
         let _env_lock = ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -849,13 +856,30 @@ mod telemetry_wiring_tests {
             std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
         }
         let _cleanup = EnvVarGuard;
-        // No device-signing-seam vars, no VEIL_OBSERVATORY_ENDPOINT: the ordinary,
-        // universal-today "not yet enrolled" case, never touching the OS keychain for a
-        // device credential at all (the endpoint-gating check in `Engine::open`).
+        // No device-signing-seam vars, no VEIL_OBSERVATORY_ENDPOINT: `Engine::open`
+        // never reaches `load_device_signing_credential` at all (the endpoint-gating
+        // check short-circuits first) -- this is NOT a test of the loader's own
+        // Ok(None) path, only of `telemetry_authenticity`'s default value.
         let (_dir, engine) = open_engine_in_temp_dir(Some(r#"{"telemetry_enabled": true}"#));
         assert_eq!(
             engine.telemetry_authenticity(),
             TelemetryAuthenticity::Nominal
         );
     }
+
+    // **Named gap, not silently left untested: none of the following are covered by any
+    // test in this suite, and cannot be with the env-seam infrastructure alone.**
+    // (1) The loader's *real* `Ok(None)` return, reached by setting
+    //     `VEIL_OBSERVATORY_ENDPOINT` while leaving both device-signing-seam env vars
+    //     unset, which forces `load_device_signing_credential` to query the actual OS
+    //     keychain. (2) ADR-016 §10's named limitation itself -- a device whose *key*
+    //     keychain entry is absent (alone, or alongside an orphaned certificate entry)
+    //     being indistinguishable from never-enrolled. Both require manipulating real OS
+    //     keychain entries, which the env-seam (all-or-nothing: both vars set or both
+    //     unset) cannot represent -- setting only one seam var hits the loader's
+    //     *different* "both must be set or unset" `Err` branch, not either OS-keychain
+    //     state. This is exactly the gated real-keychain integration testing the
+    //     governing plan's §10.3 already scopes to Phase 3, not Phase 1. An earlier
+    //     version of this ADR's own §12 claimed tests for these two states existed; they
+    //     did not, and do not now -- corrected rather than left to be discovered later.
 }
