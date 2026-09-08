@@ -4374,12 +4374,14 @@ change this session makes.
 
 This repo's interface contract is frozen at v1.7 and lists `DeviceSigningCredential`/the signing
 input as part of the frozen public seam (`docs/architecture/interface-contracts.md:1`). Removing
-`device_ref` from `EdgeEventRecordInput` and adding `SigningCredential::device_ref()` is a
-non-additive, breaking signature change to that seam — the same class of change v1.6's
-`sign_edge_event_record` re-signing already was (`interface-contracts.md:368`). **Budgeted: this
-lands as v1.8**, following the same protocol v1.6/v1.7 did (`agent-factory-plan.md` §6), with the
-one prior caller (`vg-audit::telemetry_sink`) updated in the same change — mirroring exactly how
-v1.6 was scoped.
+`device_ref` from `EdgeEventRecordInput` is a non-additive, breaking signature change to that
+seam — the same class of change v1.6's `sign_edge_event_record` re-signing already was
+(`interface-contracts.md:368`). **Lands as v1.8** (Phase 1b, `interface-contracts.md`'s own
+version-history line and its §7a addendum), following the same protocol v1.6/v1.7 did
+(`agent-factory-plan.md` §6), with the one prior caller (`vg-audit::telemetry_sink`) updated in
+the same change — mirroring exactly how v1.6 was scoped. `SigningCredential::device_ref()` itself
+is private (matching `algorithm()`/`key_ref()`'s existing visibility), so its addition is not, on
+its own, a public-contract change — only the field removal triggers the bump.
 
 ### 8. `veil-observatory`: expect real change, not none
 
