@@ -202,7 +202,6 @@ impl TelemetryCountingAuditSink {
             contract_revision: EDGE_EVENT_CONTRACT_REVISION,
             record_id: RecordId::from(Uuid::new_v4()),
             issued_at_us,
-            device_ref: None,
             tenant_id: None,
             sequence,
             valid_until_us: issued_at_us.saturating_add(EDGE_EVENT_VALIDITY_WINDOW_US),

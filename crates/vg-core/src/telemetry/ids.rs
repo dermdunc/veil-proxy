@@ -296,9 +296,10 @@ pub enum DeviceRefError {
 
 /// Enrolment-minted device pseudonym (`Envelope::device_ref`). 16 bytes, matching the
 /// reconciliation plan's own envelope sketch pattern exactly (`^dev_[a-f0-9]{32}$` is 32
-/// hex characters = 16 bytes). `Envelope::device_ref` stays `None` until
-/// `veil-custodian`'s enrolment registry exists (ratified Q1) — this type exists now so
-/// the envelope's shape is correct in advance.
+/// hex characters = 16 bytes). Populated from the signing credential for an ECDSA-signed
+/// record, structurally absent for an HMAC-signed one — see `telemetry::signing`'s own
+/// module doc and ADR-016 (XREPO-007). Serialises with the `dev_` prefix (below); no
+/// `Deserialize`, no `FromStr` — there is no inbound parse path for this type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DeviceRef([u8; 16]);
 
@@ -314,12 +315,13 @@ impl TryFrom<&[u8]> for DeviceRef {
 }
 
 impl Serialize for DeviceRef {
-    /// 16 raw bytes, hex-encoded (task's own "verified safe" list: `DeviceRef` is
-    /// `[u8; 16]`, safe as hex) — never the `^dev_[a-f0-9]{32}$` display pattern this
-    /// type's own doc mentions as a *future* wire sketch; that's schema-generation's job,
-    /// not this session's.
+    /// `dev_<32hex>` — `veil-custodian`'s own wire form, byte-for-byte
+    /// (ADR-016, XREPO-007: this repo previously serialised bare hex with no prefix,
+    /// which `veil-enrol`'s ADR-VE-005 depended on as a distinct vocabulary; that premise
+    /// is superseded, not this crate's problem to keep compatible with anymore).
+    /// Serialisation-only, matching this type's own doc: no inbound parse path exists.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hexutil::encode(&self.0))
+        serializer.serialize_str(&format!("dev_{}", hexutil::encode(&self.0)))
     }
 }
 
@@ -599,11 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn device_ref_serializes_as_lowercase_hex() {
+    fn device_ref_serializes_dev_prefixed_lowercase_hex() {
+        // ADR-016 (XREPO-007): `dev_<32hex>`, custodian's own wire form byte-for-byte --
+        // no longer bare hex with no prefix.
         let dr = DeviceRef::try_from([0xffu8; 16].as_slice()).unwrap();
         assert_eq!(
             serde_json::to_value(dr).unwrap(),
-            serde_json::json!("ff".repeat(16))
+            serde_json::json!(format!("dev_{}", "ff".repeat(16)))
         );
     }
 

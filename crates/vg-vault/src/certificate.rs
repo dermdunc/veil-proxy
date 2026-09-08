@@ -66,8 +66,10 @@ const PRIME256V1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 /// The SAN URI prefix a device's signing certificate carries (ADR-S: identical
 /// convention to the existing ADR-A mTLS cert's SAN). The `dev_`-prefixed suffix is
 /// `veil-custodian`'s own wire form for a pseudonym (ADR-G); this crate strips the
-/// prefix before handing the raw 16 bytes to [`DeviceRef`], which — on the veilgremlin
-/// side — serializes bare, with no prefix (ADR-G's own corrected wire-format note).
+/// prefix before handing the raw 16 bytes to [`DeviceRef`], which — as of ADR-016
+/// (XREPO-007) — re-adds the identical `dev_` prefix on serialisation, matching
+/// custodian's wire form byte-for-byte (superseding the bare-hex serialisation ADR-G's
+/// note originally described).
 const DEVICE_SAN_URI_PREFIX: &str = "urn:veil:device:dev_";
 
 /// A certificate that has passed every ADR-S signing-profile check, plus the identifiers

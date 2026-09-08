@@ -147,6 +147,7 @@ fn schema_version_label(v: SchemaVersion) -> &'static str {
         SchemaVersion::ReceiptV2 => "ReceiptV2",
         SchemaVersion::AlertV1 => "AlertV1",
         SchemaVersion::EdgeEventV1 => "EdgeEventV1",
+        SchemaVersion::EdgeEventV2 => "EdgeEventV2",
     }
 }
 
@@ -199,7 +200,10 @@ impl TelemetryEvent {
         envelope: Envelope,
         edge_event: EdgeEvent,
     ) -> Result<Self, SchemaVersionMismatch> {
-        Self::check_schema_version(&envelope, SchemaVersion::EdgeEventV1)?;
+        // v2 (ADR-016, XREPO-007) is the current edge-event wire contract; `EdgeEventV1`
+        // remains constructible on `SchemaVersion` but is no longer the version this
+        // still-all-rejecting conversion path expects a payload to declare.
+        Self::check_schema_version(&envelope, SchemaVersion::EdgeEventV2)?;
         Ok(Self::EdgeEvent(envelope, edge_event))
     }
 
@@ -370,12 +374,31 @@ mod tests {
 
     #[test]
     fn new_edge_event_succeeds_when_schema_version_matches() {
-        let envelope = sample_envelope(SchemaVersion::EdgeEventV1);
+        let envelope = sample_envelope(SchemaVersion::EdgeEventV2);
         let edge_event = EdgeEvent::new_demask_request(
             crate::api::Destination::RemoteModelPrompt,
             ActorPseudonym::from_bytes([1u8; 32]),
         );
         assert!(TelemetryEvent::new_edge_event(envelope, edge_event).is_ok());
+    }
+
+    #[test]
+    fn new_edge_event_rejects_the_superseded_v1_schema_version() {
+        // ADR-016 (XREPO-007): `EdgeEventV1` is kept constructible but is no longer what
+        // this conversion path expects — an envelope still declaring `v1` must be
+        // rejected as a mismatch, not silently accepted as an alias for `v2`.
+        let envelope = sample_envelope(SchemaVersion::EdgeEventV1);
+        let edge_event = EdgeEvent::new_demask_request(
+            crate::api::Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([1u8; 32]),
+        );
+        assert!(matches!(
+            TelemetryEvent::new_edge_event(envelope, edge_event),
+            Err(SchemaVersionMismatch::Mismatch {
+                expected: "EdgeEventV2",
+                got: "EdgeEventV1"
+            })
+        ));
     }
 
     #[test]

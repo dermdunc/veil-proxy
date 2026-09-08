@@ -133,6 +133,36 @@ pub struct Engine {
     /// handle) purely so callers can inspect counts without downcasting a trait object —
     /// see `vg_audit::SharedTelemetrySink`'s own doc for why it exists.
     telemetry_sink: Option<SharedTelemetrySink>,
+    /// ADR-016 §10 (XREPO-007): observable degraded-credential signal, distinct from a
+    /// stderr line. See [`TelemetryAuthenticity`]'s own doc for exactly what this does
+    /// and does not catch.
+    telemetry_authenticity: TelemetryAuthenticity,
+}
+
+/// Whether this engine's telemetry authenticity is known-good or degraded — ADR-016 §10
+/// (XREPO-007), the P0-3 downgrade posture. **Named limitation, not full coverage:**
+/// `DegradedCredentialError` fires only when [`vg_vault::load_device_signing_credential`]
+/// returns `Err` — a keychain entry the loader could at least partially read, but which
+/// turned out malformed, mismatched, or came from a backend/init failure. It does **not**
+/// fire on `Ok(None)`, the ordinary "not yet enrolled" case, and it does **not** reliably
+/// fire when the *key* keychain entry itself is absent (an orphaned certificate with no
+/// matching key, or both entries removed) — both look identical to "never enrolled" under
+/// this signal, because the loader checks the key entry first and short-circuits to
+/// `Ok(None)` before ever inspecting the certificate. Closing that gap needs a durable,
+/// independent "this device is expected to be enrolled" marker written at install time,
+/// which does not exist until Phase 3 builds one. Masking is never affected by this value
+/// either way (`veil-custodian` ADR-E: certificate state gates telemetry authenticity
+/// only, never masking) — nothing in this crate wires it into any masking path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TelemetryAuthenticity {
+    /// No credential-load error observed. The default: also the value when telemetry is
+    /// disabled entirely, and when the device is not yet enrolled (`Ok(None)`).
+    #[default]
+    Nominal,
+    /// `load_device_signing_credential` returned `Err`. Emission falls back to HMAC;
+    /// the pseudonym a downstream consumer would have keyed off is silently absent —
+    /// this signal exists so that absence is at least observable, not silent too.
+    DegradedCredentialError,
 }
 
 impl Engine {
@@ -182,6 +212,7 @@ impl Engine {
             );
         }
 
+        let mut telemetry_authenticity = TelemetryAuthenticity::Nominal;
         let (audit, telemetry_sink): (Box<dyn vg_core::AuditSink>, Option<SharedTelemetrySink>) =
             if telemetry_enabled {
                 let actor_key = vg_vault::load_or_create_actor_pseudonym_key()?;
@@ -213,6 +244,8 @@ impl Engine {
                                 "veilgremlin: WARNING device signing credential misconfigured, \
                                  falling back to HMAC: {e}"
                             );
+                                telemetry_authenticity =
+                                    TelemetryAuthenticity::DegradedCredentialError;
                                 None
                             }
                         }
@@ -243,6 +276,7 @@ impl Engine {
             parsers: all_parsers(),
             namespace,
             telemetry_sink,
+            telemetry_authenticity,
         })
     }
 
@@ -252,6 +286,12 @@ impl Engine {
     /// payloads.
     pub fn telemetry_counts(&self) -> Option<TelemetryConversionCounts> {
         self.telemetry_sink.as_ref().map(|s| s.counts())
+    }
+
+    /// See [`TelemetryAuthenticity`]'s own doc for exactly what this does and does not
+    /// catch (ADR-016 §10, XREPO-007).
+    pub fn telemetry_authenticity(&self) -> TelemetryAuthenticity {
+        self.telemetry_authenticity
     }
 
     pub fn paths(&self) -> &StatePaths {
