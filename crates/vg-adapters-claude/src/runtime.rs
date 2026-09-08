@@ -775,6 +775,12 @@ mod telemetry_wiring_tests {
                  auto-detected and used, in preference to the unset VEIL_RECEIPT_KEY HMAC \
                  path"
             );
+            // ADR-016 §10 (XREPO-007): a real, correctly-loaded credential must never be
+            // reported as degraded.
+            assert_eq!(
+                engine.telemetry_authenticity(),
+                TelemetryAuthenticity::Nominal
+            );
         }
 
         // -- case 2: a genuinely misconfigured credential falls back to real HMAC signing --
@@ -818,6 +824,38 @@ mod telemetry_wiring_tests {
                 1,
                 "the denial's DemaskDecision must have converted Ok via the actor-key entry point"
             );
+            // ADR-016 §10 (XREPO-007): a genuine credential-load Err (here, a key/cert
+            // mismatch caught by `load_device_signing_credential`'s own cross-check) must
+            // flip the observable degraded signal -- not just fall back silently.
+            assert_eq!(
+                engine.telemetry_authenticity(),
+                TelemetryAuthenticity::DegradedCredentialError,
+                "a genuinely misconfigured credential must mark telemetry authenticity as \
+                 degraded, not leave it looking identical to Nominal/never-enrolled"
+            );
         }
+    }
+
+    /// ADR-016 §10's named limitation, made into an explicit regression test rather than
+    /// left to be silently assumed covered: a device that was never enrolled (`Ok(None)`)
+    /// must never be reported as degraded -- it is not an error state.
+    #[test]
+    fn telemetry_authenticity_is_nominal_when_never_enrolled() {
+        let _env_lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var(VAULT_KEY_ENV, TEST_KEY_HEX);
+            std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
+        }
+        let _cleanup = EnvVarGuard;
+        // No device-signing-seam vars, no VEIL_OBSERVATORY_ENDPOINT: the ordinary,
+        // universal-today "not yet enrolled" case, never touching the OS keychain for a
+        // device credential at all (the endpoint-gating check in `Engine::open`).
+        let (_dir, engine) = open_engine_in_temp_dir(Some(r#"{"telemetry_enabled": true}"#));
+        assert_eq!(
+            engine.telemetry_authenticity(),
+            TelemetryAuthenticity::Nominal
+        );
     }
 }
