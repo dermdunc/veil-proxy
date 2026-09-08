@@ -523,10 +523,21 @@ needs from it is named in the item below.
       resolved by this**: `veil-observatory` still has no real ECDSA verification path built
       (KMS Verify or a native P-256 library) — the encoding question is settled, that
       integration work is separate and still unscheduled.
-- [ ] **Write the Q10 telemetry-metadata privacy section** (retention, residency, permitted joins,
-      re-identification path) into the ratification packet, alongside the Q1 registry work — the
-      plan explicitly deferred this write-up, it is not yet done
-      (`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4a).
+- [x] ~~**Write the Q10 telemetry-metadata privacy section** (retention, residency, permitted
+      joins, re-identification path) into the ratification packet, alongside the Q1 registry
+      work — the plan explicitly deferred this write-up, it is not yet done
+      (`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4a).~~ — **done 2026-09-07**,
+      as Phase 0 (P0-2) of `XREPO-007`'s device_ref work
+      (`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4b). **Real finding, corrected
+      once by a Codex adversarial round before being confirmed:** a first draft claimed no built
+      re-identification mechanism existed anywhere in this family — false; `veil-custodian`
+      already implements a gated, audited `POST /v1/resolutions` (device_binding/user_binding,
+      `Role::ResolutionAuthority`, fail-closed audit-before-disclosure). The real gap is narrower:
+      no production-grade authenticator exists yet (default build denies everyone;
+      `stub-authn` trusts a caller-supplied header — `RISK-0004`), and sealing is a documented
+      Milestone-1 plaintext placeholder (ADR-H defers real encryption to Milestone 5). §4b
+      recommends gating production enablement of real `device_ref` emission on either those
+      landing or an explicit human decision to accept the current posture for a defined interim. See ADR-016.
 - [x] ~~Get the `veil-observatory` ADR-0004 scope note actually accepted on that side.~~
       **Reviewed and accepted-with-edits 2026-08-23** by a dedicated `veil-observatory`-side
       session (own judgment, not a rubber stamp — see that repo's `docs/session-log.md`). Marker

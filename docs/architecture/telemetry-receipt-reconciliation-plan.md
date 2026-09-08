@@ -770,14 +770,151 @@ cross-referenced ledger entry.
 | Q6 | **Custom entity classes excluded from telemetry.** `detections[].class` collapses any custom-detector match to a fixed `"custom"` tag, mirroring the existing `EntityType::Display` collapse elsewhere in the codebase (`VP/crates/vg-core/src/types.rs:73`). No detector-specific custom class name ever transits the wire; volume/counts for custom-class matches remain visible. |
 | Q9 | **Drop `caller.environment`; keep `deployment_stage` only.** `deployment_stage`'s closed 4-value enum is safe as-is; free-form `environment` is dropped rather than bound to a registry, closing the infra-naming leak class named in §2.4 outright rather than mitigating it. |
 | Q11 | **Observatory-side OCSF mapping.** veil-proxy emits its native shapes (`veil.receipt.v2` / `veil.alert.v1` / `veil.edge_event.v1`) only. Any OCSF export/SIEM-integration mapping happens downstream in `veil-observatory`, decoupled from `vg-core`'s versioning — reconsidered and reversed from an initial emitter-side lean once the tension with the zero-String/closed-enum invariant was named: OCSF's category/activity/severity taxonomy is exactly the kind of externally-owned open domain §2.3 already warns generation alone doesn't make safe, and it would couple every future OCSF revision to a `vg-core` change unrelated to veil-proxy's own audit model. |
-| Q10 | **Written into the ratification packet now, not deferred to a separate DPIA track.** Retention, residency, permitted joins, and the re-identification path for telemetry metadata (device pseudonyms + metadata are personal data under GDPR even hashed, per `VP/docs/spec/requirements-and-design-spec.md:61`) are to be documented alongside the Q1 enrolment-registry work, since both sit on the same `veil-custodian` separation-of-duties boundary. **Not yet written — this is a next action, not a completed deliverable of this session** (see `docs/next-actions.md`). |
+| Q10 | **Written into the ratification packet now, not deferred to a separate DPIA track.** Retention, residency, permitted joins, and the re-identification path for telemetry metadata (device pseudonyms + metadata are personal data under GDPR even hashed, per `VP/docs/spec/requirements-and-design-spec.md:61`) are to be documented alongside the Q1 enrolment-registry work, since both sit on the same `veil-custodian` separation-of-duties boundary. ~~**Not yet written — this is a next action, not a completed deliverable of this session** (see `docs/next-actions.md`).~~ — **done 2026-09-07, see §4b.** |
 | Q7, Q8 | Left as recorded in §4 — Q7 (whether the Kind C control-decision-without-invocation case gets its own `receipt_state` value) is observatory-side modelling deferred until that work starts; Q8 (`MappingCreated`) keeps its default `TelemetryReject`, revisited only if a concrete persona query needs mapping-volume metrics. |
 
 **Not yet done, tracked as next actions:** the §3.2a type inventory; the `veil-custodian`
-enrolment-registry and signing-key-issuance build-out (Q1, Q3); the Q10 metadata-privacy write-up;
-and the paired `VO/docs/decisions/` scope note on ADR-0004 that §3.1 requires before either side
-treats this as fully ratified cross-repo (drafting that note in `veil-observatory`'s own voice was
-explicitly left for a separate confirmation, not done automatically in this session).
+enrolment-registry and signing-key-issuance build-out (Q1, Q3); ~~the Q10 metadata-privacy
+write-up~~ — **done 2026-09-07, see §4b**, written as Phase 0 of `XREPO-007` (populating
+`Envelope::device_ref` on real edge events forced the joinability question §4b's own text
+argues Q10 exists to answer); and the paired `VO/docs/decisions/` scope note on ADR-0004 that
+§3.1 requires before either side treats this as fully ratified cross-repo (drafting that note in
+`veil-observatory`'s own voice was explicitly left for a separate confirmation, not done
+automatically in this session).
+
+---
+
+## 4b. Q10 write-up — telemetry-metadata privacy (written 2026-09-07)
+
+Written as Phase 0 of `XREPO-007` (`veil-ecosystem/.hekton/cross-repo-deps.yaml:188-213`):
+wiring a real device pseudonym into `Envelope::device_ref` is exactly the joinability exposure
+Q10 was scoped to answer honestly before it existed only as an asserted "hashed refs are safe"
+claim (§4's own framing, `:742-748`). This section states the four things Q10's non-blocking
+entry asked for: retention, residency, permitted joins, and the re-identification path. It does
+**not** re-litigate Q1/Q2/Q3/Q9/Q11, ratified already in §4a.
+
+### Retention
+
+`device_ref` gets no bespoke retention rule of its own within the envelope itself — it lives
+inside the same signed record every telemetry event carries, under the retention policy already
+ratified for telemetry generally: a 24-hour hot tier feeding S3, with lifecycle tiering to
+regulatory hot and cold archive (`veil-custodian` ADR-B, cited at `docs/decisions.md:2921`).
+Nothing about `device_ref` extends, shortens, or exempts that window, *for the envelope's own
+copy*.
+
+**Correction, found by a Fable adversarial review round after both prior confirmations: that is
+not the whole retention picture, and stopping there would have been an incomplete answer to
+Q10's own question.** `veil-observatory` durably copies `device_ref` **out** of the envelope into
+its own ops-zone stores, independent of the 24-hour hot-tier policy above:
+
+- **The signing-key sightings ledger** — `record_signing_key_sighting(key_ref, record_id,
+  device_ref, disposition)` (`veil-observatory/src/veil_observatory/storage/local.py:918-936`),
+  written via `_append_unique` (append-only, no eviction) for **both** `accepted` **and**
+  `unverifiable_algorithm` dispositions (`pipeline.py:216-220`) — meaning every record Phase 1's
+  own live-run proof produces lands here, not just a hypothetical future `accepted` one. This is
+  the exact ledger `XREPO-001`/`XREPO-006`'s consumers already read and the permitted-joins
+  section above already blesses as a sanctioned join — but this write-up's first draft answered
+  "retention" only for the envelope's primary store, not for this derived, durably-persisted copy.
+- **The nonce-ledger key**, which embeds `device_ref` via `nonce_scope`
+  (`adapters/verification.py:340-347`: `f"nonce/{record.nonce_scope}/{nonce}"`) — a replay-defence
+  structure, not itself an evidentiary record, but still a place the value persists outside the
+  envelope's own clock.
+
+Neither store has a stated retention/eviction policy in this codebase as read today — the ops
+zone is the same store this repo's own code describes as having "no role gate, no reason
+requirement and no access log" (`contracts/validation.py:99-105`). **This is a real, previously
+unstated gap, not a restatement of the envelope answer above**: Q10's honest retention answer is
+"the envelope's own copy follows the 24-hour/S3-tiering policy; its derived copy in
+`veil-observatory`'s signing-key sightings ledger has no stated retention policy at all, and
+persists for as long as the ops zone is never pruned." This is exactly the kind of
+joinability-adjacent fact Q10 exists to surface rather than let slide past as "already covered by
+the envelope's own policy."
+
+### Residency
+
+Unaffected by this change. Q2's ratified decision already scopes v1 to **per-laptop enrolment
+only** (`:762`) — no near-term SaaS/multi-tenant `veil-observatory` deployment, so the
+cross-border/multi-tenant residency question `product-family.md`'s own risk list already flags
+(`:832-835`, "Data residency / cross-border transfer of telemetry itself... a centralized
+(esp. SaaS) `veil-observatory` raises its own residency question") stays exactly as open, and
+exactly as deferred, as it already was. Populating `device_ref` does not change which AWS
+account or jurisdiction `veil-observatory`'s evidence zone sits in; it changes what one record
+inside that zone can be joined against (below).
+
+### Permitted joins
+
+This is the actual substance of Q10, and the honest answer is narrower than "hashed refs are
+safe":
+
+- **Within `veil-observatory`, by design:** any two telemetry records — edge events, and once
+  built, receipts/alerts — carrying the same `device_ref` are meant to be joinable on it. That
+  is the entire point of populating the field (§2.2 of this repo's ADR-016, `docs/decisions.md`):
+  it links events across signing-key/certificate rotation, which the custodian's own ADR-F
+  (`veil-custodian/docs/decisions.md:19`) treats as an intended operational property, not a leak.
+- **Against `veil-custodian`'s own signing-key/attestation/CRL state, by design:** this is the
+  join `XREPO-001` and `XREPO-006` already built consumers for — checking a sighted `device_ref`
+  against `GET /signing-keys/{key_ref}` and `GET /attestation/status` to mint revocation/
+  expiry findings. This is the sanctioned, access-controlled join: it flows through
+  `veil-custodian`'s own `Role::Observatory` grant, never a raw database join.
+- **Against `veil-custodian`'s own resolution mechanism, by design — and it already exists.**
+  **Correction, 2026-09-07: an earlier draft of this section claimed no built resolution
+  mechanism existed anywhere in this family. That was wrong, found by a Codex adversarial review
+  round before this document was confirmed — see below.** `veil-custodian` already implements
+  exactly the `product-family.md` §6.2 pattern: it stores `device_binding`/`user_binding`
+  alongside the pseudonym (`veil-custodian/src/store/mod.rs:17-18`), exposes
+  `POST /v1/resolutions` (`src/api/mod.rs:23-24`) gated on a dedicated `Role::ResolutionAuthority`
+  distinct from `Role::Observatory` (`src/authz/mod.rs:53,149`), enforces a fail-closed order —
+  authorise, then look up, then gate offboarded/lost pseudonyms behind a legal-hold-class
+  reference, then seal, then commit an audit row, and only *then* return identity in the response
+  body (`src/api/handlers/resolutions.rs:20-30`'s own doc comment states this ordering
+  explicitly; the code follows it) — and never returns identity if the audit write itself fails
+  (`resolutions.rs:120-127`). This is a real, separation-of-duties, audited-resolution control,
+  not a recommendation for one.
+- **Against anything else that resolves a pseudonym to a real device or human identity — NOT
+  permitted, and not built.** No MDM/CMDB join, no HR/asset-registry join, exists anywhere in
+  this family's shipped code; `veil-custodian`'s own resolution endpoint above is the sole
+  sanctioned path, and even it is not yet production-hardened (below).
+
+### Re-identification path — corrected, and still a real limitation, of a different shape
+
+**Correction: a resolution mechanism is built, gated, and audited — `veil-custodian`'s
+`POST /v1/resolutions` (above). The honest limitation is that it is not yet production-hardened,
+in ways that matter for exactly the joinability question Q10 exists to answer:**
+
+- **No real authenticator exists in this family yet.** `veil-custodian` ships exactly two
+  `Authenticator` implementations: `DenyAllAuthenticator` (the default — denies every caller,
+  including a legitimate `ResolutionAuthority`) and `StubHeaderAuthenticator`, gated behind the
+  non-default `stub-authn` feature, which trusts a caller-supplied `X-Veil-Actor`/`X-Veil-Roles`
+  header outright (`src/authz/stub.rs:25-28`; `src/main.rs:100-108`). This is the same
+  self-asserted-authorisation gap `veil-ecosystem`'s own risk register already tracks
+  ecosystem-wide (`RISK-0004`, `.hekton/risk-register.yaml`) — not new, but directly load-bearing
+  here: today, "authorised `ResolutionAuthority`" means "whoever can set an HTTP header," in any
+  deployment that enables `stub-authn` at all, and means "nobody" in the default build.
+- **Sealing is a plaintext passthrough, by the repo's own documented design.** `PassthroughSealer`
+  is explicitly a Milestone 1 placeholder — "an identity function, no real cryptography"
+  (`src/keys/mod.rs:2-9,29-32`) — with real per-subject envelope encryption deferred to
+  Milestone 5 (ADR-H). The `disclosed_snapshot` a resolution audit-logs today is stored, and
+  returned, as plaintext.
+- **Net effect:** the joinability exposure `device_ref` introduces is bounded by a real,
+  fail-closed, audited *code path* — this is a materially stronger position than the prior draft
+  of this section claimed to be missing — but that path's actual access control, in any
+  deployment shipped today, reduces to "whoever can reach the endpoint and set a header" absent a
+  real authenticator, and its at-rest confidentiality reduces to "whoever can read the audit/store
+  files" absent real sealing. Neither gap is `device_ref`-specific; both are pre-existing,
+  already-documented `veil-custodian` milestones (a production authenticator, and ADR-H's
+  Milestone 5 sealing), not new work this ADR invents.
+
+**Consequence for production enablement, recorded here and cross-referenced from ADR-016:**
+this write-up satisfies P0-2's requirement that Q10 be *written*, not deferred — it is written,
+and it is now accurate rather than merely complete. The honest recommendation is that
+**production enablement of real, organic `device_ref` emission should remain gated** on one of:
+(a) `veil-custodian` shipping a real `ResolutionAuthority` authenticator and real sealing
+(Milestone 5, ADR-H) before any deployment relies on resolution being genuinely access-controlled
+and confidential, or (b) an explicit, human-made decision to accept the current stub-authn/
+plaintext-sealing posture for a defined interim period, with that acceptance itself recorded as a
+decision rather than an omission. Phase 3 (§10 of the XREPO-007 plan) is the earliest point a
+device credential even gets provisioned outside a manual env-seam, so this gate binds practice,
+not just theory, before then.
 
 ---
 
