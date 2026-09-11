@@ -4144,3 +4144,458 @@ not yet wired into any real cross-repo CI on either side — both this repo's or
 veil-observatory's ADR-0019 name the same precondition (a generated `veil.receipt.v2`/
 `veil.alert.v1`/`veil.edge_event.v1` schema artifact on this repo's side) as the reason,
 unmet as of this entry.
+
+## 2026-09-07 — ADR-016 (ACCEPTED, human-confirmed 2026-09-08): populate `Envelope::device_ref` structurally from the signing credential (`XREPO-007`)
+
+**Status: accepted, implemented on `agent/claude/xrepo-007-device-ref-derivation`, not yet
+merged.** Human-confirmed 2026-09-08 (the project owner's "move to 1b" instruction, after this
+entry's two adversarial review rounds below and the four Phase 0 decisions were each confirmed in
+turn), then implemented per §6, then subjected to a third adversarial round against the shipped
+code itself (not just this text) — see the implementation commits on that branch for what changed
+and the corrections that round produced. PR and merge are still pending explicit confirmation, per
+this repo's own discipline. Originally written as Phase 1a of the plan closing `veil-ecosystem`'s
+`XREPO-007`
+(`.hekton/cross-repo-deps.yaml:188-213`) — this repo's `TelemetryCountingAuditSink` has
+hard-coded every real edge event's `device_ref` to `None` since the field was added
+(`vg-audit/src/telemetry_sink.rs:205`), so no consumer of this repo's signed telemetry has ever
+been able to key off a real device pseudonym from organic traffic. Four Phase 0 prerequisite
+decisions were raised with, and confirmed by, the project owner before any of the below was
+written; each is recorded under its own heading.
+
+**Revised twice, same effort.** A Codex adversarial review round (live-codebase verification
+across this repo, `veil-custodian`, and `veil-observatory`, not documentation-internal
+consistency) found four real gaps in the first draft: Q10's central claim that no device-identity
+resolution mechanism exists was wrong (`veil-custodian` already has one — §6); the "structurally
+impossible to disagree" claim in §3 overclaimed past `DeviceSigningCredential::from_parts`'s own
+residual gap; §10's `Ok(None)`-vs-`Err` downgrade posture cannot distinguish a fully-removed
+credential from never-enrolled; and the companion `veil-observatory` ADR-0021 needed its own
+fixes (noted there). A second, Fable-model adversarial round then checked those very fixes rather
+than re-finding the same six, and found four more real gaps: §5 named the wrong code site for the
+`schema_version` bump entirely — the actual emission path (`sign_edge_event_record`) was never
+mentioned, so implementing the original §5 literally would have left every real record still
+declaring `v1` on the wire; §10's Codex-corrected text was itself still wrong in one direction
+(the key-vs-certificate check order); §9's closure "four limitations" had silently drifted from
+the plan's own canonical four, dropping the certificate-loader gap entirely; and Q10's retention
+answer missed that `veil-observatory` durably copies `device_ref` into an ops-zone ledger with no
+stated retention policy of its own. All eight are corrected inline below, marked where found, not
+silently smoothed over.
+
+### 1. Decision
+
+**An ECDSA-signed edge event carries the exact custodian-minted device pseudonym from the
+signing certificate, in canonical `dev_<32hex>` form. An HMAC-signed edge event carries no
+device reference at all — structurally, not by convention.**
+
+No HMAC-derivation, no on-device transformation of the pseudonym.
+
+### 2. Rationale
+
+This repo's own architecture already draws a hard line between two identity classes:
+**actor** identity is HMAC-pseudonymised per-device specifically to *prevent* cross-device
+correlation (`telemetry/pseudonymize.rs:1`), while **device** identity is an opaque pseudonym
+minted at enrolment and *deliberately present* in telemetry so a separately-held custodian can
+provide an explicit, authorised, audited resolution boundary
+(`docs/architecture/product-family.md:520,528,535`). Emitting the certificate's own pseudonym
+directly implements that second, already-ratified design; HMAC-transforming it would produce a
+value `veil-custodian` cannot resolve, breaking the one join this family's own consumers
+(`XREPO-001`, `XREPO-006`) were built to make.
+
+**Explicitly not the justification used:** "the signature already correlates these events, so
+`device_ref` adds nothing." That argument is wrong and is rejected here. Signature bytes vary
+per message; the stable in-certificate correlator already on every ECDSA record is
+`integrity.key_ref` (`signing.rs:151,317`). `device_ref` adds a *longer* correlation window on
+top of that: by design it survives certificate/signing-key rotation
+(`veil-custodian/docs/decisions.md:19`; `veil-custodian/src/api/handlers/signing_keys.rs:258,276`
+— routine rotation preserves the pseudonym, re-imaging mints a new one). That is an **intended
+operational consequence**, recorded as one below (§5), not an open question and not something
+this repo gets to re-litigate — it is settled custodian policy. And "custodian-resolvable-only"
+is not the same claim as "unjoinable": `veil-observatory` already stores a valid pseudonym
+verbatim (`veil-observatory/src/veil_observatory/storage/local.py:114,117`), so any other
+dataset carrying the same pseudonym can be joined against it without anyone being resolved to a
+human. That residual joinability exposure is exactly what Q10 (§6 below,
+`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4b) exists to answer honestly
+rather than wave away.
+
+### 3. Mechanism: structural derivation, not a threaded field
+
+**Rejected alternative: keep threading an independent `Option<DeviceRef>` into
+`EdgeEventRecordInput` from `Engine::open`.** This is today's actual shape
+(`telemetry/signing.rs:280,284`) and it is wrong to keep: it creates two independently-stored
+facts about device identity that can disagree, and lets a caller combine HMAC with a fabricated
+`Some(device_ref)`, or one ECDSA credential with a caller-supplied reference belonging to a
+different device — both possible today precisely because `EdgeEventRecordInput.device_ref` is
+independent of `SigningCredential`.
+
+**Decision: remove the field, derive it instead.**
+
+1. Remove `device_ref` from `EdgeEventRecordInput` (`telemetry/signing.rs:280,284`).
+2. Add `SigningCredential::device_ref(&self) -> Option<DeviceRef>` alongside the existing
+   `algorithm()`/`key_ref()` methods on that same enum (`signing.rs:310-327`): `None` for
+   `Hmac`, `Some(cred.device_ref())` for `EcdsaP256` — `DeviceSigningCredential::device_ref()`
+   already returns the exact `vg_core` type (`signing.rs:202`), so no vault→core conversion
+   layer is needed, and no new certificate-parsing work is needed either: the SAN-derived,
+   length-checked `DeviceRef` this loader already produces
+   (`vg-vault/src/certificate.rs:71`, hex-decoded and rejected if not exactly 16 bytes) is the
+   same value this method exposes.
+3. `sign_edge_event_record` derives `Envelope::device_ref` from `SigningCredential::device_ref()`
+   exactly as it already derives `algorithm()` and `key_ref()` from the same enum.
+4. Remove the now-dead `device_ref: None` line from `vg-audit/src/telemetry_sink.rs:205`.
+
+This is the same move this module already made once, for the same reason:
+`SigningCredential::key_ref()` (`signing.rs:317-327`) exists specifically because an earlier
+version let `key_ref` be threaded independently and disagree with the certificate that actually
+signed (documented verbatim in that method's own doc comment, and again on
+`DeviceSigningCredential::from_parts`, `signing.rs:151-160`). Deriving `device_ref` the same way
+makes "ECDSA ⇒ exact certificate identity / HMAC ⇒ none" structural **at the
+`SigningCredential`/`sign_edge_event_record` boundary** — a caller reaching `sign_edge_event_record`
+cannot construct a disagreeing pair — rather than a rule enforced only by discipline at one call
+site.
+
+**Correction, found by a Codex adversarial review round before this ADR was confirmed: this is
+narrower than "structurally impossible to disagree," full stop.** `DeviceSigningCredential::from_parts`
+itself remains `pub` and takes `device_ref: DeviceRef` as an independent parameter, stored
+verbatim — unlike `key_ref`, which `from_parts` derives internally from `certificate_der`,
+`device_ref` is **not** derived from the certificate inside `from_parts` (`signing.rs:174-185`):
+a caller could construct a `DeviceSigningCredential` whose `device_ref` does not match its own
+`certificate_der`'s SAN. This is not a new gap this ADR introduces — it is the same residual
+already named in the governing plan's OQ-13 ("`from_parts` is `pub` and unvalidated... convention,
+not type enforcement. Note it; do not assume type possession means issuer authentication") — but
+this ADR's own §3 text overclaimed past that residual and must not. What *is* true, and is what
+actually matters for production: the only legitimate production path,
+`vg-vault::keychain::load_device_signing_credential`, always constructs the credential via
+`validate_signing_certificate_pem`'s own parsed, SAN-derived `device_ref`
+(`vg-vault/src/keychain.rs:219-223`), so agreement is guaranteed *for that one path*, by
+convention plus the fact that nothing else in this codebase calls `from_parts` with untrusted
+input. §12's test list is corrected accordingly: "no path produces a different value" is replaced
+with "the production loader path (`load_device_signing_credential` →
+`validate_signing_certificate_pem`) always produces a credential whose `device_ref` matches its
+own certificate's SAN" — a true, checkable claim — plus an explicit, separate test that
+`SigningCredential::device_ref()` merely reflects whatever `DeviceSigningCredential` it is given,
+which is trivially true and does not by itself guarantee certificate agreement.
+
+**Second correction, found by a later Codex round against the shipped implementation, not just
+this text: `key_ref` has the identically-shaped residual, and the "unlike `key_ref`" phrasing
+above invites the wrong reading.** `from_parts` derives `key_ref` from whatever `certificate_der`
+bytes it is given (`KeyRef::from_certificate_der(certificate_der)`) — true, and that much really is
+structural, `key_ref` cannot be independently supplied. But `from_parts` never cross-checks that
+`certificate_der` corresponds to `signing_key` at all; its own test helper constructs exactly this
+mismatch deliberately (`signing.rs`, `sample_ecdsa_credential`, using placeholder DER unrelated to
+the test key). So "`key_ref` cannot disagree with the key that actually signs" is *not* guaranteed
+by `from_parts` alone — it is guaranteed the same way `device_ref` agreement is: only by the
+production loader's own separate check, `validate_signing_certificate_pem` cross-checking the
+loaded private key's public half against the certificate's `SubjectPublicKeyInfo`
+(`vg-vault/src/certificate.rs`) before `keychain.rs:219-223` ever calls `from_parts`. Read "unlike
+`key_ref`" above as scoped narrowly — `key_ref` cannot be overridden as an independent parameter,
+which `device_ref` (pre-this-ADR) could — not as a claim that `key_ref` has no `from_parts`
+residual at all. It has the same one, for the same reason, closed by the same one production path.
+
+**Minimum-acceptable fallback considered and not needed:** rejecting a caller-supplied value
+that disagrees with the credential, rather than removing the field outright, was the fallback
+option if removing a frozen-contract field proved too disruptive. It is not needed — see §7
+below; the interface-contract cost of removing the field is bounded and budgeted. This does not
+touch the `from_parts` residual above, which predates this ADR and is not fixed by it.
+
+### 4. Wire format: `dev_<32hex>` (P0-1, human-confirmed)
+
+`DeviceRef` is `[u8; 16]` and today serialises as bare lowercase hex (`ids.rs:316-323`).
+`veil-custodian`'s wire form is strict `dev_<32 lowercase hex>`
+(`veil-custodian/src/domain/pseudonym.rs:59`) — same 16 bytes, only the `dev_` prefix differs.
+**Decision: change `DeviceRef`'s `Serialize` impl (`ids.rs:316-323`) to emit `dev_<32hex>`.**
+Serialisation-only: `DeviceRef` has no `Deserialize` and no `FromStr` (`ids.rs:40,305`), so there
+is no inbound parse path to update and no back-compat burden — the field has been `None` on
+every event ever emitted.
+
+**This supersedes `veil-enrol`'s ADR-VE-005** (`veil-enrol/docs/decisions.md:12`), which ratified
+the premise that custodian's `dev_` form and this repo's bare-hex form are both deliberately
+strict on their own side and that `veil-enrol` is the sole owner of the conversion between them
+(`veil-enrol/src/pseudonym.rs:69`). That premise no longer holds once this repo emits `dev_`
+directly. **`veil-enrol`'s ADR-VE-005 must be amended** (not silently orphaned) to record that
+its conversion-ownership role now applies only where a bare-hex value still exists in that repo's
+own process (e.g. any place it independently derives a pseudonym before this change lands
+elsewhere in the family) — filed as a same-day follow-up in that repo's own `decisions.md`,
+cross-referencing this entry.
+
+### 5. Versioning: `schema_version` bump to `veil.edge_event.v2` (P0-1, human-confirmed)
+
+Two defensible options were on the table: no version change at all (this was already the
+documented v1 contract shape, so this is conformance not a contract change), or a
+`schema_version` change (producer semantics genuinely change: a field that was always-null now
+carries a stable identifier). **Decision: bump `schema_version`.** Argued against the actual
+rule (`docs/architecture/telemetry-receipt-reconciliation-plan.md:654-657`): `schema_version`
+changes on *any* semantic or shape change, while `contract_revision` is reserved for
+additive-only changes within one `schema_version`. Populating an always-null field with a
+newly-meaningful, joinable identifier is a semantic change to what the field means, not an
+additive one — `contract_revision` is the wrong lever, and "bump `EDGE_EVENT_CONTRACT_REVISION`
+to 2" (an option this plan's own §2.5 already argues against on these grounds, see
+`telemetry-receipt-reconciliation-plan.md:638-657`) stays rejected for exactly that reason.
+
+**Why this is not the cost-free-but-hollow gesture a `contract_revision` bump would have been**,
+confirmed by reading `veil-observatory`'s actual ingest code rather than assumed:
+`contracts/validation.py`'s `SCHEMA_FILES` dict and `contracts/edge_event.py`'s `from_dict`
+(`:120`) both hard-code the literal `"veil.edge_event.v1"` — they do not read the incoming
+envelope's own `schema_version` field to decide which schema to validate against. A
+`schema_version` bump therefore is **not** silently absorbed the way an unenforced
+`contract_revision` gate would be (`veil-observatory/schemas/veil.edge_event.v1.schema.json:95`,
+which accepts any `contract_revision >= 1` with no quarantine behavior) — it is a real,
+structural fork: an envelope declaring `veil.edge_event.v2` validated against the `v1` schema's
+`"const": "veil.edge_event.v1"` requirement (`:108`) fails outright. **This is real coordination
+cost, not paperwork**, and is exactly why `veil-observatory` gets its own companion ADR
+(§8 below) rather than this repo assuming "no Observatory change needed."
+
+**Mechanical consequence in this repo — corrected, found wrong by a Fable adversarial review
+round after the Codex round had already confirmed the ADR: an earlier draft of this paragraph
+named the wrong call site as what needs to change.** `SchemaVersion` (`envelope.rs:27-31`) gains
+`EdgeEventV2`, wired to the literal `"veil.edge_event.v2"` (`envelope.rs:38-45`) — that much was
+right. But `telemetry/mod.rs`'s `check_schema_version` gate (`mod.rs:202`, inside
+`TelemetryEvent::new_edge_event`) is **not** the code every real wire record goes through — it
+sits on the `TryFrom<&AuditEvent>` conversion path, which this module's own doc records as
+currently all-rejecting and unused in production. **The actual emission path is
+`sign_edge_event_record`, which constructs both its unsigned and signed envelopes via two direct
+calls to `Envelope::new(SchemaVersion::EdgeEventV1, ...)` (`signing.rs:406,432`), entirely
+independent of `check_schema_version`.** Those two call sites are what must change to
+`SchemaVersion::EdgeEventV2` — moving only `mod.rs:202`'s gate, as the earlier draft said, would
+leave every real emitted record still declaring `"veil.edge_event.v1"` on the wire, which the
+`v1` schema (`maxLength: 128`, no pattern) would accept without complaint — silently defeating
+the entire point of §5's bump. The golden-string test (`envelope.rs:353-359,402`) needs a
+matching update to assert `EdgeEventV2`'s wire string, and the golden-vector change in §12 must
+assert the emitted `schema_version` is `"veil.edge_event.v2"` explicitly, not just that
+`device_ref` is non-null — the earlier draft's test description didn't pin the version literal
+and so would not have caught this bug. `schema_version_label` (`mod.rs:149`) and this module's
+own doc comments naming `veil.edge_event.v1` (`signing.rs:1,23-25`) also need updating for
+accuracy, though nothing depends on them functionally. The JSON Schema's own `const`
+(`veil.edge_event.v2.schema.json`, new file, veil-observatory side) moves in lockstep with the
+corrected Rust-side change. `EdgeEventV1` itself is **not removed** — `#[non_exhaustive]` already
+anticipates more variants, and nothing in this repo has ever emitted a real `EdgeEventV1` edge
+event with a populated `device_ref`, so there is no historical `v1` record whose meaning this
+bump would need to preserve.
+
+### 6. Consequence: joinability is the residual exposure, and Q10 is now written (P0-2, human-confirmed)
+
+Q10 — the telemetry-metadata privacy write-up (retention, residency, permitted joins,
+re-identification path), previously deferred (`docs/next-actions.md:526`,
+`telemetry-receipt-reconciliation-plan.md` §4a) — is now written
+(`telemetry-receipt-reconciliation-plan.md` §4b). **It is not a clean bill of health, and its
+first draft's central claim was itself wrong — corrected by a Codex adversarial round before
+this ADR was confirmed.** The first draft claimed no built, access-controlled, audited
+resolution mechanism existed anywhere in this family. False: `veil-custodian` already implements
+one — `POST /v1/resolutions`, gated on `Role::ResolutionAuthority`, fail-closed
+audit-before-disclosure ordering (`veil-custodian/src/api/handlers/resolutions.rs`). The real,
+corrected gap is narrower: no production-grade `Authenticator` exists for that role yet (default
+build denies everyone; the only alternative, `stub-authn`, trusts a caller-supplied header — the
+same gap `veil-ecosystem`'s `RISK-0004` already tracks ecosystem-wide), and sealing is a
+documented Milestone-1 plaintext placeholder, with real encryption deferred to Milestone 5
+(ADR-H). §4b recommends gating production enablement of real `device_ref` emission on either
+those two landing, or an explicit human decision to accept the current posture for a defined
+interim period. **That recommendation is recorded here, not silently adopted**: this ADR
+covers the structural wiring and its non-production live proof (§9); it does not itself flip any
+production-enablement switch, because none exists yet — telemetry is opt-in configuration a
+human already controls per-deployment (ADR-015). The gate is a recommendation for whoever
+decides to actually turn `VEIL_OBSERVATORY_ENDPOINT` on for a real enrolled fleet, not a code
+change this session makes.
+
+### 7. Interface-contract impact
+
+This repo's interface contract is frozen at v1.7 and lists `DeviceSigningCredential`/the signing
+input as part of the frozen public seam (`docs/architecture/interface-contracts.md:1`). Removing
+`device_ref` from `EdgeEventRecordInput` is a non-additive, breaking signature change to that
+seam — the same class of change v1.6's `sign_edge_event_record` re-signing already was
+(`interface-contracts.md:368`). **Lands as v1.8** (Phase 1b, `interface-contracts.md`'s own
+version-history line and its §7a addendum), following the same protocol v1.6/v1.7 did
+(`agent-factory-plan.md` §6), with the one prior caller (`vg-audit::telemetry_sink`) updated in
+the same change — mirroring exactly how v1.6 was scoped. `SigningCredential::device_ref()` itself
+is private (matching `algorithm()`/`key_ref()`'s existing visibility), so its addition is not, on
+its own, a public-contract change — only the field removal triggers the bump.
+
+### 8. `veil-observatory`: expect real change, not none
+
+Earlier drafts of this plan expected "no storage change" on the Observatory side, reasoning from
+its schema and storage code accepting the string as-is
+(`veil-observatory/schemas/veil.edge_event.v1.schema.json:96`,
+`veil-observatory/src/veil_observatory/storage/local.py:114`). **That expectation does not
+survive contact with §5's schema_version bump or P0-1's schema-tightening decision.** Both
+require real Observatory-side work: a new `veil.edge_event.v2.schema.json` (with `device_ref`
+tightened to `^dev_[a-f0-9]{32}$`, no longer "any string ≤128 chars"), and a fix to
+`contracts/edge_event.py`'s `from_dict` so it dispatches on the incoming envelope's own
+`schema_version` instead of a hard-coded `"veil.edge_event.v1"` literal. This gets its own
+companion ADR on that repo's side, per that repo's own discipline — not pre-written here.
+
+### 9. Proof scope, honestly bounded (P0-4, human-confirmed)
+
+`veil-observatory`'s verifier supports HMAC only and explicitly, correctly refuses ECDSA records
+(`veil-observatory/src/veil_observatory/adapters/verification.py:55,212`) — they land as
+`unverifiable_algorithm`, never `accepted` (`pipeline.py:184`), and `verify-device-attestation`
+considers only `accepted` sightings (`cli.py:463`; `ADR-0020:90`). **Decision: narrow this
+session's live-run proof to what that honestly allows, and file real Observatory ECDSA
+verification as its own separate registry item (Phase 2) rather than sequencing it first.**
+
+**What the live-run proof (Phase 1c) can show:** a real custodian-issued credential produces an
+ECDSA edge-event record carrying the expected `dev_<32hex>` pseudonym from its certificate SAN;
+the signature verifies externally (veil-demo's existing from-scratch DER-wrapping verifier);
+`veil-observatory` parses and retains the pseudonym verbatim in its sighting ledger
+(`storage/local.py:114,117`); the record lands under disposition `unverifiable_algorithm`
+(`pipeline.py:216`).
+
+**Closure limitations — corrected to the plan's own canonical four (governing plan §8), found by
+a Fable adversarial review round to have quietly drifted in an earlier draft of this section,
+which listed a different four and dropped the certificate-loader gap entirely:**
+
+1. Organic traffic without a seamed or (future) keychain-installed credential still emits
+   `device_ref: null`; no device-side credential installer exists
+   (`vg-vault/src/keychain.rs:137` remains load-only).
+2. `veil-observatory` cannot cryptographically verify ECDSA, so these sightings land as
+   `unverifiable_algorithm`, not `accepted`, and the attestation consumer still cannot key off
+   them (`cli.py:463`; `ADR-0020:90`).
+3. The certificate loader does not verify the CA signature or validity interval
+   (`vg-vault/src/certificate.rs:27-32`) — Phase 1 accepts this because the credential comes from
+   the local, already-trusted OS keychain; it becomes a hard requirement in Phase 3, which accepts
+   a certificate *file*.
+4. Historical null records are not backfilled.
+
+These four, verbatim, are what close `XREPO-007` — matching ADR-0021's own list on the
+`veil-observatory` side, not a separately-drifted set.
+
+### 10. Downgrade posture: unhealthy/quarantined, masking unaffected (P0-3, human-confirmed)
+
+`Engine::open` (`vg-adapters-claude/src/runtime.rs:205-218`) already distinguishes two outcomes
+from `load_device_signing_credential`: `Ok(None)` and `Err`. Today both end the same way once a
+device is expected to be enrolled: falls back to HMAC, `Err` additionally logging one
+`eprintln!` warning. Once `device_ref` is meaningful, an `Err` path silently turns authenticity
+ECDSA telemetry into unauthenticated-as-to-device HMAC telemetry, and — because a real pseudonym
+is now on the line — also silently suppresses the one pseudonym a downstream consumer would have
+keyed off.
+
+**Correction, found by a Codex adversarial review round before this ADR was confirmed: `Ok(None)`
+vs. `Err` is not a reliable "was enrolled, now broken" vs. "never enrolled" split, and this ADR's
+first draft claimed it was.** Reading `load_device_signing_credential`'s full body
+(`vg-vault/src/keychain.rs:155-224`): if **both** keychain entries are deleted (the key lookup
+runs first and short-circuits), the result is `Ok(None)` — identical to a device that was never
+enrolled at all (`keychain.rs:174,179`). Conversely, a keychain backend/init failure reaches
+`Err` (`keychain.rs:169-172`) without proving any credential ever existed. So the specific
+scenario P0-3 was raised to catch — "a removed... managed credential... silently turns
+authenticated ECDSA telemetry into HMAC telemetry" (the plan's own P0-3 wording) — is **not**
+caught by branching on `Ok(None)` vs. `Err` alone: deleting both entries (the most direct way to
+remove a credential) produces exactly the silent, unflagged `Ok(None)` path this decision was
+meant to stop being silent.
+
+**Decision, narrowed to what Phase 1 can actually implement without a durable enrolment marker
+(which does not exist until Phase 3 builds an installer):**
+
+1. On `Err`, mark the engine's telemetry authenticity as degraded via an observable signal, not
+   just a stderr line indistinguishable from any other warning — e.g. an `Engine`-level queryable
+   state (`telemetry_authenticity() -> TelemetryAuthenticity::{Nominal, DegradedCredentialError}`
+   or equivalent, exact shape decided at implementation time). **Corrected, found by a Fable
+   adversarial review round after the Codex round had already confirmed this ADR: point 1's own
+   parenthetical here ("material actually found") is wrong, and its claimed coverage overstated a
+   second time in the opposite direction.** `Err` fires on real credential-loader failures, but
+   two of those prove no credential material was ever present at all — `Entry::new` failing to
+   even open a keychain entry (`keychain.rs:169-170`, a backend/init problem, e.g. a locked
+   keychain) and a bare env-var read error — so "material actually found" is not an accurate
+   description of everything that reaches this branch; the degraded signal will fire on those too,
+   which is acceptable (better a false-positive degraded signal than a false-negative silent one)
+   but must not be described as more precise than it is. Separately, the coverage claim itself was
+   asymmetric: reading `load_device_signing_credential`'s key-then-cert order
+   (`keychain.rs:174-188`) shows the key lookup runs **first** and short-circuits to `Ok(None)`
+   the moment it is missing, **without ever checking whether a certificate entry exists**. So
+   "cert present without its key" is caught (proceeds to read the cert, which then fails to load
+   correctly against no matching key → `Err`) but "**key** present without its **cert**" is *not*
+   reliably caught either if the situation is reversed at the point of failure — concretely, key
+   entry missing (regardless of whether a certificate entry happens to still exist) returns
+   `Ok(None)`, identical to never-enrolled, every time. The correct, narrower claim: `Err` catches
+   a present-but-broken *key* (partial env-seam, malformed scalar, key/certificate mismatch once
+   both are read) — it does not reliably catch every "one half of the pair is missing" case, only
+   the ones where the key half is present.
+2. **Named limitation, not silently accepted, and now stated precisely:** any state where the
+   **key** keychain entry is absent — whether because both entries were removed, or the key entry
+   alone was removed while an orphaned certificate entry remains — is indistinguishable from
+   never-enrolled under this signal, and stays silent, exactly as silent as today. Distinguishing
+   "this device is expected to be enrolled" from "this device has never been enrolled" requires a
+   durable, independent marker written at install time, which is Phase 3 territory (§10 of the
+   governing plan; no installer exists yet to write one). P0-3's posture is therefore only
+   **partially** achieved in Phase 1 — the subset of `Err` cases where the key entry is present
+   but something else is wrong, not any case where the key entry itself is missing — and this ADR
+   states that gap explicitly rather than implying full coverage.
+
+Emission itself is **not** disabled in either case — masking must keep working regardless
+(`veil-custodian` ADR-E: certificate state gates telemetry authenticity only, never masking),
+and this repo's own `Engine` already has no coupling between credential state and masking to
+preserve, so this decision does not touch masking at all.
+
+### 11. Migration statement
+
+Historical records with `device_ref: null` remain `null` and are not backfilled. Nothing in this
+change alters records already emitted.
+
+### 12. Tests required (Phase 1b, not yet built by this entry)
+
+- **Corrected per §3's Codex-found gap:** the production loader path
+  (`load_device_signing_credential` → `validate_signing_certificate_pem`) always produces a
+  credential whose `device_ref` matches its own certificate's SAN — this is the true, checkable
+  claim, not "no path produces a different value" (`DeviceSigningCredential::from_parts` remains
+  a `pub`, unvalidated constructor that accepts an independent `device_ref`; that residual is
+  named, not fixed, by this ADR — see §3). Separately: `SigningCredential::device_ref()` returns
+  exactly whatever `DeviceSigningCredential` it wraps, for both credential variants.
+- HMAC signer cannot emit any device reference, even under an attempted caller override (moot
+  once `EdgeEventRecordInput.device_ref` is removed, but the enum-level guarantee gets its own
+  direct test).
+- A **non-null** ECDSA golden vector that also **pins the `schema_version` literal**: the existing
+  golden test constructs a credential carrying a `DeviceRef` but submits `device_ref: None`
+  (`vg-core/tests/telemetry.rs`, near `:599-619`) — a serializer-only change would not touch it
+  today, leaving the only ECDSA cross-language vector blind to this invariant. Changed to
+  non-null, **and** asserted to declare `"schema_version": "veil.edge_event.v2"` explicitly — not
+  just non-null `device_ref` — precisely because §5's Fable-found bug (the emission path still
+  declaring `v1`) would otherwise pass a device_ref-only assertion undetected.
+- Negative certificate tests: malformed SAN prefix, non-hex suffix, wrong length, multiple URI
+  SANs — the loader already enforces `urn:veil:device:dev_<32hex>` and rejects anything not
+  exactly 16 bytes (`vg-vault/src/certificate.rs:71`, `220`), but the present suite has no
+  malformed-SAN fixture.
+- Credential-load error behaviour proving §10's posture: an `Err` from
+  `load_device_signing_credential` where the key entry is present but something else is wrong
+  (partial env-seam, key/certificate mismatch) results in the degraded/quarantined signal, HMAC
+  emission continuing, and no change whatsoever to any masking-path test. Plus a test proving
+  `TelemetryAuthenticity`'s *default* value (`Nominal`) when the credential-lookup branch is
+  skipped entirely (no `VEIL_OBSERVATORY_ENDPOINT` set).
+  **Correction, found by a Codex adversarial review round against the shipped implementation,
+  not just this ADR's text: the bullet that previously stood here claimed tests existed proving
+  §10's named limitation (a device whose key keychain entry is absent, alone or alongside an
+  orphaned certificate). No such tests exist, and none can, with the infrastructure Phase 1 has.**
+  The env-seam is all-or-nothing (both `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
+  set, or both unset) — it cannot represent "one specific OS-keychain entry present, the other
+  absent"; setting only one seam var instead hits the loader's *different* "both must be set or
+  unset" `Err` branch, which is already covered but is not the same scenario. Exercising the
+  loader's real `Ok(None)` return (via the actual OS keychain, `VEIL_OBSERVATORY_ENDPOINT` set,
+  both seam vars unset) and §10's named limitation itself both require a gated real-keychain
+  integration test — exactly the kind of testing the governing plan's §10.3 already scopes to
+  Phase 3, not Phase 1. This ADR's own §10 correctly describes the limitation in prose; it should
+  not have also claimed automated coverage that was never built.
+- Observatory-side schema/storage fixture for the canonical `dev_` form, on the `veil.edge_event.v2`
+  schema (companion ADR, §8).
+- **Replay/nonce partitioning test.** `veil-observatory` folds `device_ref` into `nonce_scope`
+  (`contracts/edge_event.py:89-94`: `f"{tenant or 'notenant'}/{device_ref or 'nodevice'}"`).
+  Changing every real event's component from the literal `nodevice` to a stable per-device
+  pseudonym repartitions replay detection — this is a live behavioural change to a security
+  control and needs its own proof, not just a schema fixture.
+
+Plus the full `cargo test --workspace --locked` suite and all fitness/architecture tests,
+independently verified, same as every prior entry in this file.
+
+### Non-goals, unchanged from this session's scope
+
+No `DeviceRef` deserialisation/`FromStr`/parse leniency (no inbound consumer exists). No generic
+`vg-cli credential install` command — superseded by the already-decided `vg enrol
+request-csr`/`install-cert` workflow (`veil-enrol/docs/architecture.md:32,51`), itself a separate,
+larger, later registry item. No device credential lifecycle/installer (Phase 3, separate item).
+No `veil-observatory` real ECDSA verifier (Phase 2, separate item). No backfill of historical
+null records.
+
+---
+
+`docs/architecture/telemetry-receipt-reconciliation-plan.md` §4b (Q10) and
+`docs/next-actions.md`'s corresponding item were written/updated the same session as part of
+this ADR's own P0-2. **Corrected 2026-09-08: this ADR was confirmed before any code was written,
+per this repo's own established discipline (ADR-S, ADR-013/014/015 and every closed `XREPO-00N`
+item to date all had a written, confirmed decision record before implementation began) — an
+earlier version of this closing paragraph, now stale, said no branch existed yet. Implementation
+has since landed** on `agent/claude/xrepo-007-device-ref-derivation` (§6, this repo's own
+`build`/`test`/`clippy`/`fmt`/`deny`/`audit` gates all clean, plus a further Codex adversarial
+round against the shipped code — see that branch's commit history). PR and merge remain pending
+explicit human confirmation, and Phase 1c's live-run proof has not yet been performed.

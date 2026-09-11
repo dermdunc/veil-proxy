@@ -27,19 +27,34 @@ use super::ids::{DeviceRef, KeyRef, RecordId, TenantId};
 pub enum SchemaVersion {
     ReceiptV2,
     AlertV1,
+    /// Superseded on the production emission path by [`EdgeEventV2`](Self::EdgeEventV2)
+    /// as of ADR-016 (XREPO-007) — kept, not removed, because `#[non_exhaustive]` already
+    /// anticipates more variants and nothing in this repo has ever emitted a real
+    /// `EdgeEventV1` record with a populated `device_ref`, so there is no historical
+    /// record whose meaning removing it would disturb.
     EdgeEventV1,
+    /// The current `veil.edge_event.v2` wire contract (ADR-016, XREPO-007): `device_ref`
+    /// is populated from the signing credential for ECDSA and structurally absent for
+    /// HMAC, and serialises as `dev_<32hex>` rather than bare hex — see
+    /// `telemetry::ids::DeviceRef`'s own doc. This is a semantic change to what the
+    /// field means, not an additive one, which is why it is a `schema_version` bump
+    /// rather than a `contract_revision` increment (argued in the ADR against
+    /// `docs/architecture/telemetry-receipt-reconciliation-plan.md`'s own versioning
+    /// rules).
+    EdgeEventV2,
 }
 
 impl Serialize for SchemaVersion {
     /// Fixed wire tags, hand-matched rather than derived: `veil-observatory`'s verifier
-    /// gates on the exact string `"veil.edge_event.v1"` for `EdgeEventV1` (this session's
-    /// scope; the other two variants are given the analogous, so-far-unused tags for
-    /// `Receipt`/`Alert`, kept consistent with this one rather than left unspecified).
+    /// gates on the exact string for each `EdgeEvent*` variant (the other two variants
+    /// are given the analogous, so-far-unused tags for `Receipt`/`Alert`, kept consistent
+    /// with this one rather than left unspecified).
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let s = match self {
             SchemaVersion::ReceiptV2 => "veil.receipt.v2",
             SchemaVersion::AlertV1 => "veil.alert.v1",
             SchemaVersion::EdgeEventV1 => "veil.edge_event.v1",
+            SchemaVersion::EdgeEventV2 => "veil.edge_event.v2",
         };
         serializer.serialize_str(s)
     }
@@ -351,12 +366,27 @@ mod tests {
 
     #[test]
     fn schema_version_edge_event_v1_serializes_to_the_exact_gated_string() {
-        // `veil-observatory`'s existing verifier gates on this exact literal string —
-        // see this type's `Serialize` impl doc.
+        // Kept alongside `EdgeEventV2` (ADR-016, XREPO-007) even though nothing on the
+        // production emission path constructs this variant anymore — `v1` is a real
+        // historical wire shape (`schemas/veil.edge_event.v1.schema.json` on the
+        // `veil-observatory` side still validates against it), not a removed one.
         let v = serde_json::to_value(SchemaVersion::EdgeEventV1).unwrap();
         assert_eq!(
             v,
             serde_json::Value::String("veil.edge_event.v1".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_version_edge_event_v2_serializes_to_the_exact_gated_string() {
+        // `veil-observatory`'s ADR-0021 companion resolver gates on this exact literal
+        // string — see this type's `Serialize` impl doc, and ADR-016 §5's own
+        // Fable-round correction on why pinning this literal (not just non-null
+        // `device_ref`) matters for the cross-language golden vector.
+        let v = serde_json::to_value(SchemaVersion::EdgeEventV2).unwrap();
+        assert_eq!(
+            v,
+            serde_json::Value::String("veil.edge_event.v2".to_string())
         );
     }
 

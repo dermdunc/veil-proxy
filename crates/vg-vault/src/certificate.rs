@@ -66,8 +66,10 @@ const PRIME256V1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 /// The SAN URI prefix a device's signing certificate carries (ADR-S: identical
 /// convention to the existing ADR-A mTLS cert's SAN). The `dev_`-prefixed suffix is
 /// `veil-custodian`'s own wire form for a pseudonym (ADR-G); this crate strips the
-/// prefix before handing the raw 16 bytes to [`DeviceRef`], which — on the veilgremlin
-/// side — serializes bare, with no prefix (ADR-G's own corrected wire-format note).
+/// prefix before handing the raw 16 bytes to [`DeviceRef`], which — as of ADR-016
+/// (XREPO-007) — re-adds the identical `dev_` prefix on serialisation, matching
+/// custodian's wire form byte-for-byte (superseding the bare-hex serialisation ADR-G's
+/// note originally described).
 const DEVICE_SAN_URI_PREFIX: &str = "urn:veil:device:dev_";
 
 /// A certificate that has passed every ADR-S signing-profile check, plus the identifiers
@@ -224,6 +226,24 @@ fn device_ref_from_san(names: &[GeneralName]) -> Result<DeviceRef, VaultError> {
         ))
     })?;
 
+    // **Correction, found by a Codex adversarial review round against the shipped
+    // implementation: `decode_hex` (shared with the env-seam's human-typed-hex-key
+    // parsing, where case-insensitivity is a deliberate convenience) accepts BOTH
+    // upper- and lowercase hex digits via `char::to_digit(16)`. Custodian's own
+    // `DevicePseudonym::FromStr` explicitly rejects any uppercase byte
+    // (`veil-custodian/src/domain/pseudonym.rs`), so a certificate whose SAN carries
+    // uppercase hex is not a shape custodian's own CA would ever issue.** This is a
+    // certificate claiming an identity, not an operator-typed convenience value — it
+    // must be exactly as strict as the wire form it claims to carry, not looser.
+    if !suffix
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(crypto_err(
+            "signing certificate SAN device pseudonym is not lowercase hex",
+        ));
+    }
+
     let bytes = decode_hex(suffix)
         .ok_or_else(|| crypto_err("signing certificate SAN device pseudonym is not valid hex"))?;
 
@@ -237,7 +257,105 @@ fn device_ref_from_san(names: &[GeneralName]) -> Result<DeviceRef, VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use der::asn1::Ia5String;
     use vg_core::telemetry::KeyRef;
+
+    fn uri_san(s: &str) -> GeneralName {
+        GeneralName::UniformResourceIdentifier(Ia5String::new(s).expect("valid IA5String"))
+    }
+
+    /// Negative SAN-parsing tests (ADR-016 §12, XREPO-007) — the governing plan's own
+    /// text names this gap explicitly: `device_ref_from_san` already enforces
+    /// `urn:veil:device:dev_<32hex>` and rejects malformed input, but the present suite
+    /// (at the time this ADR was written) had no fixture actually exercising it. Targets
+    /// the private parsing function directly rather than round-tripping through a full
+    /// generated certificate — this isolates the SAN-extraction logic itself, which is
+    /// where all of this behaviour actually lives.
+    mod device_ref_from_san_tests {
+        use super::*;
+
+        #[test]
+        fn rejects_no_uri_entry_at_all() {
+            let names = vec![]; // no GeneralName::UniformResourceIdentifier at all
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_a_uri_with_the_wrong_prefix() {
+            let names = vec![uri_san(
+                "urn:veil:host:dev_0102030405060708090a0b0c0d0e0f10",
+            )];
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_a_non_hex_suffix() {
+            let names = vec![uri_san(
+                "urn:veil:device:dev_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            )];
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_uppercase_hex_even_though_it_is_valid_hex() {
+            // Custodian's own DevicePseudonym::FromStr rejects uppercase explicitly --
+            // this loader must be exactly as strict, not looser, since it is validating
+            // a certificate's claimed identity, not a human-typed convenience value.
+            let names = vec![uri_san(
+                "urn:veil:device:dev_0102030405060708090A0B0C0D0E0F10",
+            )];
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_a_suffix_that_is_too_short() {
+            let names = vec![uri_san(
+                "urn:veil:device:dev_0102030405060708090a0b0c0d0e0f",
+            )]; // 15 bytes
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn rejects_a_suffix_that_is_too_long() {
+            let names = vec![uri_san(
+                "urn:veil:device:dev_0102030405060708090a0b0c0d0e0f1011",
+            )]; // 17 bytes
+            assert!(device_ref_from_san(&names).is_err());
+        }
+
+        #[test]
+        fn accepts_the_first_uri_san_when_a_second_non_uri_name_follows() {
+            // Multiple SAN entries, only one of which is a URI -- must not be confused
+            // by the presence of another `GeneralName` variant.
+            let names = vec![
+                uri_san("urn:veil:device:dev_0102030405060708090a0b0c0d0e0f10"),
+                GeneralName::DnsName(
+                    der::asn1::Ia5String::new("example.invalid").expect("valid IA5String"),
+                ),
+            ];
+            let expected =
+                DeviceRef::try_from((1u8..=16u8).collect::<Vec<_>>().as_slice()).unwrap();
+            assert!(device_ref_from_san(&names).unwrap() == expected);
+        }
+
+        /// Ambiguous SAN-selection behaviour, named explicitly rather than left
+        /// undocumented: `device_ref_from_san` uses `find_map`, which stops at the
+        /// *first* `UniformResourceIdentifier` entry it encounters — it does not skip a
+        /// malformed first URI to try a second, well-formed one. A certificate with two
+        /// URI SANs, the first malformed, is rejected even though a valid pseudonym is
+        /// present later in the same extension. This is current, intentional behaviour
+        /// (first-URI-wins, not first-*valid*-URI-wins) — this test locks it in so a
+        /// future change to more lenient multi-URI handling is a deliberate, reviewed
+        /// decision, not an accidental behaviour change.
+        #[test]
+        fn does_not_fall_through_to_a_second_uri_san_if_the_first_is_malformed() {
+            let names = vec![
+                uri_san("urn:veil:host:dev_0102030405060708090a0b0c0d0e0f10"), // wrong prefix
+                uri_san("urn:veil:device:dev_1112131415161718191a1b1c1d1e1f20"), // well-formed
+            ];
+            assert!(device_ref_from_san(&names).is_err());
+        }
+    }
 
     /// Vendored from `veil-custodian` (`docs/api/fixtures/signing-keys/`, see
     /// `crates/vg-core/tests/fixtures/custodian/FIXTURES_SOURCE`) — the real ADR-S

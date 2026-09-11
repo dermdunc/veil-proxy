@@ -20,14 +20,16 @@
 //! }
 //! ```
 //!
-//! `envelope.schema_version` is always the literal string `"veil.edge_event.v1"` for a
+//! `envelope.schema_version` is always the literal string `"veil.edge_event.v2"` for a
 //! record built here (this module always constructs an `Envelope` with
-//! `SchemaVersion::EdgeEventV1`); `envelope.integrity.algorithm` and
-//! `envelope.integrity.key_ref` are both derived from the [`SigningCredential`] passed
-//! to [`sign_edge_event_record`] — `"HMAC_SHA_256"`/`None` for
+//! `SchemaVersion::EdgeEventV2` — ADR-016, XREPO-007); `envelope.integrity.algorithm`
+//! and `envelope.integrity.key_ref` are both derived from the [`SigningCredential`]
+//! passed to [`sign_edge_event_record`] — `"HMAC_SHA_256"`/`None` for
 //! [`SigningCredential::Hmac`], `"ECDSA_SHA_256"`/`Some(key_ref)` for
 //! [`SigningCredential::EcdsaP256`] — never asserted independently of the key that
-//! actually signed. See `telemetry::envelope` and `telemetry::edge_event` for the full
+//! actually signed. `envelope.device_ref` is derived the same structural way: `None`
+//! for `Hmac`, `Some(cred.device_ref())` for `EcdsaP256` — see
+//! [`SigningCredential::device_ref`]. See `telemetry::envelope` and `telemetry::edge_event` for the full
 //! field-by-field shape of each nested object.
 //!
 //! **Signing procedure**, mirroring how a verifier must check a received record:
@@ -188,17 +190,17 @@ impl DeviceSigningCredential {
         &self.key_ref
     }
 
-    /// **Not read by [`sign_edge_event_record`]** — a doubt-driven-development finding
-    /// worth stating explicitly rather than leaving implicit: `Envelope::device_ref`
-    /// comes from `EdgeEventRecordInput::device_ref` (currently always `None` in
-    /// production — ratified Q1, `veil-custodian`'s enrolment registry doesn't exist
-    /// yet), *not* from this credential, even though the credential itself carries a
-    /// cryptographically-verified device identity. Wiring this credential's own
-    /// `device_ref` into the envelope is real, deliberately out-of-scope follow-up work
-    /// (`docs/next-actions.md`) — a decision about how Q1's registry-gating interacts
-    /// with "we already know the device from its certificate," not a gap that fell out
-    /// silently. This getter exists today only so callers (and this module's own tests)
-    /// can confirm the credential carries the identity its certificate claims.
+    /// **Read by [`sign_edge_event_record`] as of ADR-016 (XREPO-007)**, via
+    /// [`SigningCredential::device_ref`] — this credential's own identity is now what
+    /// `Envelope::device_ref` carries on the wire for an ECDSA-signed record. (An
+    /// earlier version of this doc comment recorded the opposite as a deliberate,
+    /// named gap — that gap is what ADR-016 closes; this comment is corrected, not
+    /// silently left stale.) **Residual limitation, not fixed by that ADR**: this
+    /// getter returns whatever `device_ref` this credential was constructed with —
+    /// [`from_parts`](Self::from_parts) is `pub` and stores it verbatim, independent of
+    /// `certificate_der`, so agreement between the two is guaranteed only by the one
+    /// legitimate production path (`vg-vault::keychain::load_device_signing_credential`,
+    /// which always derives it from the certificate's own SAN), not by this type alone.
     pub fn device_ref(&self) -> DeviceRef {
         self.device_ref
     }
@@ -271,17 +273,23 @@ pub enum SigningError {
     Canonicalize(#[from] CanonicalizeError),
 }
 
-/// Everything needed to build and sign one `veil.edge_event.v1` wire record, gathered
+/// Everything needed to build and sign one `veil.edge_event.v2` wire record, gathered
 /// into one struct rather than a long parameter list: [`sign_edge_event_record`] needs
 /// to construct an [`Envelope`] twice internally (once with a placeholder signature to
 /// compute the MAC over, once with the real one), and a struct avoids two long argument
 /// lists that must stay in lockstep (mirrors `Envelope::new`'s own
 /// `#[allow(clippy::too_many_arguments)]` precedent, but for a call site invoked twice).
+///
+/// **No `device_ref` field, as of ADR-016 (XREPO-007).** It used to be an independent
+/// `Option<DeviceRef>` here, which let a caller combine HMAC with a fabricated
+/// `Some(device_ref)`, or one ECDSA credential with a caller-supplied reference
+/// belonging to a different device — both possible because this field was independent
+/// of `SigningCredential`. `Envelope::device_ref` is now derived from the credential
+/// itself, via [`SigningCredential::device_ref`], the same way `key_ref` already was.
 pub struct EdgeEventRecordInput {
     pub contract_revision: u32,
     pub record_id: RecordId,
     pub issued_at_us: u64,
-    pub device_ref: Option<DeviceRef>,
     pub tenant_id: Option<TenantId>,
     pub sequence: u64,
     pub valid_until_us: u64,
@@ -295,12 +303,13 @@ pub struct EdgeEventRecordInput {
 }
 
 /// Which credential [`sign_edge_event_record`] signs with — and therefore which
-/// `SigningAlgorithm` and `Integrity::key_ref` the resulting record carries.
-/// `EdgeEventRecordInput` used to carry its own `key_ref: Option<KeyRef>` field
-/// alongside a hard-coded `SigningAlgorithm::HmacSha256` literal, letting the two drift
-/// independently of the key that actually signed; both are now derived from this enum
-/// instead, so that disagreement is structurally impossible rather than merely tested
-/// against (interface-contracts v1.5 -> v1.6).
+/// `SigningAlgorithm`, `Integrity::key_ref`, and (ADR-016, XREPO-007) `device_ref` the
+/// resulting record carries. `EdgeEventRecordInput` used to carry its own
+/// `key_ref: Option<KeyRef>` field alongside a hard-coded `SigningAlgorithm::HmacSha256`
+/// literal, letting the two drift independently of the key that actually signed; all
+/// three are now derived from this enum instead, so that disagreement is structurally
+/// impossible rather than merely tested against (interface-contracts v1.5 -> v1.6, and
+/// v1.8 for the `device_ref` derivation).
 pub enum SigningCredential<'a> {
     Hmac(&'a ReceiptSigningKey),
     EcdsaP256(&'a DeviceSigningCredential),
@@ -323,6 +332,21 @@ impl SigningCredential<'_> {
         match self {
             Self::Hmac(_) => None,
             Self::EcdsaP256(cred) => Some(cred.key_ref.clone()),
+        }
+    }
+
+    /// `None` for HMAC — the family's actor-vs-device identity split (ADR-016 §2,
+    /// `pseudonymize.rs`'s own doc) means an HMAC-signed record carries no device
+    /// reference at all, structurally. `Some`, always the credential's own
+    /// certificate-derived pseudonym, for ECDSA — mirrors `key_ref` exactly. **What this
+    /// guarantees, precisely**: this method returns whatever `device_ref` the wrapped
+    /// `DeviceSigningCredential` was constructed with — see that type's own
+    /// `device_ref()` doc for the one residual case (a directly-constructed credential
+    /// via the `pub` `from_parts`) this does not, by itself, protect against.
+    fn device_ref(&self) -> Option<DeviceRef> {
+        match self {
+            Self::Hmac(_) => None,
+            Self::EcdsaP256(cred) => Some(cred.device_ref()),
         }
     }
 
@@ -386,15 +410,16 @@ impl Serialize for EdgeEventWireRecord<'_> {
     }
 }
 
-/// Builds and signs one `veil.edge_event.v1` record with `credential` — see this
+/// Builds and signs one `veil.edge_event.v2` record with `credential` — see this
 /// module's own doc comment for the exact wire shape and signing procedure, and
-/// [`SigningCredential`] for how `credential` determines `integrity.algorithm` and
-/// `integrity.key_ref`.
+/// [`SigningCredential`] for how `credential` determines `integrity.algorithm`,
+/// `integrity.key_ref`, and (ADR-016, XREPO-007) `envelope.device_ref`.
 pub fn sign_edge_event_record(
     input: EdgeEventRecordInput,
     credential: &SigningCredential<'_>,
 ) -> Result<SignedEdgeEventRecord, SigningError> {
     let key_ref = credential.key_ref();
+    let device_ref = credential.device_ref();
     let placeholder_integrity = Integrity::new(
         input.payload_sha256,
         input.nonce,
@@ -403,11 +428,11 @@ pub fn sign_edge_event_record(
         Vec::new(),
     );
     let envelope_unsigned = Envelope::new(
-        SchemaVersion::EdgeEventV1,
+        SchemaVersion::EdgeEventV2,
         input.contract_revision,
         input.record_id,
         input.issued_at_us,
-        input.device_ref,
+        device_ref,
         input.tenant_id.clone(),
         input.sequence,
         input.valid_until_us,
@@ -429,11 +454,11 @@ pub fn sign_edge_event_record(
         signature,
     );
     let envelope_signed = Envelope::new(
-        SchemaVersion::EdgeEventV1,
+        SchemaVersion::EdgeEventV2,
         input.contract_revision,
         input.record_id,
         input.issued_at_us,
-        input.device_ref,
+        device_ref,
         input.tenant_id,
         input.sequence,
         input.valid_until_us,
@@ -479,7 +504,6 @@ mod tests {
             contract_revision: 1,
             record_id: RecordId::from(Uuid::nil()),
             issued_at_us: 1_700_000_000_000_000,
-            device_ref: None,
             tenant_id: None,
             sequence: 0,
             valid_until_us: 1_700_000_300_000_000,
@@ -640,6 +664,76 @@ mod tests {
         );
         // Raw r||s, not DER: exactly 64 bytes, 128 hex chars.
         assert_eq!(signed.signature_hex.len(), 128);
+    }
+
+    // -- device_ref derivation (ADR-016, XREPO-007) --
+
+    #[test]
+    fn signing_credential_device_ref_reflects_whatever_credential_it_wraps() {
+        // The true, checkable claim per ADR-016 §3/§12's Codex-round correction: this
+        // method returns exactly whatever `DeviceSigningCredential` it is given -- it
+        // does not, by itself, guarantee that value matches any certificate. Agreement
+        // for real production credentials is a property of the loader
+        // (`vg-vault::keychain::load_device_signing_credential`), tested there, not here.
+        let cred = sample_ecdsa_credential(5);
+        let expected = cred.device_ref();
+        let credential = SigningCredential::EcdsaP256(&cred);
+        assert!(credential.device_ref() == Some(expected));
+
+        let key = sample_key();
+        let hmac_credential = SigningCredential::Hmac(&key);
+        assert!(hmac_credential.device_ref().is_none());
+    }
+
+    #[test]
+    fn sign_edge_event_record_hmac_never_carries_a_device_ref() {
+        let event = EdgeEvent::new_demask_request(
+            Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([4u8; 32]),
+        );
+        let credential = SigningCredential::Hmac(&sample_key());
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&signed.canonical_json).unwrap();
+        assert_eq!(value["envelope"]["device_ref"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn sign_edge_event_record_ecdsa_carries_the_credentials_device_ref() {
+        let event = EdgeEvent::new_demask_request(
+            Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([6u8; 32]),
+        );
+        let cred = sample_ecdsa_credential(13);
+        let credential = SigningCredential::EcdsaP256(&cred);
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&signed.canonical_json).unwrap();
+        assert_eq!(
+            value["envelope"]["device_ref"],
+            serde_json::to_value(cred.device_ref()).unwrap()
+        );
+        // The wire value is `dev_`-prefixed (ADR-016 §4) -- not bare hex.
+        assert!(value["envelope"]["device_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("dev_"));
+    }
+
+    #[test]
+    fn sign_edge_event_record_declares_schema_version_v2() {
+        // ADR-016 §5's own Fable-round correction: this is the one call site that
+        // actually determines what reaches the wire, so it gets its own direct test
+        // rather than relying only on the golden-vector fixtures to catch a regression.
+        let event = EdgeEvent::new_demask_request(
+            Destination::RemoteModelPrompt,
+            ActorPseudonym::from_bytes([8u8; 32]),
+        );
+        let credential = SigningCredential::Hmac(&sample_key());
+        let signed = sign_edge_event_record(sample_input(event), &credential).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&signed.canonical_json).unwrap();
+        assert_eq!(
+            value["envelope"]["schema_version"],
+            serde_json::json!("veil.edge_event.v2")
+        );
     }
 
     #[test]

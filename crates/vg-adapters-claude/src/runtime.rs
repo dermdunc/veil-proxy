@@ -133,6 +133,36 @@ pub struct Engine {
     /// handle) purely so callers can inspect counts without downcasting a trait object —
     /// see `vg_audit::SharedTelemetrySink`'s own doc for why it exists.
     telemetry_sink: Option<SharedTelemetrySink>,
+    /// ADR-016 §10 (XREPO-007): observable degraded-credential signal, distinct from a
+    /// stderr line. See [`TelemetryAuthenticity`]'s own doc for exactly what this does
+    /// and does not catch.
+    telemetry_authenticity: TelemetryAuthenticity,
+}
+
+/// Whether this engine's telemetry authenticity is known-good or degraded — ADR-016 §10
+/// (XREPO-007), the P0-3 downgrade posture. **Named limitation, not full coverage:**
+/// `DegradedCredentialError` fires only when [`vg_vault::load_device_signing_credential`]
+/// returns `Err` — a keychain entry the loader could at least partially read, but which
+/// turned out malformed, mismatched, or came from a backend/init failure. It does **not**
+/// fire on `Ok(None)`, the ordinary "not yet enrolled" case, and it does **not** reliably
+/// fire when the *key* keychain entry itself is absent (an orphaned certificate with no
+/// matching key, or both entries removed) — both look identical to "never enrolled" under
+/// this signal, because the loader checks the key entry first and short-circuits to
+/// `Ok(None)` before ever inspecting the certificate. Closing that gap needs a durable,
+/// independent "this device is expected to be enrolled" marker written at install time,
+/// which does not exist until Phase 3 builds one. Masking is never affected by this value
+/// either way (`veil-custodian` ADR-E: certificate state gates telemetry authenticity
+/// only, never masking) — nothing in this crate wires it into any masking path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TelemetryAuthenticity {
+    /// No credential-load error observed. The default: also the value when telemetry is
+    /// disabled entirely, and when the device is not yet enrolled (`Ok(None)`).
+    #[default]
+    Nominal,
+    /// `load_device_signing_credential` returned `Err`. Emission falls back to HMAC;
+    /// the pseudonym a downstream consumer would have keyed off is silently absent —
+    /// this signal exists so that absence is at least observable, not silent too.
+    DegradedCredentialError,
 }
 
 impl Engine {
@@ -182,6 +212,7 @@ impl Engine {
             );
         }
 
+        let mut telemetry_authenticity = TelemetryAuthenticity::Nominal;
         let (audit, telemetry_sink): (Box<dyn vg_core::AuditSink>, Option<SharedTelemetrySink>) =
             if telemetry_enabled {
                 let actor_key = vg_vault::load_or_create_actor_pseudonym_key()?;
@@ -213,6 +244,8 @@ impl Engine {
                                 "veilgremlin: WARNING device signing credential misconfigured, \
                                  falling back to HMAC: {e}"
                             );
+                                telemetry_authenticity =
+                                    TelemetryAuthenticity::DegradedCredentialError;
                                 None
                             }
                         }
@@ -243,6 +276,7 @@ impl Engine {
             parsers: all_parsers(),
             namespace,
             telemetry_sink,
+            telemetry_authenticity,
         })
     }
 
@@ -252,6 +286,12 @@ impl Engine {
     /// payloads.
     pub fn telemetry_counts(&self) -> Option<TelemetryConversionCounts> {
         self.telemetry_sink.as_ref().map(|s| s.counts())
+    }
+
+    /// See [`TelemetryAuthenticity`]'s own doc for exactly what this does and does not
+    /// catch (ADR-016 §10, XREPO-007).
+    pub fn telemetry_authenticity(&self) -> TelemetryAuthenticity {
+        self.telemetry_authenticity
     }
 
     pub fn paths(&self) -> &StatePaths {
@@ -735,6 +775,12 @@ mod telemetry_wiring_tests {
                  auto-detected and used, in preference to the unset VEIL_RECEIPT_KEY HMAC \
                  path"
             );
+            // ADR-016 §10 (XREPO-007): a real, correctly-loaded credential must never be
+            // reported as degraded.
+            assert_eq!(
+                engine.telemetry_authenticity(),
+                TelemetryAuthenticity::Nominal
+            );
         }
 
         // -- case 2: a genuinely misconfigured credential falls back to real HMAC signing --
@@ -778,6 +824,62 @@ mod telemetry_wiring_tests {
                 1,
                 "the denial's DemaskDecision must have converted Ok via the actor-key entry point"
             );
+            // ADR-016 §10 (XREPO-007): a genuine credential-load Err (here, a key/cert
+            // mismatch caught by `load_device_signing_credential`'s own cross-check) must
+            // flip the observable degraded signal -- not just fall back silently.
+            assert_eq!(
+                engine.telemetry_authenticity(),
+                TelemetryAuthenticity::DegradedCredentialError,
+                "a genuinely misconfigured credential must mark telemetry authenticity as \
+                 degraded, not leave it looking identical to Nominal/never-enrolled"
+            );
         }
     }
+
+    /// **Corrected, found by a Codex adversarial review round against the shipped
+    /// implementation (not just the ADR text): the previous version of this test, and
+    /// its name, overclaimed what it proves.** With no `VEIL_OBSERVATORY_ENDPOINT` set,
+    /// `Engine::open`'s endpoint-gating check means `load_device_signing_credential` is
+    /// never even called — this exercises the *default* value of `telemetry_authenticity`
+    /// when the credential-lookup branch is skipped entirely, not the loader's real
+    /// `Ok(None)` return path. That distinction matters: it is a real, useful test (the
+    /// default must be `Nominal`, not some other value that happens to look right only
+    /// by accident), but it does not prove what "never enrolled" means once the loader
+    /// actually runs.
+    #[test]
+    fn telemetry_authenticity_defaults_to_nominal_when_the_credential_lookup_is_skipped() {
+        let _env_lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var(VAULT_KEY_ENV, TEST_KEY_HEX);
+            std::env::set_var(ACTOR_PSEUDONYM_KEY_ENV, TEST_KEY_HEX);
+        }
+        let _cleanup = EnvVarGuard;
+        // No device-signing-seam vars, no VEIL_OBSERVATORY_ENDPOINT: `Engine::open`
+        // never reaches `load_device_signing_credential` at all (the endpoint-gating
+        // check short-circuits first) -- this is NOT a test of the loader's own
+        // Ok(None) path, only of `telemetry_authenticity`'s default value.
+        let (_dir, engine) = open_engine_in_temp_dir(Some(r#"{"telemetry_enabled": true}"#));
+        assert_eq!(
+            engine.telemetry_authenticity(),
+            TelemetryAuthenticity::Nominal
+        );
+    }
+
+    // **Named gap, not silently left untested: none of the following are covered by any
+    // test in this suite, and cannot be with the env-seam infrastructure alone.**
+    // (1) The loader's *real* `Ok(None)` return, reached by setting
+    //     `VEIL_OBSERVATORY_ENDPOINT` while leaving both device-signing-seam env vars
+    //     unset, which forces `load_device_signing_credential` to query the actual OS
+    //     keychain. (2) ADR-016 §10's named limitation itself -- a device whose *key*
+    //     keychain entry is absent (alone, or alongside an orphaned certificate entry)
+    //     being indistinguishable from never-enrolled. Both require manipulating real OS
+    //     keychain entries, which the env-seam (all-or-nothing: both vars set or both
+    //     unset) cannot represent -- setting only one seam var hits the loader's
+    //     *different* "both must be set or unset" `Err` branch, not either OS-keychain
+    //     state. This is exactly the gated real-keychain integration testing the
+    //     governing plan's §10.3 already scopes to Phase 3, not Phase 1. An earlier
+    //     version of this ADR's own §12 claimed tests for these two states existed; they
+    //     did not, and do not now -- corrected rather than left to be discovered later.
 }

@@ -480,15 +480,21 @@ fn edge_event_block_rejects_an_unrecognized_reason_string() {
 /// with the cross-repo consequences considered) must fail this test loudly, not pass
 /// silently.
 ///
-/// The concrete input values below must match `tests/fixtures/edge_event_v1_golden.json`'s
+/// The concrete input values below must match `tests/fixtures/edge_event_v2_golden.json`'s
 /// own `input` object exactly -- reviewed and edited together, not derived from each
 /// other automatically (deliberately not parsed back out of the fixture file: a bug that
 /// corrupted both the fixture and this test's input construction identically would
 /// otherwise still pass).
+///
+/// Renamed from `edge_event_v1_golden_vector_matches_the_fixture`/`edge_event_v1_golden.json`
+/// (ADR-016, XREPO-007): `sign_edge_event_record` now always declares
+/// `SchemaVersion::EdgeEventV2` on the wire, HMAC included -- the version bump is a
+/// property of the wire contract this function builds, not conditional on which
+/// credential signs it.
 #[test]
-fn edge_event_v1_golden_vector_matches_the_fixture() {
+fn edge_event_v2_golden_vector_matches_the_fixture() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/edge_event_v1_golden.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/edge_event_v2_golden.json")).unwrap();
 
     // input.actor_pseudonym_key_hex = "09" * 32
     let actor_key = ActorPseudonymKey::from_bytes([0x09u8; 32]);
@@ -513,7 +519,6 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
         contract_revision: 1, // input.contract_revision
         record_id,
         issued_at_us: 1_700_000_000_000_000, // input.issued_at_us
-        device_ref: None,                    // input.device_ref
         tenant_id: None,                     // input.tenant_id
         sequence: 0,                         // input.sequence
         valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
@@ -540,13 +545,19 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
     );
     // The signature is also embedded in the canonical JSON -- both must agree.
     assert!(signed.canonical_json.contains(&signed.signature_hex));
+    // ADR-016 §5/§12 (XREPO-007): the version bump must actually reach the wire, and an
+    // HMAC-signed record's device_ref stays structurally null, never populated.
+    assert!(signed
+        .canonical_json
+        .contains("\"schema_version\":\"veil.edge_event.v2\""));
+    assert!(signed.canonical_json.contains("\"device_ref\":null"));
 }
 
 // -- Wire serialization / canonical JSON / ECDSA signing (ADR-S) --
 
 /// Cross-language contract test, the ECDSA counterpart to
-/// `edge_event_v1_golden_vector_matches_the_fixture` above: reconstructs the exact
-/// `veil.edge_event.v1` record pinned in `tests/fixtures/edge_event_v1_ecdsa_golden.json`
+/// `edge_event_v2_golden_vector_matches_the_fixture` above: reconstructs the exact
+/// `veil.edge_event.v2` record pinned in `tests/fixtures/edge_event_v2_ecdsa_golden.json`
 /// via the *production* path (`AuditEvent` -> `EdgeEvent::try_from_audit_event` ->
 /// `sign_edge_event_record`, this time with a `SigningCredential::EcdsaP256`) and asserts
 /// byte-exact equality against the fixture's `canonical_json` and `signature_hex`. This
@@ -555,19 +566,28 @@ fn edge_event_v1_golden_vector_matches_the_fixture() {
 /// contract can produce) — a downstream Python/`cryptography` verifier must reproduce
 /// this byte-for-byte, exactly as the HMAC vector's own fixture documents for its case.
 ///
+/// **Renamed from `edge_event_v1_ecdsa_golden_vector_matches_the_fixture`, and now
+/// non-null `device_ref`, per ADR-016 §12 (XREPO-007).** The pre-ADR-016 version of this
+/// test deliberately submitted `device_ref: None` on the input even though the credential
+/// carried a real `DeviceRef` — meaning a serializer-only change would never have touched
+/// this vector, leaving the only ECDSA cross-language golden vector blind to the exact
+/// invariant this ADR introduces. `device_ref` is no longer an input field at all (it is
+/// derived from `credential`), so this vector now genuinely exercises the non-null,
+/// `dev_`-prefixed path.
+///
 /// Deterministic by construction (RFC 6979) — same reason the HMAC vector above is
 /// deterministic, extended to ECDSA: `p256::ecdsa::SigningKey::sign`'s default is
 /// deterministic, not randomized, so this fixture is stable across regenerations with the
 /// same inputs, not merely reproducible once.
 ///
 /// The concrete input values below must match
-/// `tests/fixtures/edge_event_v1_ecdsa_golden.json`'s own `input` object exactly — same
+/// `tests/fixtures/edge_event_v2_ecdsa_golden.json`'s own `input` object exactly — same
 /// discipline as the HMAC vector, and for the same reason (not parsed back out of the
 /// fixture file).
 #[test]
-fn edge_event_v1_ecdsa_golden_vector_matches_the_fixture() {
+fn edge_event_v2_ecdsa_golden_vector_matches_the_fixture() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/edge_event_v1_ecdsa_golden.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/edge_event_v2_ecdsa_golden.json")).unwrap();
 
     // input.actor_pseudonym_key_hex = "09" * 32 -- same value the HMAC vector uses, kept
     // identical deliberately so the only thing that varies between the two fixtures is
@@ -617,9 +637,9 @@ fn edge_event_v1_ecdsa_golden_vector_matches_the_fixture() {
         contract_revision: 1, // input.contract_revision
         record_id,
         issued_at_us: 1_700_000_000_000_000, // input.issued_at_us
-        device_ref: None,                    // input.device_ref -- Envelope::device_ref, not
-        // the SigningCredential's own device_ref above; ADR-S's enrolment registry
-        // (Q1) doesn't exist yet, same reason the HMAC vector also leaves this `None`.
+        // No `device_ref` field on `EdgeEventRecordInput` anymore (ADR-016, XREPO-007):
+        // `Envelope::device_ref` is derived from `credential` (the `device_credential`
+        // constructed above, carrying `device_ref` = 01 02 ... 10), not supplied here.
         tenant_id: None,                       // input.tenant_id
         sequence: 0,                           // input.sequence
         valid_until_us: 1_700_000_300_000_000, // input.valid_until_us
@@ -646,6 +666,15 @@ fn edge_event_v1_ecdsa_golden_vector_matches_the_fixture() {
     assert_eq!(signed.signature_hex.len(), 128);
     // The signature is also embedded in the canonical JSON -- both must agree.
     assert!(signed.canonical_json.contains(&signed.signature_hex));
+    // ADR-016 §5/§12 (XREPO-007): the version bump must actually reach the wire, and an
+    // ECDSA-signed record's device_ref must be the credential's own pseudonym,
+    // `dev_`-prefixed -- not just "non-null," the exact expected value.
+    assert!(signed
+        .canonical_json
+        .contains("\"schema_version\":\"veil.edge_event.v2\""));
+    assert!(signed
+        .canonical_json
+        .contains("\"device_ref\":\"dev_0102030405060708090a0b0c0d0e0f10\""));
 }
 
 /// Hard-gate regression: every raw, free-text-shaped value this session's whole input
@@ -702,7 +731,6 @@ fn edge_event_serialization_never_leaks_raw_forbidden_values() {
             contract_revision: 1,
             record_id: RecordId::from(Uuid::nil()),
             issued_at_us: 1_700_000_000_000_000,
-            device_ref: None,
             tenant_id: None,
             sequence: i as u64,
             valid_until_us: 1_700_000_300_000_000,
