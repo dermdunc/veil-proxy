@@ -485,7 +485,7 @@ needs from it is named in the item below.
       was produced and sent over real HTTP, then independently verified (including a negative
       control that correctly rejected a tampered signature). This is what grounded the
       raw-`r||s`-encoding sign-off recorded in `docs/decisions.md`'s 2026-09-05 entry.
-      **Still genuinely open, not resolved by this:** nothing yet writes a real enrolled
+      ~~**Still genuinely open, not resolved by this:** nothing yet writes a real enrolled
       credential into a device's OS keychain automatically — the proof reached `Engine::open`
       via the same `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` test seam, with the
       raw key scalar extracted by hand from `veil-enrol`'s output, not stored in the keychain by
@@ -493,9 +493,21 @@ needs from it is named in the item below.
       (enrolment itself is out of scope here, per ADR-D/ADR-N: "a device never calls this API"),
       so until something — `veil-enrol` or a separate device-side tool — writes the credential
       into the OS keychain, `Ok(None)`/HMAC fallback remains the outcome for any device that
-      hasn't had a credential manually threaded in via the env-var seam. Also still open:
-      `veil-observatory` has no real ECDSA verification path (confirmed live by the same proof,
-      a `401` naming the exact reason) and the enrolment-registry half (Q1) is untouched.
+      hasn't had a credential manually threaded in via the env-var seam.~~ — **done,
+      2026-09-12 (`XREPO-009`, ADR-017):** `vg-vault::enrol` is now a real device-side keychain
+      *writer* (`request_device_signing_csr`/`install_device_signing_certificate`), and
+      `vg enrol request-csr`/`install-cert` are real `vg-cli` commands. Live-run proven
+      zero-seam in `veil-demo/scripts/xrepo-009-device-credential-install-proof.sh`: a real
+      credential is written to the real macOS keychain, then loaded back by two further,
+      independent `vg` processes with `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
+      asserted unset, the second reaching veil-observatory's `accepted` disposition — the first
+      time organic, un-seamed traffic has ever reached it. Five closure limitations (no CA
+      trust-anchor distribution, macOS-only, no renewal automation, not an MDM path, the anchor's
+      algorithm constraint proven only against the dev CA) are filed as `XREPO-010`–`XREPO-013`
+      in `veil-ecosystem/.hekton/cross-repo-deps.yaml`, not silently accepted. The other gap this
+      bullet named when written — `veil-observatory` had no real ECDSA verification path — is
+      now **also closed** (`XREPO-008`, 2026-09-11, ADR-0022 on veil-observatory's side); the
+      enrolment-registry half (Q1) remains untouched.
 - [ ] **Decide whether `Envelope::device_ref` should be populated from
       `DeviceSigningCredential::device_ref()` when signing with ECDSA**, rather than staying tied
       to the separate, still-always-`None` `EdgeEventRecordInput::device_ref` (ratified Q1 gates
