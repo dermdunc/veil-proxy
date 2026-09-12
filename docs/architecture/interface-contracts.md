@@ -296,10 +296,15 @@ pub fn credential_status() -> Result<CredentialStatus, EnrolError>;
 pub struct PendingCsr { pub csr_pem: String, pub spki_fingerprint: String }
 pub enum InstallOutcome { Installed(InstalledSigningCredential), AlreadyInstalled, RecoveredPartialInstall }
 pub struct InstalledSigningCredential { pub device_ref: DeviceRef, pub key_ref: KeyRef, pub not_after: std::time::SystemTime }
-// `installed` and env-seam shadowing are independent facts, not one enum's mutually exclusive
-// arms (round-A correction, ADR-017 review provenance): a credential can be genuinely
-// installed AND currently shadowed by the env seam at the same time.
-pub struct CredentialStatus { pub installed: Option<InstalledSigningCredential>, pub env_seam_shadowing: bool }
+// Three independent facts, not one enum's mutually exclusive arms (round-A correction: a
+// credential can be installed AND shadowed at once; round-B correction: `installed: None`
+// alone cannot distinguish "never enrolled" from ADR-017 §7's marker-present/credential-
+// missing-or-interrupted state without erasing the exact distinction §7 exists to draw).
+pub struct CredentialStatus {
+    pub installed: Option<InstalledSigningCredential>,
+    pub env_seam_shadowing: bool,
+    pub enrolment_marker_present: bool,
+}
 pub enum EnrolError {
     EnvSeamActive,
     Profile(VaultError),
@@ -319,7 +324,7 @@ backend (corrected from an earlier "never written to disk" phrasing that oversta
 this repo's own established "never persisted plaintext" guarantee, `keychain.rs`'s module doc).
 It stores the private key in the OS keychain under a new content-addressed pending service
 (account = the key's own SPKI fingerprint, not the `"default"` account the existing device-
-signing services use — see ADR-017 §4), and returns a CSR plus that same fingerprint for the
+signing services use — see ADR-017 §3), and returns a CSR plus that same fingerprint for the
 existing out-of-band operator-confirmation flow (`veil-enrol/docs/architecture.md`'s CSR
 handoff mechanism, unchanged by this contract). `install_device_signing_certificate` verifies
 the returned certificate against a caller-supplied CA certificate — **there is no variant that
