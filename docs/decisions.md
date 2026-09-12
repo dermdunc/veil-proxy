@@ -4619,10 +4619,26 @@ now: this ADR's own live-run proof (§12) can target disposition `accepted`, not
 
 **Review provenance.** Two independent adversarial design rounds ran against this ADR's draft
 before acceptance, verified against the live code in this repo, `veil-enrol`, and
-`veil-custodian` — not documentation-internal consistency. Findings and corrections are recorded
-inline below, marked where found, not silently smoothed over. [Round summaries land here once
-run; this paragraph is intentionally left open rather than pre-written, matching the
-`XREPO-007`/`XREPO-008` precedent of never asserting a review happened before it did.]
+`veil-custodian` — not documentation-internal consistency. **Round one (Codex, via `codex exec`,
+read-only sandbox against all three repos) found eight real issues**, all corrected inline below,
+marked where found: the CA-signature-algorithm claim in §3 overclaimed custodian-wide
+compatibility when only the auto-generated local/test CA is actually pinned to P-256/SHA-256
+(§3, §13 limitation 5); §6's `AlreadyInstalled`/cert-only-recovery rows treated SPKI equality as
+proof of certificate identity, when custodian deliberately permits repeat issuance from the same
+CSR/key producing a *different* certificate each time (§6, corrected to require full DER
+equality); the cert-then-key ordering's crash-safety claim did not extend to `--force`
+replacement, where an old key can transiently mismatch a new certificate (§3, §6 — resolved by
+generalizing the recovery condition rather than special-casing replacement); the writer
+introduces a genuinely new multi-write race beyond the single inherited one, closed by a
+cross-process lock (§3); the landed `CredentialStatus`/`EnrolError` contract shapes could not
+actually satisfy this text's own claims about what `status` reports and what a refusal message
+names (§10, and `interface-contracts.md`'s v1.9 addendum, both corrected); and the v1.9
+addendum's "never written to disk" phrasing overstated this repo's own established "never
+persisted plaintext" guarantee (corrected in the same addendum). Round one also verified as
+*correct*: the SPKI fingerprint algorithm, custodian's CSR curve/outer-signature checks,
+`RequestBuilder::finalize`'s forced empty `extensionRequest`, the `builder` feature's `sha1`
+dependency, and the `runtime.rs` `DegradedCredentialError`/missing-marker gap. **Round two
+(Fable) ran against round one's fixes** [land after round two runs].
 
 ### 1. Decision
 
@@ -4718,15 +4734,40 @@ multi-day human handoff window. Content-addressing lets multiple outstanding CSR
 safely; `install-cert` selects the private key **by the incoming certificate's own SPKI**, never
 by recency.
 
-**Write order is cert, then key, then delete-pending.** `load_device_signing_credential`
+**Write order is cert, then key, then delete-pending — but "already handled" is judged by
+certificate identity, not key identity (round-A correction).** `load_device_signing_credential`
 (`keychain.rs:155-197`) reads the KEY entry first and returns `Ok(None)` — "not enrolled" — on
 `NoEntry`, *before* ever inspecting the certificate; a missing certificate while the key exists
 is the hard error. So a crash between the cert write and the key write is invisible to every
-existing caller and safely re-runnable; the reverse order would instead leave that hard-error
-state as the crash residue. This does not, by itself, make the whole install atomic — a crash
-after the key write but before the pending-entry delete leaves a fully-working credential with
-an orphaned pending key, which a correct re-run must recognize as already-installed rather than
-fail on (§7's state table).
+existing caller and safely re-runnable **only if the re-run can tell "this is my own crash
+residue" apart from "a different certificate happens to occupy the cert slot."** An earlier
+draft of this ADR judged that by SPKI equality alone — wrong: `veil-custodian` deliberately
+permits repeat issuance from the same CSR/key, producing a *different* certificate DER (and
+`key_ref`) each time (`veil-custodian/src/ca/mod.rs:1608-1646`; `veil-enrol/docs/decisions.md:11`
+documents the same). SPKI equality proves the key matches, not that the certificate is the one
+this invocation is installing. **Corrected condition: recovery (writing the key from the
+matching pending entry, then deleting it) is permitted only when the stored certificate's own
+DER equals the incoming certificate's DER *and* its SPKI matches the selected pending key.**
+This single condition, evaluated the same way regardless of *why* the cert slot already held
+something, uniformly covers both cases an earlier draft treated separately: a crash during a
+fresh install (cert written, key not yet) and a crash during a `--force` replacement (new cert
+written, old key still present — the old key's SPKI will not match the new cert, so this is
+recognized as incomplete-replacement residue and completed, not mistaken for
+already-satisfied). Any other combination — cert present but DER differs from the one being
+installed, or SPKI simply doesn't match — refuses and requires `--force`, per §6's table.
+
+**A cross-process lock now serializes every mutating `enrol` command (round-A addition).** The
+inherited non-atomicity at `keychain.rs:91-103` is a single `get→generate→set` race on one
+secret; this writer's install sequence touches four entries (marker, cert, key, pending-delete)
+across up to two processes' worth of state, and without serialization two concurrent
+`install-cert` invocations can each pass the pre-write classification check and interleave their
+writes into a torn, mismatched credential that neither invocation's own certificate can recover
+without a fresh CSR round-trip — a strictly worse outcome than the single-entry race it would
+otherwise be lumped in with. `enrol.rs` takes a single OS-level file lock (a fixed path under the
+device's local state directory, held for the full duration of state inspection through
+pending-delete) around every mutating command; `status` does not need it (read-only). This is a
+single-device, single-user lock, not a distributed one — sufficient for a CLI no daemon or
+second device ever invokes concurrently against the same keychain.
 
 **Certificate authenticity is mandatory, with no bypass (P0-1, human-confirmed).**
 `certificate.rs:26-32` documents, correctly, that its profile check does not verify a
@@ -4736,14 +4777,21 @@ breaks that premise: it accepts a certificate handed over an out-of-band channel
 <file>` is therefore **required**, verified directly against `p256::ecdsa::VerifyingKey`
 (`x509-cert 0.3` has no certificate-verification API of its own; manual verification is not the
 cleaner of two options, it is the only one) — issuer-name chaining, then signature, both
-restricted to exactly `ecdsa-with-SHA256` over a P-256 anchor key (the one algorithm
-`veil-custodian`'s CA actually signs with, `rcgen::KeyPair::generate()`'s default,
-`src/ca/mod.rs:148`). There is deliberately **no `--insecure`-style escape hatch**: a bypass
-flag is used precisely in the situation where it is dangerous, and certificate authenticity is
-the hardest of the sub-problems this item was filed to name in the first place. A leaf within
-seven days of, or past, its own `not_after` produces a warning, not a rejection — renewal
-automation is out of scope, but silently installing an already-dead credential is a pure waste
-of a multi-day handoff cycle.
+restricted to exactly `ecdsa-with-SHA256` over a P-256 anchor key. **Round-A correction: this is
+only the auto-generated local/test CA's default (`rcgen::KeyPair::generate()`,
+`veil-custodian/src/ca/mod.rs:148`), not a restriction `veil-custodian` actually enforces on a
+provisioned production CA** — a real deployment's CA key is loaded via `KeyPair::from_pem`
+(`veil-custodian/src/ca/mod.rs:119,197`) with no algorithm check, and `rcgen` itself accepts
+Ed25519, P-384, and RSA issuer keys as well as P-256. This ADR does not widen the anchor check to
+accommodate that: `install-cert` **refuses** any anchor/leaf pair using a different algorithm
+rather than silently accepting it, which is the correct default, but it means Phase 1's writer
+is only proven compatible with a P-256/SHA-256 custodian CA — recorded as closure limitation 5
+(§13), not silently assumed away. There is deliberately **no `--insecure`-style escape hatch**:
+a bypass flag is used precisely in the situation where it is dangerous, and certificate
+authenticity is the hardest of the sub-problems this item was filed to name in the first place.
+A leaf within seven days of, or past, its own `not_after` produces a warning, not a rejection —
+renewal automation is out of scope, but silently installing an already-dead credential is a pure
+waste of a multi-day handoff cycle.
 
 **Minimum-acceptable fallback considered and not needed:** requiring an MDM-driven automated
 trigger for this flow, rather than a human-operated CLI, was considered and rejected for Phase
@@ -4776,12 +4824,17 @@ two, rather than claiming cross-platform coverage this phase never exercised.
 Classified from what's already in the keychain when `install-cert` runs, checked before any
 write:
 
+**Round-A correction: every row below classifies on certificate DER equality, not SPKI
+equality** — matching key material does not mean matching certificate identity, since
+`veil-custodian` deliberately permits repeat issuance from the same CSR/key with a different
+resulting certificate each time (§3).
+
 | Observed state | Outcome | Needs `--force`? |
 |---|---|---|
 | nothing installed, matching pending key present | install | no |
-| cert present, key absent (§3's crash residue) | auto-recover: write key, delete pending | **no** — requiring a flag to recover from the tool's own crash would be user-hostile |
-| key+cert present, installed key's public half already matches the incoming certificate's SPKI | no-op success, retry the pending-delete | no |
-| key+cert present, a *different* credential | refuse, naming the currently-installed `key_ref`/`device_ref` | **yes** |
+| stored cert's DER equals the incoming cert's DER, stored key absent or not matching its SPKI (§3's unified crash-residue condition — covers both a fresh-install crash and an interrupted `--force` replacement) | auto-recover: write key from the matching pending entry, delete pending | **no** — requiring a flag to recover from the tool's own crash would be user-hostile |
+| stored cert's DER equals the incoming cert's DER, stored key already matches its SPKI | no-op success, retry the pending-delete | no |
+| key+cert present, stored cert's DER differs from the incoming cert (even if SPKI/key matches — a re-issued certificate for the same key is a distinct identity, per §3) | refuse, naming the currently-installed `key_ref`/`device_ref` | **yes** |
 | key present, cert absent (the loader's existing "inconsistent state" error) | refuse, name it as keychain corruption | **yes** |
 | no pending key matches the certificate's SPKI at all | refuse: "was this certificate issued for a CSR from this device?" | n/a |
 
@@ -4791,8 +4844,10 @@ keychain entry is overwritten — so refusal is the default and `--force` is an 
 named-in-the-help override, never implied by re-running the same command. `--force` is not
 renewal automation and the help text says so.
 
-Non-atomicity is inherited, not newly introduced: `keyring` offers no compare-and-set, the same
-accepted residual already documented at `keychain.rs:91-103` for the actor-pseudonym key.
+Non-atomicity: the single-entry `get→generate→set` race already accepted at
+`keychain.rs:91-103` is inherited unchanged, but this writer's four-entry install sequence is a
+**new** exposure beyond it, closed by §3's cross-process lock rather than left as an enlarged
+version of the old accepted risk.
 
 ### 7. A durable enrolment marker ships in this phase (P0-7, human-confirmed)
 
@@ -4812,10 +4867,13 @@ merely benign to the signing path.
 ### 8. `vg enrol status` and `vg enrol cancel-csr` are in scope (P0-8, human-confirmed)
 
 Two commands beyond the originally-scoped `request-csr`/`install-cert` pair. `status` reports
-whether a credential is installed, its `device_ref`/`key_ref` if so, and — critically — whether
-the env seam is currently shadowing the keychain; this is what §12's live-run proof uses to
-*observe* "loaded from the real OS keychain with the env vars unset," rather than inferring it
-indirectly from signing behavior alone. `cancel-csr --fingerprint <hex>` deletes one pending
+whether a credential is installed (with its `device_ref`/`key_ref` if so) **and, independently,
+whether the env seam is currently shadowing the keychain** — round-A correction: these are two
+orthogonal facts, not one enum's mutually exclusive arms, since a credential can be genuinely
+installed *and* currently shadowed at the same time (§10's `CredentialStatus` shape corrected
+accordingly). This is what §12's live-run proof uses to *observe* "loaded from the real OS
+keychain with the env vars unset," rather than inferring it indirectly from signing behavior
+alone. `cancel-csr --fingerprint <hex>` deletes one pending
 entry; it is the only way to remove an orphaned pending private key short of the OS keychain
 UI, a direct consequence of §3's content-addressed pending storage letting multiple CSRs
 accumulate.
@@ -4837,8 +4895,15 @@ new `vg-vault::enrol` module (`request_device_signing_csr`, `install_device_sign
 `InstalledSigningCredential`/`CredentialStatus`/`EnrolError`) — purely additive — plus one new
 reachable `Err` case on the existing `load_device_signing_credential` (§7), additive to every
 current caller (all already treat any `Err` as an HMAC downgrade) but recorded as a contract
-event since it is a new case, not silently folded into the module addition. See
-`interface-contracts.md` §7a's v1.9 addendum for the full shape.
+event since it is a new case, not silently folded into the module addition. **Round-A correction
+applied post-landing, same commit sequence, before implementation began:** `CredentialStatus`
+was originally a three-armed enum (`NotEnrolled`/`Installed`/`EnvSeamShadowing`) that could not
+represent an installed-and-shadowed credential at once (§8); it is now `{ installed:
+Option<InstalledSigningCredential>, env_seam_shadowing: bool }`, two independent facts.
+`EnrolError::AlreadyEnrolled` gained `device_ref: DeviceRef` alongside its existing `key_ref`, so
+§6's required refusal message can name both identifiers from the install call itself rather than
+a second, racy `credential_status()` read. See `interface-contracts.md` §7a's v1.9 addendum for
+the full corrected shape.
 
 ### 11. Downstream-repo impact
 
@@ -4904,6 +4969,14 @@ and how an operator diagnoses the gap, not the on-the-wire signing behavior.
    seven-day install-time warning (§3) as a backstop.
 4. This is not an MDM enrolment path (§2, §12) — it proves OS-keychain interoperability with a
    real, custodian-issued certificate, not a production enrolment or renewal story.
+5. **(Round-A finding)** The anchor check is proven against `veil-custodian`'s auto-generated
+   local/test CA (P-256/ECDSA-SHA256, `src/ca/mod.rs:148`) only. `veil-custodian` does not itself
+   restrict a *provisioned* production CA to that algorithm (`KeyPair::from_pem`,
+   `src/ca/mod.rs:119,197`; `rcgen` also accepts Ed25519/P-384/RSA issuer keys). `install-cert`
+   refuses rather than silently accepts a mismatched algorithm (§3), so this fails safe, but it
+   means Phase 1's writer is not proven compatible with every CA `veil-custodian` could
+   theoretically be provisioned with — filed as a follow-on to pin or verify that constraint
+   cross-repo, not assumed away here.
 
 ### 14. Migration statement
 
@@ -4923,7 +4996,13 @@ migrates.
   keychain in the default test run) — every row of §6's table, plus a simulated crash after
   each write step in §3's sequence, asserting both the loader's behavior at that point and a
   correct recovering re-run; one install-then-load round trip proving the migrated loader
-  branch and the new writer agree.
+  branch and the new writer agree. **(Round-A additions)** same-key-different-certificate is
+  *not* treated as `AlreadyInstalled` (the corrected §6 row, proven with two certificates
+  sharing one SPKI but different DER — reproducing `veil-custodian`'s actual repeat-issuance
+  behavior); a crash mid-`--force`-replacement (new cert written, old key still present)
+  recovers via the same unified condition without requiring a second `--force`; two concurrent
+  `install-cert` invocations against the same fake store, one blocked on the other's lock,
+  never produce a torn credential.
 - `vg-cli` integration — `--help` coverage for the new group; env-seam-set refusal (§4);
   malformed/wrong-profile/wrong-anchor certificate refusal; missing `--ca-cert` rejected by
   `clap` itself, proving no bypass exists.
