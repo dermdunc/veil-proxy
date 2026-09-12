@@ -18,6 +18,11 @@
 //! - `vg audit last|<n>` — the most recent audit event(s), redaction-safe by construction.
 //! - `vg policy check` — load/validate the layered packs, print the resolved summary.
 //! - `vg vault stats` — mapping count only; never values.
+//! - `vg enrol request-csr|install-cert|status|cancel-csr` — device-side telemetry
+//!   signing-credential install (ADR-017, XREPO-009). Device-level, not repo-level: ignores
+//!   `--state-dir`/`VG_STATE_DIR` entirely, dispatched before `StatePaths::resolve` runs.
+
+mod enrol;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -117,6 +122,47 @@ enum Command {
         #[arg(long)]
         no_hook: bool,
     },
+    /// Device-side telemetry signing-credential install (ADR-017, XREPO-009). Device-level,
+    /// not repo-level: `--state-dir`/`VG_STATE_DIR` are accepted but ignored by every
+    /// subcommand here -- the credential lives in the OS keychain under a fixed per-device
+    /// account, not this repo's `.veilgremlin/` state directory.
+    Enrol {
+        #[command(subcommand)]
+        cmd: EnrolCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnrolCmd {
+    /// Generate a P-256 signing keypair and emit a CSR for a veil-enrol operator. The
+    /// private key is stored in the OS keychain as a pending entry and never written to
+    /// disk.
+    RequestCsr {
+        /// Write the CSR PEM here instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// Install a custodian-issued signing certificate, verified against a pinned CA.
+    InstallCert {
+        /// The certificate PEM returned by `veil-enrol issue-signing-key`
+        #[arg(long, value_name = "FILE")]
+        cert: PathBuf,
+        /// The custodian CA certificate PEM, obtained out of band. Required: without a
+        /// trust anchor, any certificate file could install an attacker-chosen device
+        /// identity. There is deliberately no bypass flag.
+        #[arg(long, value_name = "FILE")]
+        ca_cert: PathBuf,
+        /// Replace an existing, different signing credential. Not renewal automation.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Discard a pending CSR's private key (see `request-csr`'s printed fingerprint)
+    CancelCsr {
+        #[arg(long, value_name = "HEX")]
+        fingerprint: String,
+    },
+    /// Show whether a signing credential is installed, and whether the env seam shadows it
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -152,6 +198,24 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // ADR-017 (XREPO-009): `enrol` is device-level, not repo-level -- it must not resolve,
+    // depend on, or create a `.veilgremlin/` state directory, so it is intercepted here,
+    // before `StatePaths::resolve` runs at all. `--state-dir`/`VG_STATE_DIR` are accepted by
+    // the global CLI arg parser but silently ignored for this command group; that is
+    // documented on `Command::Enrol` itself, not re-explained at every call site here.
+    if let Command::Enrol { cmd } = cli.command {
+        return match cmd {
+            EnrolCmd::RequestCsr { out } => enrol::cmd_request_csr(out),
+            EnrolCmd::InstallCert {
+                cert,
+                ca_cert,
+                force,
+            } => enrol::cmd_install_cert(cert, ca_cert, force),
+            EnrolCmd::CancelCsr { fingerprint } => enrol::cmd_cancel_csr(fingerprint),
+            EnrolCmd::Status => enrol::cmd_status(),
+        };
+    }
+
     let (paths, provenance) = StatePaths::resolve(cli.state_dir)?;
     // F3 hardening: never silently trust a state dir adopted from an ancestor.
     if let Some(warning) = provenance.discovered_warning(paths.root()) {
@@ -182,6 +246,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             hook_samples,
             no_hook,
         } => cmd_bench(hook_samples, no_hook),
+        Command::Enrol { .. } => {
+            unreachable!("Command::Enrol is intercepted above, before StatePaths::resolve")
+        }
     }
 }
 

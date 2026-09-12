@@ -27,12 +27,35 @@
 //! out of scope for Phase 1 (the reseed happens once, at open); the `UNIQUE` index on the
 //! ordinal columns is the backstop if that assumption is ever violated.
 
+mod anchor;
 mod certificate;
 mod codec;
+mod csr;
+mod enrol;
 mod error;
 mod keychain;
 mod random;
 mod schema;
+mod store;
+
+/// Test-only support shared across this crate's `#[cfg(test)]` modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    /// Serializes any test that mutates `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM`
+    /// (or checks them as an environment-shadowing precondition) across module boundaries.
+    /// Both `keychain.rs`'s loader tests and `enrol.rs`'s writer tests touch this exact pair
+    /// of process-global env vars, so a per-module lock (`enrol.rs`'s own `serialize_tests`
+    /// among its own tests, or `keychain.rs`'s comment-documented single-function coalescing)
+    /// is not enough on its own — `cargo test`'s default in-thread parallelism can still
+    /// interleave a mutation in one module's test with a read in the other's. One shared,
+    /// crate-wide lock closes that gap.
+    pub(crate) fn device_signing_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -54,6 +77,13 @@ use crate::keychain::load_or_create_db_key;
 use crate::random::fill_random;
 
 pub use crate::keychain::{load_device_signing_credential, load_or_create_actor_pseudonym_key};
+
+// ADR-017 (XREPO-009), interface-contracts.md v1.9: the device-signing-credential writer.
+pub use crate::enrol::{
+    cancel_pending_csr, credential_status, install_device_signing_certificate,
+    request_device_signing_csr, CredentialStatus, EnrolError, InstallOutcome,
+    InstalledSigningCredential, PendingCsr,
+};
 
 /// The default OS-keychain service name under which the DB key is stored.
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "com.veilgremlin.vault";

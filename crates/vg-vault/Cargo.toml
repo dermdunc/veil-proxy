@@ -38,11 +38,19 @@ getrandom = "0.2"
 # back out of the OS keychain, so `keychain::load_device_signing_credential` can validate
 # its Key Usage / Extended Key Usage profile and extract the SAN-carried `DeviceRef` --
 # `vg-core` deliberately has no X.509 parser (its own `Cargo.toml` explains why), so this
-# is the one crate in the workspace that owns certificate parsing. Default features only
-# (`pem`, `std`): no `builder` (never issues a certificate, only reads one), no `signature`
-# (never verifies a certificate's own CA signature -- that trust decision belongs to
-# `veil-custodian`, the issuer; this loader only checks the profile of a certificate
-# already retrieved from the local, already-trusted keychain).
+# is the one crate in the workspace that owns certificate parsing. Also now builds a PKCS#10
+# CSR (`csr` module) and verifies a certificate's CA signature against a pinned anchor
+# (`anchor` module) -- ADR-017 (XREPO-009).
+#
+# Default features only (`pem`, `std`) -- deliberately still no `builder`, no `signature`:
+# - `builder`'s `RequestBuilder` unconditionally inserts an `extensionRequest` attribute even
+#   with zero extensions added, diverging from the empty-`Attributes` CSR shape `veil-enrol`
+#   and `veil-custodian`'s own test suites are proven against, and it pulls an unused `sha1`
+#   dependency into this crate. `csr.rs` hand-assembles the always-available (non-feature-
+#   gated) `x509_cert::request::{CertReq, CertReqInfo}` types instead.
+# - `signature` exists only to support `builder`; `x509-cert 0.3` has no certificate- or CSR-
+#   verification API of its own regardless of features, so it buys nothing. `anchor.rs`
+#   verifies directly against `p256::ecdsa::VerifyingKey`.
 x509-cert = "0.3"
 # `x509-cert 0.3`'s own typed extension accessors (`get_extension::<KeyUsage>()`) return
 # `der`/`const-oid` types directly, so this crate names them to construct the two OIDs it
@@ -60,12 +68,32 @@ const-oid = "0.10"
 # `#[cfg]` requirement, needed to get the public key's raw bytes for that comparison. Same
 # version `vg-core`'s own `p256` dependency already resolves, so no second version enters
 # the build graph.
-p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
+#
+# `pkcs8` added (ADR-017, XREPO-009): the feature gate `ecdsa`'s `DerSignature`, the
+# `AssociatedAlgorithmIdentifier` impl the hand-assembled CSR's outer signature needs, and
+# `Signature::from_der` for anchor verification. All transitive deps this pulls (`pkcs8
+# 0.11`, `der 0.8`, `digest 0.11`) are already resolved elsewhere in this workspace's lock
+# file -- this adds no new dependency, only visibility of what's already there.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc", "pkcs8"] }
+# SPKI fingerprint (`csr.rs`) must be byte-identical to `veil-enrol`'s own
+# `csr_public_key_fingerprint` (SHA-256 over the DER SubjectPublicKeyInfo). Already compiled
+# transitively via `p256`'s `ecdsa` feature (`sha2` backs `Sha256` there) -- this is a
+# visibility change, naming the crate directly rather than reaching through `p256`'s
+# re-exports, since this fingerprint is the single most cross-repo-load-bearing value this
+# crate produces.
+sha2 = "0.11"
 # Zeroizes the plaintext-hex encode/decode intermediates in keychain.rs (a
 # doubt-driven-development finding: the final [u8; 32] key crosses this crate's boundary
 # unwrapped by design — see keychain.rs's doc comments — but the hex String/Vec<u8> this
 # crate builds along the way had no zeroize coverage at all).
 zeroize = "1"
+# `enrol::EnrolLock` (ADR-017 §3) takes a raw advisory `flock(2)` lock on a device-global
+# path -- deliberately not a lockfile-existence convention, since the kernel must release it
+# automatically if the holding process crashes mid-install (the exact scenario the lock's
+# recovery design depends on). Already resolved transitively in this workspace's lock file
+# (`keyring`'s own dependency tree); this makes it a direct dependency rather than reaching
+# through another crate's re-export for something this security-relevant.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

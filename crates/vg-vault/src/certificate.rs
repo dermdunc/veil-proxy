@@ -25,11 +25,21 @@
 //! length, which a wrong-algorithm key could coincidentally match (same review round).
 //!
 //! **What this module does not check.** It does not verify the certificate's own CA
-//! signature — that trust decision belongs to `veil-custodian`, the issuer; a
-//! certificate reaching this loader already came from the local, already-trusted OS
-//! keychain (`keychain::load_device_signing_credential`), not an untrusted network peer.
-//! It does not parse or validate `not_before`/`not_after` — expiry is the custodian's
-//! revocation/CRL problem (ADR-P), not this crate's.
+//! signature — that trust decision belonged entirely to `veil-custodian`, the issuer, for
+//! as long as every certificate this module ever saw had already come from the local,
+//! already-trusted OS keychain (`keychain::load_device_signing_credential`), never an
+//! untrusted network peer. **That premise no longer holds unconditionally**: ADR-017
+//! (XREPO-009) added `enrol::install_device_signing_certificate`, which validates a
+//! certificate handed over an out-of-band channel — a file, not yet in the keychain —
+//! before ever writing it there. `anchor.rs` is where that verification now lives, checked
+//! against a caller-supplied CA certificate at install time; this module's own profile
+//! checks are unchanged and still run either way, since they check a different property
+//! (which certificate *profile* this is) than `anchor.rs` does (who signed it). It does not
+//! parse or validate `not_before`/`not_after` — expiry is the custodian's revocation/CRL
+//! problem (ADR-P) for a certificate already in the keychain; `enrol.rs`'s install path
+//! separately warns (not rejects) on an already-expired-or-expiring certificate via
+//! `anchor::verify_issued_by_anchor`'s own validity fields, so this module still never
+//! needs to parse them itself.
 
 use der::asn1::ObjectIdentifier;
 use der::{DecodePem, Encode};

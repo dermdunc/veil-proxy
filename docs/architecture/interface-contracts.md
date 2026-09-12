@@ -1,6 +1,6 @@
-# VeilGremlin — Interface Contracts (v1.8)
+# VeilGremlin — Interface Contracts (v1.9)
 
-**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2); v1.5 (2026-08-23 — `TelemetryEvent` added, `vg-core`'s `telemetry::` module; see §1 and §7a); v1.6 (2026-08-31 — ADR-S ECDSA signing: `sign_edge_event_record` re-signed to take a `SigningCredential`, `DeviceSigningCredential` added, see §7a); v1.7 (2026-08-31 — config surface: `load_device_signing_credential`'s return type sharpened to `Option`-wrapped, `OwnedSigningCredential` added, see §7a); v1.8 (2026-09-08 — ADR-016/XREPO-007: `EdgeEventRecordInput` loses `device_ref`, `Envelope::device_ref` now derived structurally from `SigningCredential`, wire contract bumps to `veil.edge_event.v2`, see §7a). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
+**Status:** Frozen at T02 (2026-07-15) and version-controlled under the contract-change protocol since. The seams do not change ad hoc: every change goes through the protocol in `agent-factory-plan.md` §6 and bumps the version. The versions to date: v1.1 (Task T07, 2026-07-18 — `mask` gained `ctx: &Context`, see §2); v1.2 and v1.3 (Task T09, 2026-07-18 — `MaskedPack` gained `bindings`, `rehydrate` re-signed, §8 hook protocol corrected to the platform's real semantics; see §1, §2, §8); v1.4 (Task T10, 2026-07-18 — `benchmark` gained `ctx: &Context`, see §2); v1.5 (2026-08-23 — `TelemetryEvent` added, `vg-core`'s `telemetry::` module; see §1 and §7a); v1.6 (2026-08-31 — ADR-S ECDSA signing: `sign_edge_event_record` re-signed to take a `SigningCredential`, `DeviceSigningCredential` added, see §7a); v1.7 (2026-08-31 — config surface: `load_device_signing_credential`'s return type sharpened to `Option`-wrapped, `OwnedSigningCredential` added, see §7a); v1.8 (2026-09-08 — ADR-016/XREPO-007: `EdgeEventRecordInput` loses `device_ref`, `Envelope::device_ref` now derived structurally from `SigningCredential`, wire contract bumps to `veil.edge_event.v2`, see §7a); v1.9 (2026-09-11 — ADR-017/XREPO-009: `vg-vault` gains a device-signing-credential *writer* — `enrol::request_device_signing_csr`/`install_device_signing_certificate`, new public types `EnrolError`/`InstallOutcome`/`InstalledSigningCredential`/`PendingCsr` — and `load_device_signing_credential` gains one new `Err` case, see §7a). This document was reconciled against the actual `vg-core` code at freeze time (a doubt-driven-development pass on the T02 PR found it had drifted from the implementation before either landed) — every type and trait below now matches `crates/vg-core/src/{types,traits,api}.rs` exactly, including the supporting types (§0) the original draft's illustrative signatures used but never defined.
 
 These are the seams that let squads build in parallel. They are illustrative Rust signatures — Squad 0 owns the canonical definitions in `vg-core`. Other squads implement against these traits and **do not** depend on each other's internals.
 
@@ -278,6 +278,105 @@ Contract: append-only; **no raw values** in any variant (refs/counts/versions on
 
 ## 7a. `TelemetryEvent` (v1.5, owned by `vg-core`, `telemetry::` module)
 
+**v1.9 addendum (2026-09-11, ADR-017, XREPO-009):** `vg-vault` gains the device-signing-credential
+**writer** the v1.7 addendum's loader has never had — closing the gap that addendum named
+("every real device still falls back to HMAC today, since no enrolment flow exists yet"). New
+public surface, a new `vg-vault::enrol` module:
+
+```rust
+pub fn request_device_signing_csr() -> Result<PendingCsr, EnrolError>;
+pub fn install_device_signing_certificate(
+    cert_pem: &str,
+    ca_cert_pem: &str,
+    force: bool,
+) -> Result<InstallOutcome, EnrolError>;
+pub fn cancel_pending_csr(spki_fingerprint: &str) -> Result<(), EnrolError>;
+pub fn credential_status() -> Result<CredentialStatus, EnrolError>;
+
+pub struct PendingCsr { pub csr_pem: String, pub spki_fingerprint: String }
+// `AlreadyInstalled`/`RecoveredPartialInstall` carry `InstalledSigningCredential` too
+// (implementation-time refinement: both are computed along the way regardless of outcome,
+// so returning them avoids a second, racy `credential_status()` read).
+pub enum InstallOutcome {
+    Installed(InstalledSigningCredential),
+    AlreadyInstalled(InstalledSigningCredential),
+    RecoveredPartialInstall(InstalledSigningCredential),
+}
+// `issuer`/`not_before` are implementation-time additions (ADR-017 §3's command surface
+// commits to printing "profile, issuer, device_ref, key_ref, validity window"). `issuer`
+// comes from the certificate's own `issuer` field, obtainable identically at install time or
+// later via `credential_status` -- unlike the anchor file's own subject/fingerprint, which
+// only exist at install time and are deliberately not part of this shared type.
+pub struct InstalledSigningCredential {
+    pub device_ref: DeviceRef,
+    pub key_ref: KeyRef,
+    pub issuer: String,
+    pub not_before: std::time::SystemTime,
+    pub not_after: std::time::SystemTime,
+}
+// Three independent facts, not one enum's mutually exclusive arms (round-A correction: a
+// credential can be installed AND shadowed at once; round-B correction: `installed: None`
+// alone cannot distinguish "never enrolled" from ADR-017 §7's marker-present/credential-
+// missing-or-interrupted state without erasing the exact distinction §7 exists to draw).
+pub struct CredentialStatus {
+    pub installed: Option<InstalledSigningCredential>,
+    pub env_seam_shadowing: bool,
+    pub enrolment_marker_present: bool,
+}
+pub enum EnrolError {
+    EnvSeamActive,
+    Profile(VaultError),
+    // Implementation-time refinement (found during coding, not design review): a bare unit
+    // `AnchorMismatch` carries no message, making every anchor-rejection reason (wrong CA,
+    // tampered signature, wrong algorithm, wrong curve) indistinguishable to a caller.
+    // `anchor.rs` does not produce a separately-typed error per rejection reason, so a
+    // separate `UnsupportedSignatureAlgorithm` variant (below) could never actually be
+    // constructed without string-matching anchor.rs's own message text -- the exact
+    // anti-pattern this type exists to avoid. Both are replaced by one `AnchorMismatch(String)`
+    // carrying anchor.rs's own descriptive message.
+    AnchorMismatch(String),
+    NoPendingKey,
+    // Carries device_ref too (round-A correction) so the refusal message itself can name
+    // the currently-installed identity without a second, racy credential_status() read.
+    // `key_present` (round-D correction): whether the stored key alongside the conflicting
+    // certificate is actually present -- ADR-017 §6 requires the refusal say so explicitly
+    // when it is not.
+    AlreadyEnrolled { key_ref: KeyRef, device_ref: DeviceRef, key_present: bool },
+    Keychain(VaultError),
+}
+```
+
+`request_device_signing_csr` generates a P-256 keypair in-process and never writes the private
+key to a plaintext file — the raw scalar is persisted only through the configured OS-keychain
+backend (corrected from an earlier "never written to disk" phrasing that overstated this beyond
+this repo's own established "never persisted plaintext" guarantee, `keychain.rs`'s module doc).
+It stores the private key in the OS keychain under a new content-addressed pending service
+(account = the key's own SPKI fingerprint, not the `"default"` account the existing device-
+signing services use — see ADR-017 §3), and returns a CSR plus that same fingerprint for the
+existing out-of-band operator-confirmation flow (`veil-enrol/docs/architecture.md`'s CSR
+handoff mechanism, unchanged by this contract). `install_device_signing_certificate` verifies
+the returned certificate against a caller-supplied CA certificate — **there is no variant that
+skips this**, since `certificate.rs`'s existing profile check (v1.6) never verified a CA
+signature by design, a premise that stops holding the moment a certificate arrives as a file
+rather than already being in the trusted keychain (ADR-017 §3) — matches it to its pending
+private key by SPKI, and activates it.
+
+**`load_device_signing_credential` (v1.7) gains one new `Err` case**, additive to its existing
+`Result<Option<DeviceSigningCredential>, VaultError>` shape: when a new durable enrolment
+marker is present but the active key entry is absent, it now returns `Err` naming a missing
+(not never-enrolled) credential, rather than the `Ok(None)` "not yet enrolled" case every prior
+version returned in that situation. `Ok(None)` still means exactly "no marker, never enrolled."
+No existing caller branches on this distinction today (`vg-adapters-claude::runtime`'s
+`Engine::open` already treats any `Err` as a downgrade to HMAC, `TelemetryAuthenticity::
+DegradedCredentialError`) so this is behavior-widening, not behavior-breaking, for every
+current caller — but it is a new reachable `Err` case, not purely additive, so it is recorded
+as a contract event rather than silently folded into the v1.9 module addition. See ADR-017 §7
+for the marker's full design and the `runtime.rs:144-155` gap it closes.
+
+This is `vg-vault`'s first *writer* surface for any device credential — `certificate::
+validate_signing_certificate_pem` (v1.6) and `keychain::load_device_signing_credential` (v1.7)
+are unchanged apart from the one new `Err` case above; nothing in `vg-core` changes.
+
 **v1.8 addendum (2026-09-08, ADR-016, XREPO-007):** `telemetry::signing::EdgeEventRecordInput`
 lost its `device_ref: Option<DeviceRef>` field (non-additive, breaking — the one prior caller,
 `vg-audit::telemetry_sink`'s `try_emit`, updated in the same change). `SigningCredential` gained a
@@ -390,4 +489,5 @@ implements. No JSON Schema artifact is published yet — schema generation is se
 - **v1.6** — 2026-08-31 (ADR-S, `veil-custodian`'s per-device telemetry signing-key issuance). `sign_edge_event_record`'s second parameter changed from `&ReceiptSigningKey` to `&SigningCredential<'_>` (a non-additive, breaking signature change — the one prior caller, `vg-audit::telemetry_sink`, was updated in the same change). New public types `SigningCredential`/`DeviceSigningCredential` in `vg-core`; new `vg-vault` surface (`certificate::validate_signing_certificate_pem`, `keychain::load_device_signing_credential`) not previously part of this contract. See §7a's addendum for the full shape and `../decisions.md`'s 2026-08-31 entry for the acceptance review and doubt-driven-development history (five findings, all fixed).
 - **v1.7** — 2026-08-31 (config surface: auto-detect ECDSA vs HMAC from device-credential presence). `vg-vault::keychain::load_device_signing_credential`'s return type changed from `Result<DeviceSigningCredential, VaultError>` to `Result<Option<DeviceSigningCredential>, VaultError>` (a non-additive, breaking signature change — no real callers yet besides its own tests). New public type `telemetry::signing::OwnedSigningCredential` in `vg-core` (additive). See §7a's addendum for the full shape and `../decisions.md`'s 2026-08-31 "Config surface" entry for the doubt-driven-development history (9 findings, all fixed).
 - **v1.8** — 2026-09-08 (ADR-016, `XREPO-007`: `Envelope::device_ref` populated structurally). `telemetry::signing::EdgeEventRecordInput` loses its `device_ref: Option<DeviceRef>` field (a non-additive, breaking change — the one prior caller, `vg-audit::telemetry_sink`, updated in the same change); `Envelope::device_ref` is now derived from `SigningCredential` the same structural way `key_ref` already was. Wire contract bumps: `SchemaVersion::EdgeEventV2` (`"veil.edge_event.v2"`) is what `sign_edge_event_record` actually declares now, `EdgeEventV1` kept but no longer emitted; `DeviceRef` serialises `dev_<32hex>`, not bare hex. See §7a's addendum for the full shape and `../decisions.md`'s ADR-016 entry for the two-round adversarial review history (Codex, then Fable — eight findings across both, all fixed).
+- **v1.9** — 2026-09-11 (ADR-017, `XREPO-009`: device-side signing-credential install). New `vg-vault::enrol` module (additive): `request_device_signing_csr`, `install_device_signing_certificate`, `cancel_pending_csr`, `credential_status`, and new public types `PendingCsr`/`InstallOutcome`/`InstalledSigningCredential`/`CredentialStatus`/`EnrolError` — the writer counterpart to the v1.7 loader, closing the gap that addendum named. `load_device_signing_credential` (v1.7) gains one new reachable `Err` case (a durable enrolment marker present with the active key absent) alongside its existing `Ok(None)`/`Err` shape — additive to callers today (all treat any `Err` as a downgrade to HMAC) but recorded as a contract event since it is a new case, not purely additive. See §7a's addendum for the full shape and `../decisions.md`'s ADR-017 entry for the adversarial review history.
 - Increment on any breaking change to a public type/trait above. Record the bump in `../decisions.md` and notify downstream squads.

@@ -22,6 +22,11 @@ vg-adapters-claude = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 # Reading the audit JSONL and stored-pack files for `vg audit` / `vg demask`.
 serde_json = "1"
+# `vg enrol`'s output rendering: `KeyRef`/`DeviceRef` (vg-core) deliberately expose only
+# `Serialize`, no `Display`/`Debug` -- this is the trait bound `enrol.rs`'s render() needs to
+# round-trip them through `serde_json::to_value` for display. Already resolved transitively
+# via `serde_json`'s own dependency tree; this just names it directly.
+serde = "1"
 # `vg vault stats` opens an inspection handle directly (the VaultStore trait deliberately
 # exposes no counting; Vault::mapping_count is the concrete impl's own inspection API).
 vg-vault = { workspace = true }
