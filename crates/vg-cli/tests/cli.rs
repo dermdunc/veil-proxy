@@ -209,10 +209,160 @@ fn help_is_complete_for_every_subcommand() {
         vec!["audit", "--help"],
         vec!["policy", "--help"],
         vec!["vault", "--help"],
+        vec!["enrol", "--help"],
+        vec!["enrol", "request-csr", "--help"],
+        vec!["enrol", "install-cert", "--help"],
+        vec!["enrol", "cancel-csr", "--help"],
+        vec!["enrol", "status", "--help"],
     ] {
         let out = run_vg(&state, &args, None);
         assert!(out.status.success(), "help failed for {args:?}");
         assert!(!stdout(&out).is_empty(), "empty help for {args:?}");
+    }
+}
+
+/// ADR-017 (XREPO-009) integration tests. None of these ever reach the real OS keychain --
+/// every case here is refused during validation, which happens before any keychain access
+/// (`vg-vault::enrol`'s own doc explains why this ordering makes it safe to integration-test
+/// without a keychain seam). The happy path (`request-csr`/`install-cert` actually writing a
+/// credential) is deliberately NOT tested here -- its coverage is `vg-vault`'s own
+/// `InMemoryStore`-backed state-machine tests plus the live-run proof (ADR-017 §12).
+mod enrol {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../vg-vault/tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn install_cert_refuses_when_the_env_seam_is_active() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join(".veilgremlin");
+        let out = Command::new(vg())
+            .env("VG_VAULT_KEY_HEX", TEST_KEY_HEX)
+            .env("VG_STATE_DIR", &state)
+            .env("VG_DEVICE_SIGNING_KEY_HEX", "irrelevant-for-this-test")
+            .args([
+                "enrol",
+                "install-cert",
+                "--cert",
+                fixture("enrol_leaf_a.pem").to_str().unwrap(),
+                "--ca-cert",
+                fixture("enrol_ca.pem").to_str().unwrap(),
+            ])
+            .output()
+            .expect("run vg");
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(err.contains("VG_DEVICE_SIGNING_KEY_HEX"), "stderr: {err}");
+    }
+
+    /// Round-D finding: the test above alone doesn't prove the *ordering* ADR-017 §4
+    /// requires ("first, before any file or keychain access") -- it passes just as well if
+    /// the seam were checked only deep inside the library, *after* both files are read,
+    /// since both paths there are readable. Using nonexistent paths here makes the ordering
+    /// itself the thing under test: if the CLI ever regresses to reading files before
+    /// checking the seam, this fails with a "file not found" error instead of the seam
+    /// message.
+    #[test]
+    fn install_cert_checks_the_env_seam_before_reading_either_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join(".veilgremlin");
+        let out = Command::new(vg())
+            .env("VG_VAULT_KEY_HEX", TEST_KEY_HEX)
+            .env("VG_STATE_DIR", &state)
+            .env("VG_DEVICE_SIGNING_KEY_HEX", "irrelevant-for-this-test")
+            .args([
+                "enrol",
+                "install-cert",
+                "--cert",
+                "/nonexistent/does-not-exist-cert.pem",
+                "--ca-cert",
+                "/nonexistent/does-not-exist-ca.pem",
+            ])
+            .output()
+            .expect("run vg");
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(
+            err.contains("VG_DEVICE_SIGNING_KEY_HEX"),
+            "expected the env-seam refusal (proving the seam is checked before either file \
+             read), got: {err}"
+        );
+        assert!(
+            !err.contains("No such file"),
+            "the seam check must run before either file is read, but got a file error: {err}"
+        );
+    }
+
+    #[test]
+    fn install_cert_rejects_a_wrong_profile_certificate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join(".veilgremlin");
+        let out = run_vg(
+            &state,
+            &[
+                "enrol",
+                "install-cert",
+                "--cert",
+                fixture("wrong_key_usage.pem").to_str().unwrap(),
+                "--ca-cert",
+                fixture("enrol_ca.pem").to_str().unwrap(),
+            ],
+            None,
+        );
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("digitalSignature"),
+            "stderr: {}",
+            stderr(&out)
+        );
+    }
+
+    #[test]
+    fn install_cert_rejects_a_certificate_not_issued_by_the_given_anchor() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join(".veilgremlin");
+        let out = run_vg(
+            &state,
+            &[
+                "enrol",
+                "install-cert",
+                "--cert",
+                fixture("enrol_leaf_a.pem").to_str().unwrap(),
+                "--ca-cert",
+                fixture("anchor_ca.pem").to_str().unwrap(),
+            ],
+            None,
+        );
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("issuer"), "stderr: {}", stderr(&out));
+    }
+
+    #[test]
+    fn install_cert_without_ca_cert_is_rejected_by_clap_itself() {
+        // Proves no bypass exists: --ca-cert is a required clap arg, not merely a
+        // recommended one this binary could be invoked without.
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join(".veilgremlin");
+        let out = run_vg(
+            &state,
+            &[
+                "enrol",
+                "install-cert",
+                "--cert",
+                fixture("enrol_leaf_a.pem").to_str().unwrap(),
+            ],
+            None,
+        );
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("--ca-cert"),
+            "stderr: {}",
+            stderr(&out)
+        );
     }
 }
 

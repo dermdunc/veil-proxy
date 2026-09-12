@@ -1712,6 +1712,7 @@ name = "vg-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "tempfile",
  "vg-adapters-claude",
@@ -1805,8 +1806,10 @@ dependencies = [
  "der",
  "getrandom 0.2.17",
  "keyring",
+ "libc",
  "p256",
  "rusqlite",
+ "sha2 0.11.0",
  "tempfile",
  "uuid",
  "vg-core",

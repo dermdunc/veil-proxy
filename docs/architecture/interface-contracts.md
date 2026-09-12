@@ -294,8 +294,26 @@ pub fn cancel_pending_csr(spki_fingerprint: &str) -> Result<(), EnrolError>;
 pub fn credential_status() -> Result<CredentialStatus, EnrolError>;
 
 pub struct PendingCsr { pub csr_pem: String, pub spki_fingerprint: String }
-pub enum InstallOutcome { Installed(InstalledSigningCredential), AlreadyInstalled, RecoveredPartialInstall }
-pub struct InstalledSigningCredential { pub device_ref: DeviceRef, pub key_ref: KeyRef, pub not_after: std::time::SystemTime }
+// `AlreadyInstalled`/`RecoveredPartialInstall` carry `InstalledSigningCredential` too
+// (implementation-time refinement: both are computed along the way regardless of outcome,
+// so returning them avoids a second, racy `credential_status()` read).
+pub enum InstallOutcome {
+    Installed(InstalledSigningCredential),
+    AlreadyInstalled(InstalledSigningCredential),
+    RecoveredPartialInstall(InstalledSigningCredential),
+}
+// `issuer`/`not_before` are implementation-time additions (ADR-017 §3's command surface
+// commits to printing "profile, issuer, device_ref, key_ref, validity window"). `issuer`
+// comes from the certificate's own `issuer` field, obtainable identically at install time or
+// later via `credential_status` -- unlike the anchor file's own subject/fingerprint, which
+// only exist at install time and are deliberately not part of this shared type.
+pub struct InstalledSigningCredential {
+    pub device_ref: DeviceRef,
+    pub key_ref: KeyRef,
+    pub issuer: String,
+    pub not_before: std::time::SystemTime,
+    pub not_after: std::time::SystemTime,
+}
 // Three independent facts, not one enum's mutually exclusive arms (round-A correction: a
 // credential can be installed AND shadowed at once; round-B correction: `installed: None`
 // alone cannot distinguish "never enrolled" from ADR-017 §7's marker-present/credential-
@@ -308,12 +326,22 @@ pub struct CredentialStatus {
 pub enum EnrolError {
     EnvSeamActive,
     Profile(VaultError),
-    AnchorMismatch,
-    UnsupportedSignatureAlgorithm,
+    // Implementation-time refinement (found during coding, not design review): a bare unit
+    // `AnchorMismatch` carries no message, making every anchor-rejection reason (wrong CA,
+    // tampered signature, wrong algorithm, wrong curve) indistinguishable to a caller.
+    // `anchor.rs` does not produce a separately-typed error per rejection reason, so a
+    // separate `UnsupportedSignatureAlgorithm` variant (below) could never actually be
+    // constructed without string-matching anchor.rs's own message text -- the exact
+    // anti-pattern this type exists to avoid. Both are replaced by one `AnchorMismatch(String)`
+    // carrying anchor.rs's own descriptive message.
+    AnchorMismatch(String),
     NoPendingKey,
     // Carries device_ref too (round-A correction) so the refusal message itself can name
     // the currently-installed identity without a second, racy credential_status() read.
-    AlreadyEnrolled { key_ref: KeyRef, device_ref: DeviceRef },
+    // `key_present` (round-D correction): whether the stored key alongside the conflicting
+    // certificate is actually present -- ADR-017 §6 requires the refusal say so explicitly
+    // when it is not.
+    AlreadyEnrolled { key_ref: KeyRef, device_ref: DeviceRef, key_present: bool },
     Keychain(VaultError),
 }
 ```

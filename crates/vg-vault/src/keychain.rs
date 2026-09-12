@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::certificate::validate_signing_certificate_pem;
 use crate::error::{crypto_err, VaultError};
 use crate::random::fill_random;
+use crate::store::{OsKeychain, SecretStore};
 use vg_core::telemetry::{ActorPseudonymKey, DeviceSigningCredential};
 
 /// Returns the DB encryption key for `(service, account)`, generating and storing a fresh
@@ -122,9 +123,33 @@ pub fn load_or_create_actor_pseudonym_key() -> Result<ActorPseudonymKey, VaultEr
 /// already has are hardwired to a fixed 32-byte secret, which fits the scalar but not a
 /// variable-length PEM certificate). One account, `"default"`, per device — same
 /// reasoning as [`ACTOR_PSEUDONYM_ACCOUNT`]: this doesn't fragment per vault path.
-const DEVICE_SIGNING_KEY_SERVICE: &str = "com.veilgremlin.device-signing-key";
-const DEVICE_SIGNING_CERT_SERVICE: &str = "com.veilgremlin.device-signing-cert";
-const DEVICE_SIGNING_ACCOUNT: &str = "default";
+///
+/// `pub(crate)`, not private: `enrol.rs` (ADR-017, XREPO-009) is this module's writer
+/// counterpart and reuses these exact service/account names rather than declaring a second,
+/// possibly-drifting copy.
+pub(crate) const DEVICE_SIGNING_KEY_SERVICE: &str = "com.veilgremlin.device-signing-key";
+pub(crate) const DEVICE_SIGNING_CERT_SERVICE: &str = "com.veilgremlin.device-signing-cert";
+pub(crate) const DEVICE_SIGNING_ACCOUNT: &str = "default";
+
+/// The OS-keychain service under which `enrol::request_device_signing_csr` stores a
+/// not-yet-installed private key (ADR-017 §3). **Content-addressed, not `"default"`**: the
+/// account is the pending key's own SPKI fingerprint, so multiple outstanding CSRs can coexist
+/// safely and `enrol::install_device_signing_certificate` selects the private key by the
+/// incoming certificate's own SPKI, never by recency. Declared here, alongside the active
+/// services above, rather than in `enrol.rs` itself, so all four device-signing-credential
+/// service names live in one place.
+pub(crate) const DEVICE_SIGNING_PENDING_SERVICE: &str =
+    "com.veilgremlin.device-signing-key-pending";
+
+/// The OS-keychain service under which `enrol::install_device_signing_certificate` writes a
+/// durable "this device is expected to be enrolled" marker (ADR-017 §7), holding the installed
+/// credential's SPKI fingerprint. Written *before* the certificate and key entries, so it is
+/// present even in the cert-only crash-residue state — this is what lets
+/// [`load_device_signing_credential`] distinguish "never enrolled" from "enrolment was
+/// attempted, credential missing or incomplete" (`vg-adapters-claude/src/runtime.rs:144-155`'s
+/// own named gap). One account, `"default"` — one marker per device, matching every other
+/// device-signing entry.
+pub(crate) const DEVICE_ENROLLED_SERVICE: &str = "com.veilgremlin.device-enrolled";
 
 /// Test-only escape hatch, same shape and same unconditional (not `#[cfg(test)]`-gated)
 /// reasoning as [`ACTOR_PSEUDONYM_KEY_ENV`]'s own doc comment. Two env vars, not one: a
@@ -153,7 +178,18 @@ const DEVICE_SIGNING_CERT_ENV: &str = "VG_DEVICE_SIGNING_CERT_PEM";
 /// key entry being updated) here, at load time, rather than as a mysterious signature
 /// -verification failure far downstream.
 pub fn load_device_signing_credential() -> Result<Option<DeviceSigningCredential>, VaultError> {
-    let (key_hex, cert_pem) = match (
+    load_device_signing_credential_with_store(&OsKeychain)
+}
+
+/// `pub(crate)`, store-injected counterpart of [`load_device_signing_credential`] above, so
+/// `enrol.rs`'s install-then-load round-trip tests (ADR-017 §15) can prove the migrated
+/// keychain branch and the new writer agree, entirely in-process, without ever touching the
+/// real OS keychain. The env-seam branch is unaffected — it never touches a [`SecretStore`]
+/// at all, matching its existing, unconditional precedence over the keychain.
+pub(crate) fn load_device_signing_credential_with_store(
+    store: &dyn SecretStore,
+) -> Result<Option<DeviceSigningCredential>, VaultError> {
+    match (
         std::env::var(DEVICE_SIGNING_KEY_ENV),
         std::env::var(DEVICE_SIGNING_CERT_ENV),
     ) {
@@ -163,39 +199,68 @@ pub fn load_device_signing_credential() -> Result<Option<DeviceSigningCredential
                  set — device signing credential taken from the environment, NOT the OS \
                  keychain. This is a test seam; unset both for real sessions."
             );
-            (Zeroizing::new(key_hex), cert_pem)
+            credential_from_key_and_cert(Zeroizing::new(key_hex), cert_pem).map(Some)
         }
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
-            let key_entry = Entry::new(DEVICE_SIGNING_KEY_SERVICE, DEVICE_SIGNING_ACCOUNT)
-                .map_err(|e| crypto_err(format!("keychain entry init failed: {e}")))?;
-            let cert_entry = Entry::new(DEVICE_SIGNING_CERT_SERVICE, DEVICE_SIGNING_ACCOUNT)
-                .map_err(|e| crypto_err(format!("keychain entry init failed: {e}")))?;
-
-            let key_hex = match key_entry.get_password() {
-                Ok(v) => v,
-                // Not yet enrolled -- the expected, universal-today state. Distinct from
-                // every other branch in this function: this is the one case that reports
-                // absence as `Ok(None)`, not `Err`.
-                Err(KeyringError::NoEntry) => return Ok(None),
-                Err(e) => return Err(crypto_err(format!("keychain read failed: {e}"))),
-            };
-            let cert_pem = cert_entry.get_password().map_err(|e| match e {
-                KeyringError::NoEntry => crypto_err(
-                    "device signing key exists in the OS keychain but its certificate does \
-                     not -- keychain is in an inconsistent state",
-                ),
-                e => crypto_err(format!("keychain read failed: {e}")),
-            })?;
-            (Zeroizing::new(key_hex), cert_pem)
+            load_device_signing_credential_from_keychain_only_with_store(store)
         }
-        _ => {
-            return Err(crypto_err(format!(
-                "{DEVICE_SIGNING_KEY_ENV} and {DEVICE_SIGNING_CERT_ENV} must both be set or \
-                 both unset"
-            )));
+        _ => Err(crypto_err(format!(
+            "{DEVICE_SIGNING_KEY_ENV} and {DEVICE_SIGNING_CERT_ENV} must both be set or \
+             both unset"
+        ))),
+    }
+}
+
+/// The OS-keychain-only half of [`load_device_signing_credential_with_store`] above, skipping
+/// the env-seam branch entirely regardless of whether either env var is set. `pub(crate)` so
+/// `enrol::credential_status` can report the keychain's *own* state independently of the env
+/// seam (ADR-017 §8: installed and shadowed are independent facts) — calling the combined
+/// loader instead would report the env-shadowed identity as "installed" whenever the seam is
+/// active, silently conflating the two facts `CredentialStatus` exists to keep apart.
+pub(crate) fn load_device_signing_credential_from_keychain_only_with_store(
+    store: &dyn SecretStore,
+) -> Result<Option<DeviceSigningCredential>, VaultError> {
+    let key_hex = match store.get(DEVICE_SIGNING_KEY_SERVICE, DEVICE_SIGNING_ACCOUNT)? {
+        Some(v) => v,
+        // Not yet enrolled -- the expected, universal-today state -- UNLESS ADR-017's
+        // durable enrolment marker (§7) is present, in which case this is "enrolment
+        // was attempted, credential missing or incomplete", not "never enrolled": the
+        // marker is written *before* the certificate/key entries, so it survives every
+        // crash window a partial install can leave behind. Round-B correction: this
+        // message must not assert the device *was* enrolled -- the marker can precede
+        // even the first credential write, so "was enrolled" would be wrong for a
+        // crash that happened before any credential ever existed.
+        None => {
+            return match store.get(DEVICE_ENROLLED_SERVICE, DEVICE_SIGNING_ACCOUNT)? {
+                None => Ok(None),
+                Some(_) => Err(crypto_err(
+                    "an enrolment marker is present but no usable signing credential \
+                     was found -- either an install was interrupted (re-run `vg enrol \
+                     install-cert`) or a previously-installed credential has since gone \
+                     missing",
+                )),
+            };
         }
     };
+    let cert_pem = store
+        .get(DEVICE_SIGNING_CERT_SERVICE, DEVICE_SIGNING_ACCOUNT)?
+        .ok_or_else(|| {
+            crypto_err(
+                "device signing key exists in the OS keychain but its certificate does \
+                 not -- keychain is in an inconsistent state",
+            )
+        })?;
 
+    credential_from_key_and_cert(Zeroizing::new(key_hex), cert_pem).map(Some)
+}
+
+/// Shared by both the env-seam and OS-keychain loading paths: decodes the raw scalar,
+/// validates the certificate against the ADR-S profile, and cross-checks the key's own
+/// public half against the certificate's SPKI before constructing a real credential.
+fn credential_from_key_and_cert(
+    key_hex: Zeroizing<String>,
+    cert_pem: String,
+) -> Result<DeviceSigningCredential, VaultError> {
     let key_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
         decode_hex(key_hex.trim())
             .ok_or_else(|| crypto_err("stored device signing key is not valid hex"))?,
@@ -216,11 +281,11 @@ pub fn load_device_signing_credential() -> Result<Option<DeviceSigningCredential
         ));
     }
 
-    Ok(Some(DeviceSigningCredential::from_parts(
+    Ok(DeviceSigningCredential::from_parts(
         signing_key,
         &validated.der,
         validated.device_ref,
-    )))
+    ))
 }
 
 /// Returns a zeroize-on-drop hex `String` — a doubt-driven-development finding (Codex
@@ -344,6 +409,12 @@ mod tests {
     /// this seam mutates the same two process-global env vars every case below.
     #[test]
     fn device_signing_credential_env_seam_round_trips_and_rejects_mismatches() {
+        // ADR-017 (XREPO-009): `enrol.rs`'s tests read this exact env-var pair too (as an
+        // environment-shadowing precondition), so this test's mutation of it is now a
+        // cross-module race, not just an intra-module one -- closed by one shared,
+        // crate-wide lock (confirmed as a real, not merely theoretical, flake against the
+        // full `cargo test -p vg-vault` run during that module's initial implementation).
+        let _guard = crate::test_support::device_signing_env_lock();
         unsafe {
             std::env::set_var(DEVICE_SIGNING_KEY_ENV, MATCHING_KEY_HEX);
             std::env::set_var(DEVICE_SIGNING_CERT_ENV, MATCHING_CERT_PEM);

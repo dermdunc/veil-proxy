@@ -4602,10 +4602,95 @@ explicit human confirmation, and Phase 1c's live-run proof has not yet been perf
 
 ## 2026-09-11 — ADR-017 (ACCEPTED, human-confirmed 2026-09-12): build the device-side signing-credential writer -- `vg enrol request-csr`/`install-cert` (`XREPO-009`)
 
-**Status: accepted, not yet implemented.** Written and human-confirmed *before* any code, per
-this repo's own discipline (ADR-016 §0, ADR-0022's precedent on the `veil-observatory` side):
-every Phase 0 decision below was raised individually with, and confirmed by, the project owner
-first. Interface-contract impact (§10) already landed ahead of this text, its own commit
+**Status: accepted, implemented on `agent/claude/xrepo-009-device-credential-install`, not yet
+merged.** Two design-review rounds ran against this ADR's draft before implementation began
+(see the "Review provenance" paragraph below); two further rounds then ran against the
+*shipped implementation* itself, fresh-context and given only the diff plus this ADR's own
+text -- never the author's reasoning, matching the escalating rigor `XREPO-007`/`XREPO-008`
+already established. **Both found real, overlapping bugs, most severely: an earlier draft's
+crash-recovery for an interrupted `--force` replacement demanded a *second* `--force`,
+directly contradicting this ADR's own §6 table** (confirmed independently by both reviewers);
+**a certificate with no matching pending key could write the enrolment marker and certificate
+before that absence was ever discovered**, permanently degrading a previously-healthy device
+on a merely-rejected install; and **the "device-global" lock resolved its path from `$HOME`**,
+an ordinary process environment variable any unprivileged process can set, defeating the
+lock's entire purpose (two invocations with different `HOME` values would take different
+locks while writing to the same real keychain). All are corrected inline below and in the
+shipped code, marked where found. Full findings list and the fixes applied:
+
+1. **Crash mid-`--force`-replacement required a second `--force` to recover** (round-C,
+   round-D, independently) — §6's write path is now a single classification pass
+   (`Classification::RecoverKey`) that treats "stored cert DER matches incoming, stored key
+   absent or not matching" identically regardless of *why* it doesn't match (a fresh-install
+   crash, an interrupted replacement, or simply-malformed stored key material) — no special
+   case required force where the table never said it should. Regression test:
+   `crash_mid_force_replacement_recovers_without_a_second_force`.
+2. **A rejected certificate could write the marker/certificate before discovering it had no
+   matching pending key** (round-D) — the pending key is now looked up and cross-checked
+   against the certificate's SPKI *before* any write, on every path, not classified-and-
+   written in the same pass. Regression tests:
+   `install_without_a_pending_key_is_refused_and_touches_nothing`,
+   `forcing_an_unrelated_certificate_with_no_pending_key_does_not_disturb_a_working_credential`.
+3. **The lock path was derived from `$HOME`** (round-D) — resolved via `getpwuid_r(3)` against
+   the real UID instead, which an unprivileged process cannot spoof by setting an environment
+   variable.
+4. **`credential_status` loaded through the env-precedence loader**, reporting the env-shadowed
+   identity as "installed" whenever the seam was active, and collapsed every keychain error
+   (not just the marker-present/credential-missing case) to `installed: None` (round-D) — now
+   uses a dedicated keychain-only loader (`load_device_signing_credential_from_keychain_
+   only_with_store`) and propagates genuine corruption/access errors as a real `Err` from
+   `credential_status` itself, rather than silently reporting "not installed."
+5. **`--force` could not repair a malformed stored certificate**, which hard-failed via `?`
+   before `force` was ever consulted (round-D) — folded into the same read-only classification
+   pass as a `Corrupt` outcome, which *is* consulted against `force`. Regression test:
+   `a_malformed_stored_certificate_can_be_overwritten_with_force_but_not_without_it`.
+6. **`install-cert`'s CLI-level env-seam check ran after both files were read** (round-C,
+   round-D), and **the seam-presence check used `std::env::var(..).is_ok()`**, which treats a
+   present-but-non-UTF-8 value as absent (round-D) — the CLI now preflights the identical
+   `var_os`-based presence check before either file read; §4's own library-level check
+   corrected the same way. Regression test:
+   `install_cert_checks_the_env_seam_before_reading_either_file` (uses nonexistent file paths
+   specifically so the test can distinguish "seam checked first" from "files happened to be
+   readable").
+7. **The `AlreadyEnrolled` refusal never actually named the conflicting credential** (round-C,
+   round-D) — `map_enrol_err` (`vg-cli`) now renders `key_ref`/`device_ref` via the same
+   `serde_json` pattern the rest of the CLI already uses; `AlreadyEnrolled` also gained a
+   `key_present: bool` field so the message can say so explicitly when the stored key is
+   absent, both per §6's original requirement.
+8. **`vg enrol status` only reported the enrolment-marker fact when no credential was
+   installed**, and used "enrolled: yes" wording for a state that might just be an interrupted
+   install (round-C, round-D) — all three facts (installed, marker, env seam) now print
+   unconditionally, and the marker line says "present"/"absent" rather than asserting
+   completion.
+9. **The crate failed to compile on non-Unix targets** (`AsRawFd`/`libc::flock` used
+   unconditionally) despite this ADR's own §5 preserving Windows in its existing loader-only
+   capacity (round-D) — the writer and its lock are now `#[cfg(unix)]`, with a `#[cfg(not(unix))]`
+   stub that refuses outright rather than silently compiling out the check.
+10. **Several mandated tests didn't exercise what they claimed** (round-D): the
+    same-key-different-certificate test used two *different* keys, never actually exercising
+    round-A's central SPKI-vs-DER finding — fixed with a real re-issued-certificate fixture
+    (`enrol_leaf_a_reissued.pem`, the identical CSR signed twice, matching `veil-custodian`'s
+    actual repeat-issuance behavior); the "golden-bytes" CSR test compared two calls to the
+    same code to each other, which cannot detect the encoding drift it claimed to guard
+    against — replaced with a pinned literal; the cross-repo fingerprint test recomputed the
+    fingerprint via this crate's own code on both sides — replaced with a real vendored
+    `veil-enrol` CSR fixture and an independent `openssl` computation.
+11. **Two `interface-contracts.md` v1.9 divergences from the shipped code went uncorrected**
+    (round-D): the frozen `EnrolError` shape still showed the pre-implementation
+    `AnchorMismatch`/`UnsupportedSignatureAlgorithm` pair rather than the `AnchorMismatch(String)`
+    this ADR's own §3 already documented switching to; `AlreadyEnrolled` was missing the new
+    `key_present` field from finding 7. Both corrected in the same commit as this entry.
+
+Two findings were investigated and not actioned: round-C's report that `request-csr --out`
+can leave an unreferenced pending key if the destination write fails, and that a failed
+best-effort pending-delete is not surfaced -- both are accepted, matching this ADR's own
+`cancel-csr` design (§8): an orphaned pending entry is harmless and cleanable, not a
+correctness defect.
+
+This ADR was written and human-confirmed *before* any code, per this repo's own discipline
+(ADR-016 §0, ADR-0022's precedent on the `veil-observatory` side): every Phase 0 decision below
+was raised individually with, and confirmed by, the project owner first. Interface-contract
+impact (§10) landed ahead of this text's implementation, its own commit
 (`a24163b`, `docs: bump interface-contracts.md to v1.9`), per `agent-factory-plan.md` §6's
 contract-change protocol. Closes the largest piece filed on `XREPO-007`'s own closure
 (`.hekton/cross-repo-deps.yaml:297-335`, "the largest piece"): `vg-vault::keychain::
