@@ -4599,3 +4599,355 @@ has since landed** on `agent/claude/xrepo-007-device-ref-derivation` (§6, this 
 `build`/`test`/`clippy`/`fmt`/`deny`/`audit` gates all clean, plus a further Codex adversarial
 round against the shipped code — see that branch's commit history). PR and merge remain pending
 explicit human confirmation, and Phase 1c's live-run proof has not yet been performed.
+
+## 2026-09-11 — ADR-017 (ACCEPTED, human-confirmed 2026-09-12): build the device-side signing-credential writer -- `vg enrol request-csr`/`install-cert` (`XREPO-009`)
+
+**Status: accepted, not yet implemented.** Written and human-confirmed *before* any code, per
+this repo's own discipline (ADR-016 §0, ADR-0022's precedent on the `veil-observatory` side):
+every Phase 0 decision below was raised individually with, and confirmed by, the project owner
+first. Interface-contract impact (§10) already landed ahead of this text, its own commit
+(`a24163b`, `docs: bump interface-contracts.md to v1.9`), per `agent-factory-plan.md` §6's
+contract-change protocol. Closes the largest piece filed on `XREPO-007`'s own closure
+(`.hekton/cross-repo-deps.yaml:297-335`, "the largest piece"): `vg-vault::keychain::
+load_device_signing_credential` has been load-only since it was written, and the only populater
+ever exercised, the `VG_DEVICE_SIGNING_KEY_HEX`/`VG_DEVICE_SIGNING_CERT_PEM` env-var pair, is an
+explicit test seam, not a production install path — so every organically-signed edge event from
+a real device still carries `device_ref: null`. `XREPO-008` (real ECDSA verification at
+`veil-observatory`) closed 2026-09-11, which is the prerequisite that makes this worth doing
+now: this ADR's own live-run proof (§12) can target disposition `accepted`, not
+`unverifiable_algorithm`.
+
+**Review provenance.** Two independent adversarial design rounds ran against this ADR's draft
+before acceptance, verified against the live code in this repo, `veil-enrol`, and
+`veil-custodian` — not documentation-internal consistency. Findings and corrections are recorded
+inline below, marked where found, not silently smoothed over. [Round summaries land here once
+run; this paragraph is intentionally left open rather than pre-written, matching the
+`XREPO-007`/`XREPO-008` precedent of never asserting a review happened before it did.]
+
+### 1. Decision
+
+**`vg-vault` gains its first device-signing-credential *writer* (a new `enrol` module), and
+`vg-cli` gains a `vg enrol` command group (`request-csr`, `install-cert`, `status`,
+`cancel-csr`) that drives it.** This formalizes the CSR-handoff install path `veil-enrol`'s own
+ADR-VE-002 already named and scoped to live here — it introduces no new network protocol and
+does not re-litigate CSR-only issuance, which already won (`veil-custodian` ADR-M/ADR-S,
+implemented; XREPO-007's own plan §10.1 names a veil-enrol "sealed key+cert bundle" as *not an
+available option*, since it would require exfiltrating the device's private key and reversing
+that ratified decision).
+
+Explicitly not decided or built here, each filed as its own follow-on rather than silently
+absorbed: a real CA trust-anchor *distribution* mechanism (an operator still obtains the pinned
+CA certificate out-of-band, by the same channel discipline as the certificate handoff itself);
+renewal automation; OS-keychain-writer support on Windows/Linux-keyutils (§6); any change to
+the accepted-raw-scalar policy the existing loader already embodies; removal or demotion of the
+`VG_DEVICE_SIGNING_*` env seam itself (§5 narrows only its interaction with this new writer);
+TLS for telemetry transport now that a stable pseudonym rides along on every signed event
+(named, not solved, matching XREPO-007's plan §10.2's own explicit caution not to treat this as
+unrelated).
+
+### 2. Rationale
+
+Three sibling repos were read before any of this was written, and the result caps this ADR's
+scope substantially rather than expanding it:
+
+- `veil-custodian` already ships real CSR-only issuance end to end: `POST
+  /devices/{pseudonym}/signing-keys` (+ `/renew`, + a read-only lookup), ECDSA P-256/SHA-256,
+  with mTLS-vs-signing certificate-profile separation enforced by its own test suite
+  (`src/ca/mod.rs`, e.g. `signing_certificate_never_carries_client_auth_even_when_the_csr_
+  requests_it`). Nothing in this ADR touches that repo.
+- `veil-enrol` deliberately ships **no device-side binary and no device-facing API**
+  (`veil-enrol` ADR-VE-001: never a daemon/listener; ADR-VE-002: the repo is `--privacy
+  internal` because it holds the enrolment-authority credential, and shipping installable code
+  from it to every device would undermine that boundary). Its accepted v1 is a file-based CSR
+  handoff with an out-of-band SPKI-fingerprint confirmation
+  (`veil-enrol/docs/architecture.md`'s "CSR handoff mechanism"), and it already names `vg enrol
+  request-csr`/`install-cert` in this repo as the follow-on (`docs/decisions.md:9`,
+  `docs/architecture.md:32,51`). Nothing in this ADR touches that repo either.
+- This repo is where every missing piece actually lives: `vg-cli` has no `enrol` subcommand at
+  all today, and `vg-vault` has no keychain *writer* — only the load-only loader documented at
+  `keychain.rs:137-154`.
+
+**Explicitly not the justification used:** this ADR is **not** "veilgremlin now supports MDM
+device enrolment." The family's own product design says a device's pseudonym is minted at MDM
+enrolment time (`docs/architecture/product-family.md:587`), and the ecosystem status record is
+explicit that no MDM currently invokes any part of this process automatically
+(`veil-ecosystem/docs/architecture.md:180`). A human-operated CLI proves OS-keychain
+interoperability with a real custodian-issued certificate — it does not establish a production
+enrolment or renewal path, and this ADR's closure text must say so rather than let the live-run
+proof imply more than it shows (XREPO-007 plan §10.2, "A manual CLI is not the MDM enrolment
+story").
+
+### 3. Mechanism
+
+**Rejected alternative, named and refuted first:** using `x509-cert 0.3`'s `builder` feature
+(`RequestBuilder`) to construct the CSR. Its own `finalize` unconditionally inserts an
+`extensionRequest` attribute even when zero extensions are added
+(`x509-cert-0.3.0/src/request/builder.rs:115-117`), which diverges from the empty-`Attributes`
+CSR shape `veil-enrol` and `veil-custodian`'s own test suites are actually proven against
+(openssl's default), and pulls an unused `sha1` dependency into the crate holding the vault's
+key material. **Decision:** hand-assemble `x509_cert::request::{CertReq, CertReqInfo}`
+directly — these are not feature-gated (only the `builder` submodule is), so this reuses
+upstream's typed ASN.1 encoders rather than reimplementing one, at the cost of ~30 lines this
+crate now owns instead of a feature flag.
+
+The CSR itself: PKCS#10 `CertificationRequestInfo`, version 0, subject `CN=placeholder`
+(`veil-custodian`'s CA overwrites Subject/SAN/KeyUsage/ExtendedKeyUsage/the CA bit
+unconditionally at signing time, `src/ca/mod.rs:316-328`, so nothing meaningful can be
+requested in the Subject anyway), SPKI `id-ecPublicKey`/`prime256v1` uncompressed SEC1 point,
+**empty attributes**, outer signature `ecdsa-with-SHA256` with absent parameters — the one
+algorithm custodian's own preflight requires of a CSR's self-signature (`src/ca/mod.rs:601`,
+curve-checked on raw CSR bytes before `rcgen` ever sees them, `:573`). ECDSA is deterministic
+(RFC 6979), so a fixed key yields a byte-identical CSR — pinned as a golden-bytes regression
+test to catch silent encoding drift on a future dependency bump.
+
+**Fingerprint:** SHA-256 over the DER-encoded `SubjectPublicKeyInfo` — the exact same bytes
+embedded in the CSR — matching `veil-enrol/src/csr.rs:81-87`'s
+`csr_public_key_fingerprint` byte-for-byte (it hashes the *whole* SPKI SEQUENCE including its
+`AlgorithmIdentifier`, not just the raw EC point; hashing the point alone would look plausible
+and silently break the operator's out-of-band confirmation step). Pinned in tests against a
+vendored `veil-enrol` fixture, without a network call.
+
+**Pending-key storage is content-addressed, not single-slot.** A new keychain service,
+`com.veilgremlin.device-signing-key-pending`, keyed by **account = the pending key's own SPKI
+fingerprint**, not the `"default"` account the active credential services use. Rejected:
+single-slot storage, because re-running `request-csr` would silently invalidate an
+already-submitted CSR mid-handoff, and because writing straight into the *active*
+`DEVICE_SIGNING_KEY_SERVICE` before a certificate exists manufactures exactly the orphan-key
+state `keychain.rs:182-188` already treats as a hard "inconsistent state" error, for the entire
+multi-day human handoff window. Content-addressing lets multiple outstanding CSRs coexist
+safely; `install-cert` selects the private key **by the incoming certificate's own SPKI**, never
+by recency.
+
+**Write order is cert, then key, then delete-pending.** `load_device_signing_credential`
+(`keychain.rs:155-197`) reads the KEY entry first and returns `Ok(None)` — "not enrolled" — on
+`NoEntry`, *before* ever inspecting the certificate; a missing certificate while the key exists
+is the hard error. So a crash between the cert write and the key write is invisible to every
+existing caller and safely re-runnable; the reverse order would instead leave that hard-error
+state as the crash residue. This does not, by itself, make the whole install atomic — a crash
+after the key write but before the pending-entry delete leaves a fully-working credential with
+an orphaned pending key, which a correct re-run must recognize as already-installed rather than
+fail on (§7's state table).
+
+**Certificate authenticity is mandatory, with no bypass (P0-1, human-confirmed).**
+`certificate.rs:26-32` documents, correctly, that its profile check does not verify a
+certificate's CA signature — because until now, every certificate it saw had already come from
+the trusted local keychain, never an untrusted file. `install-cert` is exactly the thing that
+breaks that premise: it accepts a certificate handed over an out-of-band channel. `--ca-cert
+<file>` is therefore **required**, verified directly against `p256::ecdsa::VerifyingKey`
+(`x509-cert 0.3` has no certificate-verification API of its own; manual verification is not the
+cleaner of two options, it is the only one) — issuer-name chaining, then signature, both
+restricted to exactly `ecdsa-with-SHA256` over a P-256 anchor key (the one algorithm
+`veil-custodian`'s CA actually signs with, `rcgen::KeyPair::generate()`'s default,
+`src/ca/mod.rs:148`). There is deliberately **no `--insecure`-style escape hatch**: a bypass
+flag is used precisely in the situation where it is dangerous, and certificate authenticity is
+the hardest of the sub-problems this item was filed to name in the first place. A leaf within
+seven days of, or past, its own `not_after` produces a warning, not a rejection — renewal
+automation is out of scope, but silently installing an already-dead credential is a pure waste
+of a multi-day handoff cycle.
+
+**Minimum-acceptable fallback considered and not needed:** requiring an MDM-driven automated
+trigger for this flow, rather than a human-operated CLI, was considered and rejected for Phase
+1. The manual flow already matches `veil-enrol`'s own accepted v1 design, needs no new
+infrastructure, and is sufficient to prove the one thing this phase actually claims — OS
+keychain interoperability with a real, custodian-issued certificate — without overbuilding
+toward an MDM integration nothing in this family currently drives.
+
+### 4. Environment-seam interaction is hard-blocked at install (P0-3, human-confirmed)
+
+`VG_DEVICE_SIGNING_KEY_HEX`/`_CERT_PEM` already take precedence over the keychain at load time
+(`keychain.rs:156-168`) and are an accepted, if named, production-escape-hatch risk on a
+managed device. This ADR does not touch that status. It closes only the *new* gap a writer
+would otherwise open: `install-cert` checks for either variable being set **first, before any
+file or keychain access**, and refuses if so — a keychain install would otherwise be silently
+shadowed at load time by the seam, wasting the entire handoff. `request-csr` warns instead of
+erroring, since it only ever touches the pending entry and has nothing yet to shadow.
+
+### 5. Keychain writer scope is narrowed to macOS for Phase 1 (P0-4, human-confirmed)
+
+`vg-vault/Cargo.toml` enables `keyring`'s macOS, Windows, and Linux-keyutils backends today,
+and "macOS-only" cannot be inferred from that alone. This ADR's writer is verified on macOS
+only; the Windows and Linux-keyutils backends remain enabled and unchanged in their existing
+*loader-only* capacity, but the writer path is untested on either and this ADR does not claim
+it works there. Filed as its own follow-on to actually test and support writes on the other
+two, rather than claiming cross-platform coverage this phase never exercised.
+
+### 6. Pre-existing-credential policy: refuse by default, auto-recover crash residue, `--force` to replace (P0-5, human-confirmed)
+
+Classified from what's already in the keychain when `install-cert` runs, checked before any
+write:
+
+| Observed state | Outcome | Needs `--force`? |
+|---|---|---|
+| nothing installed, matching pending key present | install | no |
+| cert present, key absent (§3's crash residue) | auto-recover: write key, delete pending | **no** — requiring a flag to recover from the tool's own crash would be user-hostile |
+| key+cert present, installed key's public half already matches the incoming certificate's SPKI | no-op success, retry the pending-delete | no |
+| key+cert present, a *different* credential | refuse, naming the currently-installed `key_ref`/`device_ref` | **yes** |
+| key present, cert absent (the loader's existing "inconsistent state" error) | refuse, name it as keychain corruption | **yes** |
+| no pending key matches the certificate's SPKI at all | refuse: "was this certificate issued for a CSR from this device?" | n/a |
+
+`--force`, not `--replace`, matching this CLI's existing flag idiom. Replacing a device's
+cryptographic identity on a typo is irreversible — the prior signing key is gone the moment its
+keychain entry is overwritten — so refusal is the default and `--force` is an explicit,
+named-in-the-help override, never implied by re-running the same command. `--force` is not
+renewal automation and the help text says so.
+
+Non-atomicity is inherited, not newly introduced: `keyring` offers no compare-and-set, the same
+accepted residual already documented at `keychain.rs:91-103` for the actor-pseudonym key.
+
+### 7. A durable enrolment marker ships in this phase (P0-7, human-confirmed)
+
+`vg-adapters-claude/src/runtime.rs:144-155` already names the gap this closes: a loader `Err`
+degrades signing to HMAC (`TelemetryAuthenticity::DegradedCredentialError`, logged, not fatal —
+correcting an earlier draft of this ADR that overstated an orphan key as a hard failure), but
+the loader cannot tell "never enrolled" apart from "was enrolled, credential now missing"
+without a durable marker independent of the credential entries themselves. `install-cert` now
+writes a fourth keychain entry, `com.veilgremlin.device-enrolled` (account `"default"`, holding
+the installed credential's SPKI fingerprint), **before** the certificate and key writes (§3), so
+it is present even in the cert-only crash-residue state. `load_device_signing_credential` gains
+exactly one new reachable branch: key absent **and** marker present now returns `Err` naming a
+missing (not never-enrolled) credential; key absent **and** marker absent is unchanged,
+`Ok(None)`. This is what makes §3's crash-recovery design *observable* to an operator, not
+merely benign to the signing path.
+
+### 8. `vg enrol status` and `vg enrol cancel-csr` are in scope (P0-8, human-confirmed)
+
+Two commands beyond the originally-scoped `request-csr`/`install-cert` pair. `status` reports
+whether a credential is installed, its `device_ref`/`key_ref` if so, and — critically — whether
+the env seam is currently shadowing the keychain; this is what §12's live-run proof uses to
+*observe* "loaded from the real OS keychain with the env vars unset," rather than inferring it
+indirectly from signing behavior alone. `cancel-csr --fingerprint <hex>` deletes one pending
+entry; it is the only way to remove an orphaned pending private key short of the OS keychain
+UI, a direct consequence of §3's content-addressed pending storage letting multiple CSRs
+accumulate.
+
+The device-signing raw-scalar-exportability question the loader already answers (an extractable
+P-256 scalar, `keychain.rs:199`) is unchanged by this ADR — nothing here revisits it.
+
+### 9. Deferred to `x509-cert`'s CA-signature check
+
+Not applicable — `x509-cert 0.3` has no certificate-verification API to defer to (§3);
+verification in §3's mechanism is the only implementation, not a stopgap for a library feature
+that doesn't exist.
+
+### 10. Interface-contract impact
+
+**v1.9**, landed ahead of this text (`a24163b`, its own commit, per `agent-factory-plan.md` §6):
+new `vg-vault::enrol` module (`request_device_signing_csr`, `install_device_signing_certificate`,
+`cancel_pending_csr`, `credential_status`; new public types `PendingCsr`/`InstallOutcome`/
+`InstalledSigningCredential`/`CredentialStatus`/`EnrolError`) — purely additive — plus one new
+reachable `Err` case on the existing `load_device_signing_credential` (§7), additive to every
+current caller (all already treat any `Err` as an HMAC downgrade) but recorded as a contract
+event since it is a new case, not silently folded into the module addition. See
+`interface-contracts.md` §7a's v1.9 addendum for the full shape.
+
+### 11. Downstream-repo impact
+
+Unlike `XREPO-007`'s closure, this ADR requires **zero code changes in `veil-enrol` or
+`veil-custodian`** — both already implement everything this phase depends on (§2). The only
+repos touched outside this one are `veil-demo` (the live-run proof script, §12) and
+`veil-ecosystem` (registry closure, filed separately once this branch merges).
+
+### 12. Proof scope, honestly bounded
+
+The live-run proof (`veil-demo/scripts/xrepo-009-device-credential-install-proof.sh`, forked
+from `xrepo-008-ecdsa-verification-proof.sh`) shows: `vg enrol request-csr` generating a key
+in-process and a CSR; that CSR handed to a real `veil-enrol issue-signing-key` call against a
+real `veil-custodian`; `vg enrol install-cert` verifying and installing the returned
+certificate into the real macOS login keychain; `vg enrol status` and a **fresh** `vg` process
+confirming the credential loads from that real keychain with
+`VG_DEVICE_SIGNING_KEY_HEX`/`_CERT_PEM` asserted unset; and an organically-signed edge event
+reaching veil-observatory with the correct pseudonym at disposition `accepted` (possible now
+that `XREPO-008` has closed).
+
+**What this proof does not show, stated here so it is not later implied by omission:** it is
+not an MDM enrolment path (§2) — nothing automates any step, a human runs each command and
+relays the CSR/certificate by hand, exactly as `veil-enrol`'s own accepted design already
+does; it does not exercise Windows or Linux-keyutils (§6); it does not exercise renewal,
+expiry, or overlap (out of scope, §1); it is developer-machine-only, not CI-runnable — a
+keychain item written by a locally-built `vg` binary carries a binary-scoped ACL, so deleting
+it via `/usr/bin/security` in the proof's teardown can raise an interactive GUI prompt, and
+ordinary CI has no unlocked login keychain to write to at all.
+
+**Keychain safety during the proof (P0-2, human-confirmed):** the proof preflight-checks that
+`com.veilgremlin.device-signing-key`/`-cert`/`-key-pending`/`com.veilgremlin.device-enrolled`
+are absent before running (`security find-generic-password`, no `-w`: attributes only, never a
+secret, never a prompt) and refuses to run if any already exist rather than risk clobbering a
+real credential. Teardown lives in the script's existing `cleanup()` `EXIT` trap, scoped to
+exactly those services — never a wildcard, never touching `com.veilgremlin.actor-pseudonym` —
+and the script re-asserts absence after deletion and echoes that assertion into the transcript,
+mirroring the existing `--tamper` negative-control discipline. `VG_VAULT_KEY_HEX`/
+`VG_ACTOR_PSEUDONYM_KEY_HEX` stay seamed to throwaway state throughout, while the device signing
+credential is deliberately the one thing left unseamed — getting that per-variable distinction
+wrong is a real, previously-recorded incident (`veil-demo/docs/decisions.md`'s 2026-09-05 row).
+The credential is never constructed via `security add-generic-password -w` (which would put the
+raw scalar in the process table and shell history) — only `vg` itself ever writes it.
+
+### 13. Downgrade posture
+
+Unchanged for the "never enrolled" case: `Ok(None)` from the loader, HMAC signing, no
+`device_ref`, exactly as today. New, from §7: a credential that was installed and later goes
+missing (key entry deleted without the marker being cleared) now surfaces as a **named** `Err`
+distinct from "never enrolled," rather than being indistinguishable from it as before. Signing
+still degrades to HMAC either way (`runtime.rs:162-165`) — this ADR changes what gets logged
+and how an operator diagnoses the gap, not the on-the-wire signing behavior.
+
+**Closure limitations — stated explicitly, not glossed over:**
+
+1. No real CA trust-anchor **distribution** mechanism exists anywhere in this family; an
+   operator obtains the pinned CA certificate file out-of-band, by the same channel discipline
+   already used for the certificate handoff itself (`certificate.rs:26-32`'s remaining gap,
+   narrowed but not eliminated by §3's verification).
+2. The writer is verified on macOS only; Windows and Linux-keyutils remain enabled but untested
+   for writes (§6).
+3. No renewal automation exists; a fresh CSR/install cycle before a credential's 30-day
+   `not_after` (`veil-custodian/src/ca/mod.rs`, ADR-S) is entirely manual, with only a
+   seven-day install-time warning (§3) as a backstop.
+4. This is not an MDM enrolment path (§2, §12) — it proves OS-keychain interoperability with a
+   real, custodian-issued certificate, not a production enrolment or renewal story.
+
+### 14. Migration statement
+
+No existing caller of any changed or added surface exists in production. `load_device_signing_
+credential`'s one new `Err` case is additive in effect for every current caller (§10); nothing
+migrates.
+
+### 15. Tests required
+
+- `vg-vault::csr` — CSR round-trip parse, self-signature verification, empty-attributes
+  regression (the `RequestBuilder` correction, §3), golden byte-identical CSR, cross-repo
+  fingerprint pinned against a vendored `veil-enrol` fixture.
+- `vg-vault::anchor` — accept a real anchor/leaf pair; reject wrong CA, tampered TBS (as a
+  signature failure specifically, not a parse failure), wrong signature algorithm, wrong curve,
+  issuer/subject mismatch, non-CA anchor.
+- `vg-vault::enrol` state machine, against an in-process `SecretStore` fake (never the real
+  keychain in the default test run) — every row of §6's table, plus a simulated crash after
+  each write step in §3's sequence, asserting both the loader's behavior at that point and a
+  correct recovering re-run; one install-then-load round trip proving the migrated loader
+  branch and the new writer agree.
+- `vg-cli` integration — `--help` coverage for the new group; env-seam-set refusal (§4);
+  malformed/wrong-profile/wrong-anchor certificate refusal; missing `--ca-cert` rejected by
+  `clap` itself, proving no bypass exists.
+- A real-keychain round trip, `#[ignore]`d in the default run (not CI-safe, §12), plus the
+  live-run proof itself.
+- Plus the full `cargo build`/`test`/`clippy`/`fmt`/`deny`/`audit --workspace --locked` suite
+  and all fitness/architecture tests, independently verified, same as every prior entry in this
+  file.
+
+### Non-goals, unchanged from this session's scope
+
+Real CA trust-anchor distribution; renewal/expiry automation; Windows/Linux keychain-writer
+support; any change to the accepted-raw-scalar-exportability policy; removal or demotion of the
+`VG_DEVICE_SIGNING_*` env seam as a general mechanism (only its interaction with this new writer
+is addressed, §4); TLS for telemetry transport. Each is either already an open cross-repo
+registry item or will be filed as one at closure — none are silently implied as solved by this
+ADR.
+
+---
+
+**Session provenance.** Written in the same session as the `veilgremlin` sibling-repo research
+that established §2's scope-capping facts (nothing to build in `veil-enrol`/`veil-custodian`)
+and the `veil-ecosystem` governance-and-proof-convention research that established this ADR's
+required structure, both against the live repos, not assumed from the `XREPO-009` registry
+entry's own text alone. Implementation has not yet started; PR and merge remain pending
+explicit human confirmation, per this repo's own discipline, same as every prior entry in this
+file.
