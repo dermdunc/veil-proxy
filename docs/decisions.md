@@ -5264,3 +5264,45 @@ material amendments (credential source; streaming scope) recorded and explicitly
 mid-mission, per that intent's own T3 named-approval discipline. Full grounding, critique
 findings, and amendment text live in `veil-ecosystem/.hekton/intents/INT-2026-09-13-001/`, not
 duplicated here.
+
+---
+
+## 2026-09-14 — M5/A2 CLOSED: `RISK-0014` resolved (`CLAUDE_CODE_ATTRIBUTION_HEADER=0`), live-run proof passes end to end
+
+Same-day follow-up to the entry above. Asked Codex for an independent architectural opinion on
+the broader question this session's own blocker raised — not just "how do we fix this one proof
+run" but "what does it actually take for `vg-proxy` to sit in front of multiple AI coding
+harnesses (Claude Code, Codex, generally)." Codex's answer named a concrete, cheap experiment to
+try before any architecture change: Anthropic's own gateway-compatibility documentation states
+that the redacted `x-anthropic-billing-header` line is Claude Code's own *attribution* block
+(client version + a conversation-derived fingerprint, not a bare credential as this session had
+assumed), and that `CLAUDE_CODE_ATTRIBUTION_HEADER=0` is the documented way to have the CLI omit
+it entirely when a gateway reshapes system content.
+
+**This repo already had that fix built and unused.** `vg-cli/src/main.rs`'s `vg run` command
+has injected `CLAUDE_CODE_ATTRIBUTION_HEADER=0` into every launch since M1 — the module's own
+comment there already named the reasoning ("Claude Code must never generate an attribution-shaped
+`system` block on its own; asking it not to via this var is the whole fix") before this session's
+own A2 work ever ran into the real consequence of *not* setting it. The live-run proof had simply
+never gone through `vg run`; it invoked `claude -p` directly. Set the same var on the proof
+script's own invocation (`scripts/a2-live-proof.sh`) and re-ran: **the full live-run proof now
+passes end to end** against the real, unmodified `claude` CLI — real TLS, real streaming
+(`stream_demask.rs`), real masking before egress, real demasking in the real response, real
+subscription auth, no raw credential anywhere in the proof's own logs. `RISK-0014` closed same
+day (`docs/risks.md`), mirrored in `veil-ecosystem`'s own `RISK-0008`.
+
+**What's still open, named explicitly rather than implied solved by this closure:** Codex's own
+answer to the broader question it was actually asked — "sit in front of multiple harnesses" —
+recommends an explicit, process-scoped forward proxy (`HTTPS_PROXY` + a CA trusted only by the
+wrapped process) over system-wide DNS/TLS interception, architected as a generic transport layer
+around per-provider protocol codecs, not a single Anthropic-shaped pipeline. That is real,
+unstarted design and implementation work — this closure resolves the one blocker A2's own
+live-run proof hit, not the general multi-harness architecture question. Concrete gaps Codex
+named for that larger direction: `server.rs` treats every accepted connection as plaintext
+HTTP/1.1 today, with no TLS-terminating listener, CONNECT handling, or per-origin/per-session
+routing; `route.rs` and the request/response transforms are Anthropic-specific throughout; a
+Codex-shaped provider would need its own codec entirely.
+
+**Verification.** `scripts/a2-live-proof.sh` passing is the confirmation evidence for this
+closure. `cargo build/clippy/fmt/test --locked`, `cargo deny check`, `cargo audit` unaffected
+(this fix touched only the proof script's own invocation, no source changed).

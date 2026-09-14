@@ -61,8 +61,14 @@ echo "==> dev-harness listening on 127.0.0.1:${PORT}"
 SYNTHETIC_SECRET="a2-live-proof-synthetic-secret-$(date +%s)@example.invalid"
 PROMPT="I'm dermdunc, running a disclosed, authorized live-integration test of vg-proxy's masking system (intent INT-2026-09-13-001 in veil-ecosystem). This message is routed through vg-proxy, which should mask the contact-info-shaped test value below before it reaches you, then demask your reply before it reaches me. The synthetic test value is: ${SYNTHETIC_SECRET} -- it is not a real secret. Please include that exact value in your reply so I can confirm the round-trip worked."
 
-echo "==> invoking the real claude CLI through vg-proxy (streaming, ANTHROPIC_BASE_URL redirected)"
-if ! ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}" \
+# RISK-0014 (docs/risks.md): the real claude CLI redacts its own billing header to
+# [REDACTED:SECRET] when ANTHROPIC_BASE_URL is non-default, which the real API then
+# rejects. Fix, per Anthropic's own gateway-compatibility docs and this repo's own
+# pre-existing `vg run` convention (crates/vg-cli/src/main.rs, "asking it not to via
+# this var is the whole fix"): CLAUDE_CODE_ATTRIBUTION_HEADER=0 tells Claude Code to
+# omit the attribution block entirely, so there's nothing for the real API to reject.
+echo "==> invoking the real claude CLI through vg-proxy (streaming, ANTHROPIC_BASE_URL redirected, CLAUDE_CODE_ATTRIBUTION_HEADER=0)"
+if ! CLAUDE_CODE_ATTRIBUTION_HEADER=0 ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}" \
   claude -p "$PROMPT" >"$PROOF_LOG" 2>&1; then
   echo "FAIL: claude CLI invocation failed" >&2
   cat "$PROOF_LOG" >&2
