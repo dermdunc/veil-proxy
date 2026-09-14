@@ -25,9 +25,31 @@ pub enum ProxyError {
     AuditOpen(#[from] vg_audit::OpenError),
     #[error("request masking error: {0}")]
     MaskRequest(#[from] crate::mask_request::MaskRequestError),
-    #[error("failed to connect to upstream {addr}: {source}")]
+    #[error("failed to connect to upstream {host}:{port}: {source}")]
     UpstreamConnect {
-        addr: std::net::SocketAddr,
+        host: String,
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    // A2: real TLS client. `{host}` is not a valid DNS name for TLS SNI/hostname verification —
+    // caught before ever attempting a handshake, distinct from a handshake that starts and then
+    // fails (UpstreamTls below), which matters for diagnosing a bad UpstreamConfig vs. a bad
+    // network/certificate.
+    #[error("upstream host {host:?} is not a valid DNS name for TLS: {source}")]
+    UpstreamInvalidServerName {
+        host: String,
+        #[source]
+        source: rustls::pki_types::InvalidDnsNameError,
+    },
+    // Covers the real failure modes this milestone's own confirmation/disproof criteria care
+    // about: an expired/untrusted/wrong-host certificate fails here, as a real `rustls` chain-
+    // or hostname-verification error surfaced through `tokio_rustls`'s `io::Error` wrapping —
+    // never silently downgraded to a generic I/O error a caller could mistake for a network
+    // blip.
+    #[error("TLS handshake with upstream {host} failed: {source}")]
+    UpstreamTls {
+        host: String,
         #[source]
         source: std::io::Error,
     },

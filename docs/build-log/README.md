@@ -63,3 +63,4 @@ That can grow into a published site later if it earns one — see
 - [2026-08-30 — A guarantee the tests never tested](2026-08-30-a-guarantee-the-tests-never-tested.md)
 - [2026-08-31 — The cast that always agreed](2026-08-31-the-cast-that-always-agreed.md)
 - [2026-08-31 — The same gate, broken twice](2026-08-31-the-same-gate-broken-twice.md)
+- [2026-09-14 — The proxy worked. The product didn't.](2026-09-14-the-proxy-worked-the-product-didnt.md)

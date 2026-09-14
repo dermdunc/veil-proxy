@@ -18,6 +18,7 @@ pub mod route;
 mod schema;
 pub mod server;
 pub mod session;
+pub mod stream_demask;
 pub mod upstream;
 
 pub use daemon::Daemon;

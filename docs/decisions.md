@@ -5199,3 +5199,68 @@ required structure, both against the live repos, not assumed from the `XREPO-009
 entry's own text alone. Implementation has not yet started; PR and merge remain pending
 explicit human confirmation, per this repo's own discipline, same as every prior entry in this
 file.
+
+---
+
+## 2026-09-14 — M5/A2: real TLS client built; live-run proof found a real, external blocker (`RISK-0014`)
+
+**TLS dependency, human-approved before landing** (veil-ecosystem intent `INT-2026-09-13-001`,
+confirmation criterion 7): `rustls` over `native-tls` — pure-Rust, no OpenSSL/`Security.framework`
+FFI, matching `XREPO-015`'s own precedent for this family's telemetry-TLS surface. Implementation
+detail decided during the build, not part of the human-approved choice itself: used `rustls` +
+`tokio-rustls` directly rather than the higher-level `hyper-rustls` connector, since
+`upstream.rs` already owns its own connection lifecycle (unchanged since M3) and a low-level
+client was already this module's own established style. Trust-root source changed mid-build:
+`webpki-roots` (a bundled Mozilla CA list) was the first choice, but `cargo deny check licenses`
+rejected its `CDLA-Permissive-2.0` license (not in this repo's `deny.toml` allow-list) —
+switched to `rustls-native-certs` (dual MIT/Apache-2.0, already allowed), which also ties trust
+to the real OS trust store (macOS `Security.framework`, beta's own scoped platform) rather than a
+list shipped on a separate crate's own release cadence.
+
+**Certificate validation is real, proven against a real local TLS server**
+(`crates/vg-proxy/tests/tls_upstream.rs`, three tests): accepts a certificate signed by a trusted
+CA for the right hostname; refuses the same CA's certificate issued for the wrong hostname;
+refuses a certificate signed by an untrusted CA. No disabled or bypassed verification anywhere.
+
+**Streaming pulled forward from M6, mid-mission, human-approved** (`amendment-2026-09-14-001.yaml`):
+running the real live-run proof against the real, unmodified `claude` CLI found it always sends
+`stream: true` — no flag forces non-streaming — making this milestone's original "non-streaming
+Claude Code session" framing unsatisfiable by any real CLI session. Built a minimal, buffer-first
+SSE demask path (`crates/vg-proxy/src/stream_demask.rs`): the entire upstream SSE stream is
+buffered before any demasking is attempted (reusing `upstream::forward`'s existing full-buffering,
+same shape M4's own non-streaming path already has), each content block's `text_delta` fragments
+are reconstructed into one full string across the *whole* stream before rehydration ever runs —
+sidestepping, not solving, the SSE chunk-boundary/partial-placeholder question this repo's own A4
+plan entry named as open — then re-emitted as one consolidated delta per block. Only `text_delta`
+content is touched; tool-use/thinking content rounds-trips unchanged, matching
+`demask_response.rs`'s own `BLOCK_METADATA_KEYS` scope precedent. `mask_request.rs`'s earlier
+`stream: true` fail-closed block (added, then found wrong, in this same session) is removed.
+
+**Two real bugs the live-run proof caught that unit tests alone had missed:** (1) a frame
+pass-through path in `stream_demask.rs` silently dropped the SSE frame's own `\n\n` terminator,
+producing a stream the real `claude` CLI's own parser couldn't parse — fixed, and the regression
+test strengthened to actually re-parse every emitted frame, not just substring-check the output.
+(2) the proof's own prompt ("repeat this value back verbatim, nothing else") read as a
+prompt-injection probe and the model correctly refused it — reworded to disclose the test openly,
+per the model's own suggested fix in its refusal.
+
+**Real, external blocker found, not fixed here — `RISK-0014` (Critical, Open, `docs/risks.md`):**
+the real `claude` CLI's own system prompt embeds `x-anthropic-billing-header: [REDACTED:SECRET];
+cc_entrypoint=sdk-cli;` whenever `ANTHROPIC_BASE_URL` points away from the default Anthropic
+endpoint — the CLI itself redacts its real internal billing/session token, which the real
+Anthropic API then rejects outright. Confirmed the same prompt succeeds with `ANTHROPIC_BASE_URL`
+unset. Not a `vg-proxy` defect (this proxy correctly forwards whatever the CLI sends) and not
+fixable in this repo — it would fire against any custom `ANTHROPIC_BASE_URL`, the exact mechanism
+this product's beta depends on. A bounded check of `claude gateway` (a separate enterprise
+auth/telemetry subcommand, its own config) did not reveal a documented bypass.
+
+**Verification.** `cargo build/clippy --all-targets -D warnings/fmt --check/test --workspace
+--locked`, `cargo deny check`, and `cargo audit` all clean after every change in this session,
+independently re-run after the separator-bug fix and again after the streaming-scope amendment.
+
+**Session provenance.** Declared, single-model-critiqued, and Codex-cross-model-critiqued as
+`INT-2026-09-13-001` in `veil-ecosystem`'s own intent registry before implementation started; two
+material amendments (credential source; streaming scope) recorded and explicitly user-approved
+mid-mission, per that intent's own T3 named-approval discipline. Full grounding, critique
+findings, and amendment text live in `veil-ecosystem/.hekton/intents/INT-2026-09-13-001/`, not
+duplicated here.
