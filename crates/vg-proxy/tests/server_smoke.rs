@@ -205,9 +205,7 @@ async fn mask_pass_and_block_routes_respond_correctly_over_real_http() {
     let dir = TempDir::new().expect("temp dir");
     let daemon = Arc::new(open_daemon(&dir));
     let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
-    let upstream = UpstreamConfig {
-        addr: upstream_addr,
-    };
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
 
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -306,9 +304,7 @@ async fn a_malformed_mask_route_body_fails_closed_and_never_reaches_upstream() {
     let dir = TempDir::new().expect("temp dir");
     let daemon = Arc::new(open_daemon(&dir));
     let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
-    let upstream = UpstreamConfig {
-        addr: upstream_addr,
-    };
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
 
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -350,6 +346,165 @@ async fn a_malformed_mask_route_body_fails_closed_and_never_reaches_upstream() {
     let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
 }
 
+/// A2's own confirmation criterion, per the Codex cross-model critique of
+/// INT-2026-09-13-001: `mask_request.rs`'s own unit tests prove document/image blocks fail
+/// closed at that module's boundary, but a TLS/routing refactor could in principle bypass
+/// `mask_request.rs` entirely without any of those unit tests noticing. This test goes through
+/// the real server (`run_with_listener`, the same entry point production traffic uses) end to
+/// end and asserts on the *mock upstream's own captured requests* — the only way to prove a
+/// document/image block never reaches the network, not just that `mask_request()` returns
+/// `Err` in isolation.
+#[tokio::test]
+async fn a_document_content_block_never_reaches_the_real_upstream() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let namespace = session_header();
+    let body = br#"{"system":"hi","messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","data":"irrelevant"}}]}]}"#;
+    let response =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body, Some(&namespace)).await;
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "a document content block must fail closed: {response}"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "the real upstream must never be contacted for a request carrying a blocked document content block"
+    );
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}
+
+/// Same claim as the document test above, for `image` content blocks — the two block kinds
+/// share one code path (`ContentBlockKind::Document | ::Image` both map to
+/// `MaskRequestError::BlockedContentBlock` in `mask_request.rs`), but proven independently at
+/// the integration level rather than assumed to transfer from one to the other.
+#[tokio::test]
+async fn an_image_content_block_never_reaches_the_real_upstream() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let namespace = session_header();
+    let body = br#"{"system":"hi","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"irrelevant"}}]}]}"#;
+    let response =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body, Some(&namespace)).await;
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "an image content block must fail closed: {response}"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "the real upstream must never be contacted for a request carrying a blocked image content block"
+    );
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}
+
+/// A2 (post `amendment-2026-09-14-001.yaml`): a `stream: true` request is masked and forwarded
+/// like any other — it no longer fails closed at the request layer (an earlier version of this
+/// test asserted the opposite; superseded once the real live-run proof found the real `claude`
+/// CLI always sends `stream: true`, with streaming responses instead handled on the way back
+/// out by `crate::stream_demask`, unit-tested directly in that module).
+#[tokio::test]
+async fn a_streaming_request_is_masked_and_forwarded_like_any_other() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let namespace = session_header();
+    let body = br#"{"system":"hi","stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+    let response =
+        send_request_with_namespace(addr, "POST", "/v1/messages", body, Some(&namespace)).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "a streaming request must not fail closed: {response}"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "the upstream must be contacted exactly once for a streaming request"
+    );
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}
+
 /// Round-2 doubt-pass regression (Codex): `session.rs`'s own module doc named this exact trap
 /// in advance for "whichever milestone adds header-extraction code" — a present-but-invalid
 /// (non-UTF-8) `X-VG-Namespace` header must fail closed (400), never silently collapse to
@@ -362,9 +517,7 @@ async fn a_present_but_invalid_namespace_header_fails_closed_not_silently_absent
     let dir = TempDir::new().expect("temp dir");
     let daemon = Arc::new(open_daemon(&dir));
     let (upstream_addr, captured, upstream_shutdown, upstream_join) = spawn_mock_upstream();
-    let upstream = UpstreamConfig {
-        addr: upstream_addr,
-    };
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
 
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -432,9 +585,7 @@ async fn the_client_receives_the_raw_value_not_the_placeholder_the_model_echoed_
     let daemon = Arc::new(open_daemon(&dir));
     let (upstream_addr, response_text, upstream_shutdown, upstream_join) =
         spawn_configurable_mock_upstream();
-    let upstream = UpstreamConfig {
-        addr: upstream_addr,
-    };
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
 
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -500,9 +651,7 @@ async fn a_placeholder_from_an_earlier_request_in_the_same_session_still_resolve
     let daemon = Arc::new(open_daemon(&dir));
     let (upstream_addr, response_text, upstream_shutdown, upstream_join) =
         spawn_configurable_mock_upstream();
-    let upstream = UpstreamConfig {
-        addr: upstream_addr,
-    };
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
 
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -588,9 +737,7 @@ async fn bind_refuses_non_loopback_address() {
 async fn run_with_listener_refuses_a_non_loopback_listener_even_when_bind_was_bypassed() {
     let dir = TempDir::new().expect("temp dir");
     let daemon = Arc::new(unused_daemon(&dir));
-    let upstream = UpstreamConfig {
-        addr: "127.0.0.1:1".parse().unwrap(),
-    };
+    let upstream = UpstreamConfig::plain("127.0.0.1", 1);
 
     let raw_listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await

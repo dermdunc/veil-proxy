@@ -89,6 +89,46 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       up: M5 — real Claude Code, Anthropic API-key mode, non-streaming** (first real contact —
       `ANTHROPIC_BASE_URL` pointing at the daemon, a real API key swap, a real sandboxed session;
       also where `upstream.rs` needs real TLS support), per the plan's §10.3 build order.
+- [x] **M5/A2 — real TLS client + real Claude Code session — CLOSED 2026-09-14 (veil-ecosystem
+      intent `INT-2026-09-13-001`, branch `agent/claude/a2-real-tls-client`).** Built: a real
+      `rustls`/`tokio-rustls` TLS client in `upstream.rs` (`UpstreamConfig::real_anthropic()`,
+      trust via `rustls-native-certs` — the real OS trust store, not a bundled CA list — switched
+      from `webpki-roots` after `cargo deny check licenses` rejected its CDLA-Permissive-2.0
+      license), with real WebPKI certificate chain + hostname verification proven against a real
+      local TLS server in three new tests (`tests/tls_upstream.rs`: accepts a validly-signed
+      right-hostname cert, refuses a right-CA-wrong-hostname cert, refuses an untrusted-CA cert —
+      no disabled/bypassed verification anywhere). Also built, pulled forward from M6 mid-mission
+      after the live-run proof found the real `claude` CLI always sends `stream: true` (no flag
+      forces non-streaming): a minimal, buffer-first SSE response demasker (`stream_demask.rs`,
+      selected by `server.rs` on the upstream response's own `content-type: text/event-stream`
+      header) that reconstructs each content block's full text across the whole buffered stream
+      before ever demasking — sidestepping the SSE chunk-boundary/partial-placeholder question
+      this same file named as unanswered, proven with a dedicated regression splitting a real
+      placeholder across two delta chunks. `mask_request.rs`'s earlier `stream: true` block is
+      removed (superseded). `cargo build/clippy -D warnings/fmt --check/test --locked`,
+      `cargo deny check`, and `cargo audit` all clean, workspace-wide.
+
+      **The live-run proof itself then found a real, external blocker (RISK-0014) — and a real,
+      cheap fix.** Running `scripts/a2-live-proof.sh` against the real, unmodified `claude` CLI
+      found the CLI's own system prompt embeds
+      `x-anthropic-billing-header: [REDACTED:SECRET]; cc_entrypoint=sdk-cli;` whenever
+      `ANTHROPIC_BASE_URL` points away from the default Anthropic endpoint, which the real API
+      then rejects outright. A Codex cross-model consultation (asked to weigh in on the broader
+      "sit in front of multiple harnesses" architecture question) surfaced the actual fix: that
+      line is Claude Code's own *attribution* block, and Anthropic's own gateway-compatibility
+      docs name `CLAUDE_CODE_ATTRIBUTION_HEADER=0` as the documented way to have the CLI omit it
+      entirely — which `vg run` (`vg-cli/src/main.rs`) already injects into every launch, for
+      exactly this reason, since before this session started; the live-run proof had simply never
+      been run through `vg run`, only a direct `claude -p` invocation. Set on the proof script's
+      own invocation instead, and **the full live-run proof now passes end to end** against the
+      real, unmodified CLI: real TLS, real streaming, real masking/demasking, real subscription
+      auth, a synthetic secret correctly masked before egress and demasked in the real response.
+      `RISK-0014` closed same day. The bigger "sit in front of Claude Code *and* Codex generally"
+      question Codex was actually asked about is still open — its own recommendation (a
+      process-scoped explicit forward proxy over system-wide TLS interception, architected around
+      a generic transport + per-provider codec) is real follow-on design work, not yet started,
+      and Codex named concrete gaps in the current code for that direction (a TLS-terminating
+      listener is materially new work; routing/headers/masking are all still Anthropic-specific).
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`

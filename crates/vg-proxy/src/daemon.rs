@@ -16,6 +16,7 @@ use crate::demask_response;
 use crate::error::ProxyError;
 use crate::mask_request::{mask_request, MaskedRequest};
 use crate::session::{SessionConflict, SessionShim};
+use crate::stream_demask;
 
 /// A `VaultStore` wrapper around a shared `Arc<Vault>` (M3). `Daemon` needs the same open vault
 /// reachable two ways: as a concrete `Vault` for its own `handle_fake_request`/liveness checks
@@ -204,6 +205,16 @@ impl Daemon {
     pub fn demask_response(&self, body: &[u8], namespace: &Namespace) -> Vec<u8> {
         let bindings = self.session_shim.bindings_for(namespace);
         demask_response::demask_response(body, &bindings, &self.policy, namespace)
+    }
+
+    /// A2 (pulled forward from M6, `amendment-2026-09-14-001.yaml`): the SSE-response
+    /// counterpart of [`Daemon::demask_response`], for an upstream response whose own
+    /// `content-type` is `text/event-stream` — `server.rs` is the one place that decides which
+    /// of the two to call, based on that header. See [`crate::stream_demask`]'s own module doc
+    /// for the buffer-first design and its scope (text_delta only, not full M6).
+    pub fn demask_streaming_response(&self, body: &[u8], namespace: &Namespace) -> Vec<u8> {
+        let bindings = self.session_shim.bindings_for(namespace);
+        stream_demask::demask_sse_response(body, &bindings, &self.policy, namespace)
     }
 
     /// Runs `f` with a fresh [`Context`] over the owned detector/parser registries. Same shape

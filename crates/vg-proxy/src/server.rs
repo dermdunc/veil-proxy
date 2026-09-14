@@ -105,9 +105,16 @@ pub async fn run_with_listener(
                 };
                 let io = TokioIo::new(stream);
                 let daemon = Arc::clone(&daemon);
+                // `UpstreamConfig` stopped being `Copy` once it grew a `String` host and an
+                // `Option<Arc<rustls::ClientConfig>>` (A2) — cloned once per accepted
+                // connection here, and again per request inside the `Fn` service closure below
+                // (which may be called more than once per keep-alive connection), since neither
+                // scope can move the same value out twice. Both clones are cheap: a `String`
+                // clone plus an `Arc` clone, not a deep copy of the TLS config itself.
+                let upstream = upstream.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
-                        handle(req, Arc::clone(&daemon), upstream, local_addr)
+                        handle(req, Arc::clone(&daemon), upstream.clone(), local_addr)
                     });
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                         eprintln!("vg-proxy: connection error: {err}");
@@ -188,7 +195,22 @@ async fn handle_mask(
                 .await
                 .map(|c| c.to_bytes().to_vec())
                 .unwrap_or_default();
-            let demasked_body = daemon.demask_response(&raw_body, &namespace);
+            // A2 (`amendment-2026-09-14-001.yaml`): the upstream's own `content-type` — not a
+            // client-side guess, and not the *request's* `stream` field, which the upstream is
+            // free to ignore or honor on its own terms — decides which demask path applies.
+            // `text/event-stream` is Anthropic's own real signal for an SSE response; anything
+            // else (including no content-type at all) goes through the original, non-streaming
+            // JSON path unchanged.
+            let is_sse = parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            let demasked_body = if is_sse {
+                daemon.demask_streaming_response(&raw_body, &namespace)
+            } else {
+                daemon.demask_response(&raw_body, &namespace)
+            };
             let demasked_len = demasked_body.len();
             let mut parts = parts;
             // The demasked body's length is not necessarily the upstream's original length

@@ -10,6 +10,15 @@
 //! carries that this module doesn't name — round-trips through untouched, because nothing here
 //! ever re-types the body into a narrower struct that could silently drop it.
 //!
+//! **`stream` history, A2:** an earlier version of this module blocked `stream: true` outright,
+//! reasoning that M4's response demasking couldn't handle a streaming response. Running the
+//! real live-run proof against the real, unmodified `claude` CLI found that it always sends
+//! `stream: true` (no flag forces non-streaming) — blocking it made every real CLI session fail
+//! closed, not just an edge case. `amendment-2026-09-14-001.yaml` pulled a minimal SSE-response
+//! demask path forward from M6 instead (`crate::stream_demask`, selected by `server.rs` on the
+//! upstream response's own `content-type: text/event-stream` header); `stream` no longer needs
+//! special-casing on the request side at all.
+//!
 //! `tools[]` (the top-level tool *definitions*) is never read or touched by anything in this
 //! module — masking only walks `system`/`messages`, so `tools[]` survives by construction, not
 //! by an explicit skip.
@@ -571,6 +580,38 @@ mod tests {
 
         let err = run(&body, &policy).expect_err("document blocks the whole request");
         assert!(matches!(err, MaskRequestError::BlockedContentBlock(k) if k == "document"));
+    }
+
+    /// A2 (post `amendment-2026-09-14-001.yaml`): `stream` in any shape — `true`, `false`, or
+    /// absent — round-trips untouched on the request side. Streaming responses are handled on
+    /// the way back out by `crate::stream_demask`, selected in `server.rs`; this module no
+    /// longer blocks the request for it (an earlier version of this test asserted the opposite,
+    /// before the real live-run proof found the real `claude` CLI always sends `stream: true`
+    /// and blocking it made every real CLI session fail closed).
+    #[test]
+    fn stream_field_round_trips_untouched_regardless_of_value() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+
+        let explicit_true = json!({
+            "system": "hi",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        run(&explicit_true, &policy).expect("stream: true is not blocked");
+
+        let explicit_false = json!({
+            "system": "hi",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        run(&explicit_false, &policy).expect("stream: false is not blocked");
+
+        let absent = json!({
+            "system": "hi",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        run(&absent, &policy).expect("absent stream key is not blocked");
     }
 
     /// Round-2 doubt-pass regression (Codex): a real, schema-legal shape —

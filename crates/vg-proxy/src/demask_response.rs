@@ -178,6 +178,21 @@ fn demask_leaf_in_place(
     }
 }
 
+/// `stream_demask.rs`'s own entry point into this module's rehydration logic — the same
+/// single-leaf `rehydrate` call [`demask_leaf_in_place`] wraps, exposed by value rather than
+/// in-place since the SSE path demasks a freshly-reconstructed `String` it doesn't otherwise
+/// need to keep around, not a `Value` tree leaf it's mutating alongside others.
+pub(crate) fn demask_text(
+    text: &str,
+    bindings: &[PlaceholderBinding],
+    policy: &Policy,
+    ns: &Namespace,
+) -> String {
+    let mut s = text.to_string();
+    demask_leaf_in_place(&mut s, bindings, policy, ns);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline unit tests — same reasoning as `mask_request.rs`'s own test module: every item
