@@ -5394,3 +5394,136 @@ same pre-existing advisory, since `Cargo.lock` was deliberately left untouched h
 H2b's own scope). Not a regression this milestone introduced — the same finding, tracked and
 fixed on a separate branch, not yet mergeable due to the same guardrail this session cannot
 self-bypass. Will go green once that fix merges (or is rebased into this branch).
+
+## 2026-09-15 — Track H, H2c BUILT: request/response bounds and five named timeouts
+
+Second milestone under intent `INT-2026-09-14-001` (veil-ecosystem), built on top of H2b's
+`agent/claude/h2b-codec-trait-extraction` branch rather than `main` directly — H2c's own scope
+(`upstream.rs`'s `forward`/`buffer_response`, `server.rs`'s `collect_body`) is exactly the code
+H2b just restructured, so stacking avoided a large, avoidable merge conflict between two PRs that
+the plan's own Start-order table treats as independently startable but that touch the same files.
+
+**What was built**, closing plan §1.2 item 9 in both directions:
+
+- **Request-body bound** (`server.rs::MAX_REQUEST_BODY_BYTES`, 32 MiB) — `collect_body` (which
+  read an inbound body via a bare `.collect()` with no length check at all before this milestone)
+  now wraps the body in `http_body_util::Limited`; an oversized body fails closed with 413,
+  never reaching `mask_request`'s own JSON-parse step or the upstream. `collect_body` was made
+  generic over the body type (previously hardcoded to `Incoming`) specifically so its own unit
+  tests could exercise the real 32 MiB bound against an in-memory `Full<Bytes>` body instead of
+  needing a real oversized transfer over a real socket.
+- **Response-body bound** (`upstream.rs::MAX_RESPONSE_BODY_BYTES`, 64 MiB, configurable per
+  `UpstreamConfig` for testing) — `buffer_response` now reads via `Limited` too; exceeding it
+  fails closed (mapped to a 502 by `server.rs`'s existing generic upstream-error handling).
+- **Five separately-named timeouts** (`upstream.rs::Timeouts`, also configurable per
+  `UpstreamConfig`): `connect` (TCP connect + TLS handshake, 10s default), `response_headers`
+  (time to first response headers, 30s default), `idle_body` (gap between body-read progress for
+  a non-streaming response, 30s default), `streaming_idle` (the same gap, but for a
+  `text/event-stream` response — 300s default, matching GROUND-13/14's real vendor numbers:
+  Claude Code's own byte-level streaming watchdog and Codex's `stream_idle_timeout_ms`, both
+  300s), and `total_request` (a hard ceiling on the whole forwarded request regardless of any
+  single gap, 900s default — well above `streaming_idle` so a real long generation isn't cut off
+  in the ordinary case). None of these five defaults beyond `streaming_idle` are vendor-sourced;
+  each is a named, reasoned engineering default, stated as such in `Timeouts`'s own doc comment
+  rather than presented as more authoritative than it is.
+- The response body is now read frame-by-frame (not one `.collect()` call) specifically so an
+  idle-gap timeout can reset on every real chunk of progress — the mechanism that lets a
+  genuinely slow-but-alive stream survive while a truly stalled one still fails closed.
+
+**Two independent review rounds, this milestone's own real defects found and fixed:**
+
+- A fresh-context single-model pass found one real, mid-implementation bug the intent's own
+  strengthened confirmation criterion (added by the earlier Codex critique on the accepted
+  intent) exists precisely to catch: a near-zero (1ns) `connect` timeout raced against a real
+  `TcpStream::connect` to a live loopback listener flaked under load in the full workspace test
+  suite — the connect apparently won the race in that run, and the test fell through to a 30s
+  `response_headers` timeout instead of the expected `UpstreamConnectTimeout`, failing with a
+  30.01s runtime. Root-caused directly (not guessed): racing a near-zero timeout against a
+  genuinely-fast operation is inherently non-deterministic under load, exactly the kind of
+  flaky-test risk this milestone's own tests need to avoid. Fixed by switching the connect-timeout
+  test to a real, unanswerable connection attempt — `192.0.2.1` (RFC 5737 TEST-NET-1, "MUST NOT
+  be forwarded" by any real router) — empirically confirmed in this environment to reliably hang
+  rather than fail fast, so a short (200ms) timeout budget deterministically wins.
+- The same pass separately found and fixed a second, unrelated bug while writing the
+  `response_headers` timeout test itself: the test's own mock-server closure bound its
+  `TcpStream` parameter as `_stream` and never referenced it inside the `async move` block, so
+  Rust dropped it (closing the connection) the instant the closure returned, before the future it
+  constructed was ever polled — surfacing as an immediate `IncompleteMessage` on the client side
+  in ~1ms, not the intended 100ms timeout. A real, easy-to-make async-Rust footgun (an
+  underscore-prefixed binding is still a real binding with normal drop timing, not an
+  immediately-dropped placeholder — only a bare `_` pattern drops eagerly), fixed by explicitly
+  re-binding the stream inside the future body so it's genuinely captured.
+**A following Codex cross-model pass** (`codex exec --sandbox read-only`, explicit
+per-invocation user authorization) found and this session fixed four more real issues, one of
+them severity Blocker by its own assessment:
+
+- **The strengthened slow-stream test didn't actually prove what it claimed to prove.** The
+  original version paused 300ms under a 5s `streaming_idle` test budget — a margin so wide it
+  would have passed even if `streaming_idle` were implemented as one fixed deadline computed
+  once at stream-start rather than correctly reset on every frame of real progress, since a
+  single 300ms gap never approaches even a 1s deadline, let alone 5s. Fixed: rewritten to two
+  gaps (200ms each, under the new 300ms test budget) summing to 400ms — over the budget. A
+  fixed-deadline regression would fail this response; correct per-frame reset survives it. Also
+  named explicitly (not previously stated): no unit test can prove the real 300s *production
+  default* is itself well-chosen against real vendor generation behavior — that claim rests on
+  `scripts/a2-live-proof.sh` and the cited vendor documentation, not on any fast synthetic test.
+- **`response_headers`'s own doc comment overclaimed its scope.** It said the budget ran "from a
+  fully-sent request," but the implementation wraps `sender.send_request(req)` end to end, which
+  also covers writing the request body over the wire. A large request (up to `server.rs`'s own
+  32 MiB bound) over a slow or backpressured connection could exhaust this budget during upload,
+  not while genuinely waiting on the upstream, and the old error message ("did not send response
+  headers") would have described that case misleadingly. Fixed: both the doc comment and the
+  error message now name request upload as part of this budget's real scope, rather than
+  claiming a narrower one than the code actually enforces. Not restructured into a sixth timeout
+  — the plan names exactly five, and real request bodies this proxy forwards are far smaller
+  than the bound in practice.
+- **The revised `connect`-timeout test (the `192.0.2.1` TEST-NET-1 version) was itself found
+  non-hermetic.** RFC 5737 only recommends ("SHOULD") that routers not forward such addresses;
+  it does not guarantee silent packet dropping, and the critique's own sandboxed execution
+  received an immediate `PermissionDenied` there instead of a timeout — direct proof the
+  approach depends on network/environment behavior this repo doesn't control. Fixed with a
+  fully deterministic, loopback-only design: a real TCP listener accepts the bare TCP connection
+  (succeeding immediately) but never writes a TLS handshake byte back, so the client's `rustls`
+  handshake hangs waiting for a `ServerHello` that never arrives — testing `connect`'s
+  TLS-handshake half for the first time (previously untested; only the TCP half had ever been
+  exercised as a "stall" scenario) with no dependency on any external address's routing.
+- **SSE content-type matching (`ct.starts_with("text/event-stream")`) was neither exact nor
+  case-insensitive, and duplicated between `upstream.rs` and `server.rs`.** Per RFC 9110 §8.3.1,
+  media-type tokens are case-insensitive and parameters (e.g. a `charset`) aren't part of the
+  type/subtype; the prefix-match both missed a validly-cased `Text/Event-Stream` and wrongly
+  accepted an unrelated `text/event-streaming`. The bug predates this milestone (it's A2's
+  original check, in `server.rs`), but H2c copied the same flawed pattern into a second location
+  rather than centralizing it — the critique's own framing, "SSE recognition itself is
+  provider-neutral, but duplicating this timeout-relevant predicate is already a correctness
+  hazard," is exactly right. Fixed: one shared, correct implementation
+  (`upstream::is_event_stream_content_type` — split on `;`, trim, case-insensitive compare),
+  called from both sites instead of two independent copies.
+- **Minor, named and accepted rather than fixed:** a hostname `connect()` resolves DNS via
+  `tokio::task::spawn_blocking`, which tokio cannot cancel once started — a stalled resolver can
+  accumulate blocking-pool work across repeated timed-out requests even though this timeout
+  itself still returns control promptly. A fully async resolver would close this; out of this
+  milestone's own scope, documented on `Timeouts::connect`'s own field rather than left
+  implicit. The critique separately confirmed no other resource (socket, response buffer,
+  detached connection-driver task) outlives a fired timeout — everything else it tried to break
+  along those lines held.
+
+**Correction, applying the same lesson H2b's own entry recorded**: `cargo deny check`/`cargo
+audit` were run locally against a working tree still carrying the same unrelated, uncommitted
+`rustls` 0.23.44→0.23.45 `RUSTSEC-2026-0285` fix from earlier in this session (see H2b's own
+entry above) — so a local "clean" result does not describe what this branch's own committed
+`Cargo.lock` (untouched, still at the vulnerable 0.23.44) will show in real CI. Expect the same
+`cargo-deny check`/`cargo-audit` failures H2b's PR shows, for the same pre-existing, separately-
+tracked, not-yet-mergeable reason — not a new or different finding.
+
+**Verification.** `cargo build --workspace --all-targets`, `cargo test --workspace --locked`
+(three full repeated runs, no flakes, including the two new test files —
+`crates/vg-proxy/tests/upstream_timeouts.rs`, 8 tests, and two new unit tests in `server.rs`'s
+own `collect_body` coverage), `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo fmt --all --check`, and `cargo bench --workspace --locked --no-run` all clean.
+`scripts/a2-live-proof.sh` re-run and passing after these changes — real TLS, real streaming,
+real masking/demasking, real subscription auth, unregressed by the new bounds/timeouts. (One
+unrelated live-run observation, not attributable to this milestone: a single earlier re-run
+during this same session hit a real "content block type unrecognized" fail-closed rejection from
+`mask_request.rs` — a module this milestone never touches — most likely real-world variability
+in what the live `claude` CLI sent that run; two other re-runs, before and after, passed cleanly.
+Named here for the record, not chased further as out of scope.)
