@@ -15,7 +15,7 @@
 //! real live-run proof against the real, unmodified `claude` CLI found that it always sends
 //! `stream: true` (no flag forces non-streaming) — blocking it made every real CLI session fail
 //! closed, not just an edge case. `amendment-2026-09-14-001.yaml` pulled a minimal SSE-response
-//! demask path forward from M6 instead (`crate::stream_demask`, selected by `server.rs` on the
+//! demask path forward from M6 instead (`crate::codec::anthropic::stream_demask`, selected by `server.rs` on the
 //! upstream response's own `content-type: text/event-stream` header); `stream` no longer needs
 //! special-casing on the request side at all.
 //!

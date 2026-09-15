@@ -6,7 +6,7 @@
 //! into a narrow `#[derive(Deserialize)]` struct naming only the fields this crate cares about,
 //! then re-serializing that struct, would silently **drop** every field it doesn't name — a
 //! real corruption bug once a real Claude Code session (M5) sends a real request. Instead,
-//! [`crate::mask_request`] parses the body as a generic `serde_json::Value` and mutates only
+//! [`crate::codec::anthropic::mask_request`] parses the body as a generic `serde_json::Value` and mutates only
 //! `system`/`messages[].content` text leaves in place; this module's only job is classifying a
 //! content block's `"type"` discriminant during that walk, so every unmodified field round-trips
 //! byte-for-byte-equivalent through the untouched parts of the tree.

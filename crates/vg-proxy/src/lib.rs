@@ -10,15 +10,13 @@
 //! nothing schema-aware exists yet to route toward (M3+). Zero egress risk by construction
 //! throughout: there is still no upstream client anywhere in this crate.
 
+pub mod codec;
 pub mod daemon;
-pub mod demask_response;
 pub mod error;
-pub mod mask_request;
 pub mod route;
 mod schema;
 pub mod server;
 pub mod session;
-pub mod stream_demask;
 pub mod upstream;
 
 pub use daemon::Daemon;

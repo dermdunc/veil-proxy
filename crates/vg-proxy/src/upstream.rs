@@ -39,7 +39,8 @@ use std::task::{Context as TaskContext, Poll};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
-use hyper::{HeaderMap, Method, Request, Response};
+use hyper::header::{HeaderName, HeaderValue};
+use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -125,18 +126,6 @@ fn default_tls_config() -> &'static Arc<ClientConfig> {
     })
 }
 
-/// Headers forwarded verbatim from the inbound request to the upstream request — an explicit
-/// allow-set (plan §8.4), not a blind copy of every inbound header. `content-length`/`host` are
-/// deliberately excluded: the client below recomputes both fresh for the new body/upstream on
-/// every request, so a stale copied value could never silently disagree with the real one sent.
-const FORWARDED_HEADERS: &[&str] = &[
-    "content-type",
-    "x-api-key",
-    "authorization",
-    "anthropic-version",
-    "anthropic-beta",
-];
-
 /// A single connection's I/O, plain or TLS — `hyper::client::conn::http1::handshake` needs one
 /// concrete `AsyncRead + AsyncWrite` type, and `TcpStream`/`TlsStream<TcpStream>` are different
 /// concrete types, so this enum picks between them at runtime and forwards every poll method to
@@ -190,15 +179,35 @@ impl AsyncWrite for MaybeTlsStream {
 
 /// Forwards `method path_and_query body` to `config.host:config.port` — over TLS if
 /// `config.tls_config` is `Some`, verifying the certificate chain and hostname against
-/// `config.host` before sending anything — copying only [`FORWARDED_HEADERS`] from
-/// `original_headers`, and returns the upstream's response verbatim (status, body, headers)
-/// once fully received — M3/A2 are both non-streaming, so the response is buffered here rather
+/// `config.host` before sending anything — copying only `headers_to_forward` (the
+/// caller's active codec has already applied its own header-forwarding policy, Track H
+/// fork F4 — this module holds no provider-shaped header policy of its own, per D-H-1),
+/// and returns the upstream's response verbatim (status, body, headers) once fully
+/// received — M3/A2 are both non-streaming, so the response is buffered here rather
 /// than handed back as a live `Incoming` body for the caller to stream.
+///
+/// **Security note, named at H2b (Codex cross-model critique, finding 3): this function
+/// applies NO header policy of its own and forwards `headers_to_forward` verbatim,
+/// unconditionally.** Before H2b, this module's own `FORWARDED_HEADERS` constant
+/// enforced a fixed five-header allow-list internally, so calling `forward()` with an
+/// arbitrary `HeaderMap` was safe regardless of what the caller passed. That
+/// self-enforcement is gone: the safety property now depends entirely on every caller
+/// having already run the active codec's `select_headers` (fork F4) before calling this
+/// function. `server.rs` (the only production caller) does this correctly. A future
+/// caller that skips it — a new H0 launch path, a test, a second binary — would forward
+/// whatever it passes, including credential- or cookie-shaped headers, with no
+/// enforcement at this layer. This trade-off is deliberate (D-H-1: the transport layer
+/// sees "an origin and bytes," never provider-shaped policy) but is a real reduction in
+/// defense-in-depth from the pre-H2b shape, named here rather than left implicit. Not
+/// fixed in H2b's own scope: doing so would mean either reintroducing a policy into the
+/// transport layer (contradicting D-H-1) or gating this function behind a
+/// caller-supplied, already-filtered-marker type — a real design question for whoever
+/// adds the next caller of `forward()`, not resolved here.
 pub async fn forward(
     config: UpstreamConfig,
     method: Method,
     path_and_query: &str,
-    original_headers: &HeaderMap,
+    headers_to_forward: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response<Full<Bytes>>, ProxyError> {
     let tcp = TcpStream::connect((config.host.as_str(), config.port))
@@ -259,10 +268,8 @@ pub async fn forward(
         .method(method)
         .uri(path_and_query)
         .header("host", host_header);
-    for name in FORWARDED_HEADERS {
-        if let Some(value) = original_headers.get(*name) {
-            builder = builder.header(*name, value.clone());
-        }
+    for (name, value) in headers_to_forward {
+        builder = builder.header(name.clone(), value.clone());
     }
     let req = builder
         .body(Full::new(Bytes::from(body)))
