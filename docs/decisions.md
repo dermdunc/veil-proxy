@@ -5380,5 +5380,17 @@ demasking, real subscription auth, unregressed by the codec extraction. `cargo b
 --all-targets`, `cargo test --workspace --locked` (47 unit tests, up from 44 — 3 new F4 tests;
 all integration test files green, including `tests/route_classification.rs` and
 `tests/tls_upstream.rs` unchanged in behavior), `cargo clippy --workspace --all-targets --locked
--- -D warnings`, `cargo fmt --all --check`, `cargo deny check`, `cargo audit`, and `cargo bench
---workspace --locked --no-run` all clean.
+-- -D warnings`, `cargo fmt --all --check`, and `cargo bench --workspace --locked --no-run` all
+clean, both locally and in this PR's own real CI run.
+
+**Correction, caught checking this PR's real CI rather than trusting the local run:**
+`cargo deny check`/`cargo audit` were run locally against a working tree that had an
+unrelated, uncommitted `rustls` 0.23.44→0.23.45 bump (fixing RUSTSEC-2026-0285, a separate
+branch, `agent/claude/fix-rustsec-2026-0285`, blocked on a manual human commit by this
+machine's `Cargo.lock` git-guardrail) mixed in from earlier in the same session — the local
+"all clean" claim did not reflect what this PR's own committed `Cargo.lock` actually
+contains. This PR's real CI correctly shows `cargo-deny check`/`cargo-audit` FAILING on that
+same pre-existing advisory, since `Cargo.lock` was deliberately left untouched here (out of
+H2b's own scope). Not a regression this milestone introduced — the same finding, tracked and
+fixed on a separate branch, not yet mergeable due to the same guardrail this session cannot
+self-bypass. Will go green once that fix merges (or is rebased into this branch).

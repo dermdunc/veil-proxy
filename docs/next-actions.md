@@ -152,8 +152,12 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       codec-shaped policy back into the transport layer, contradicting D-H-1); and a missing
       observability path for headers silently denied by the credential-shaped pattern (now
       surfaced via `SelectedHeaders::denied_by_credential_pattern`). `cargo build/clippy/fmt/
-      test --locked`, `cargo deny check`, `cargo audit`, `cargo bench --workspace --locked
-      --no-run` all clean. **Named, not solved by this milestone:** `MaskedRequest`/
+      test --locked` and `cargo bench --workspace --locked --no-run` clean, both locally and
+      in this PR's own CI. `cargo deny check`/`cargo audit` FAIL in this PR's real CI on the
+      same pre-existing `RUSTSEC-2026-0285` (rustls 0.23.44) finding a separate branch already
+      fixes but hasn't merged — not a regression this milestone introduced (see
+      `docs/decisions.md`'s 2026-09-15 entry for the full correction). **Named, not solved by
+      this milestone:** `MaskedRequest`/
       `MaskRequestError` are reused as-is by the `Codec` trait rather than pre-generalized for
       a second codec (H3's own open question); `upstream::forward`'s new header parameter is a
       caller-trusted slice with no self-enforced policy, unlike the pre-H2b fixed constant
