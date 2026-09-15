@@ -5306,3 +5306,91 @@ Codex-shaped provider would need its own codec entirely.
 **Verification.** `scripts/a2-live-proof.sh` passing is the confirmation evidence for this
 closure. `cargo build/clippy/fmt/test --locked`, `cargo deny check`, `cargo audit` unaffected
 (this fix touched only the proof script's own invocation, no source changed).
+
+## 2026-09-15 — Track H, H2b BUILT: codec trait extraction; fork F4 (header-forwarding policy) decided
+
+Closes the gap the previous entry named explicitly ("`route.rs` and the request/response
+transforms are Anthropic-specific throughout; a Codex-shaped provider would need its own codec
+entirely") — for the routing/masking/demasking/header-forwarding seam. Scoped and accepted as
+intent `INT-2026-09-14-001` (veil-ecosystem), the first slice of Track H
+(`docs/architecture/multi-harness-proxy-plan.md`), alongside H2c (not yet built) and H1 (not yet
+run); H0/H4 stay out of scope, blocked on Track 1's A3 (production daemon bootstrap), confirmed
+not yet landed.
+
+**What was built.** A new `crates/vg-proxy/src/codec` module holds the `Codec` trait — route
+classification, the request-mask walk, response/SSE demasking, and header-forwarding policy —
+with `crates/vg-proxy/src/codec/anthropic/` as its sole implementation today. `route.rs`'s
+former Anthropic/Bedrock match arms, `mask_request.rs`, `demask_response.rs`, and
+`stream_demask.rs` all moved under `codec/anthropic/` verbatim (identical logic, new location);
+`route.rs` itself is now a thin, codec-agnostic dispatcher (`AnthropicCodec.classify_route(...)`,
+documented as a placeholder until H2a's real per-origin routing exists); `upstream.rs` lost
+`FORWARDED_HEADERS` entirely, and its `forward()` now takes an already-selected header list
+rather than filtering internally. `server.rs`, `upstream.rs`, and `route.rs` hold zero
+Anthropic-shaped identifiers at the top level — grep-verified against the plan's own H2b exit
+gate (`FORWARDED_HEADERS`, `content_block_delta`, `tool_use`, literal Anthropic/Bedrock path
+strings).
+
+**Fork F4 decided (header-forwarding policy), adopting the plan's own §7 recommendation**: a
+prefix allowlist (`anthropic-*`, `x-claude-code-*`) plus five named singletons (`content-type`,
+`x-api-key`, `authorization`, `anthropic-version`, `anthropic-beta` — the exact pre-H2b fixed
+list, unchanged forwarding behavior) plus a credential-shaped denylist (`token`, `secret`,
+`cookie`, `session`, `password`, `key`, `auth`) that wins over any prefix match. Presented to
+the user directly (per ADR-017's precedent: design forks named and settled with a human before
+code) and accepted as written before implementation began.
+
+**Two independent review rounds, both found and fixed real issues** (matching this family's
+standing doubt-driven-development practice): a fresh-context single-model pass found (1) a
+header-classification bug — `anthropic-version`/`anthropic-beta` were originally left off the
+named-singleton list and fell through to the prefix-match path, which would have flagged them as
+"unreviewed" candidates on effectively every real Claude Code request, defeating the review
+mechanism's own purpose; (2) the denylist's original substring set omitted `key`/`auth` despite
+the two credential-shaped named singletons being literally `x-api-key`/`authorization` — a
+hypothetical future `anthropic-encryption-key` would have been silently auto-forwarded. A
+following Codex cross-model pass (`codex exec --sandbox read-only`, explicit per-invocation user
+authorization) found and this session fixed: (3) a real defense-in-depth regression — pre-H2b,
+`upstream::forward()` enforced `FORWARDED_HEADERS` internally regardless of caller behavior;
+post-H2b, `forward()` is `pub`, still callable directly (`tests/tls_upstream.rs` does exactly
+this), and now forwards whatever header list it's given with zero self-enforced policy. Not
+reversed (D-H-1 forbids putting codec-shaped policy back into the transport layer), but
+documented loudly in `forward()`'s own doc comment as a named, accepted reduction in
+defense-in-depth rather than left implicit; (4) the credential-shaped denylist's substring
+matching is deliberately broad (a false positive silently drops a benign header rather than risk
+forwarding a credential — the safe direction of error), but a silent drop previously left zero
+signal for F4's own "per-release review of what actually appeared" goal — fixed by adding
+`SelectedHeaders::denied_by_credential_pattern`, logged (names only) alongside the existing
+unnamed-prefix-match log; (5) several tests asserted only header counts, not identity/value —
+strengthened; (6) stale doc-comment paths (`crate::mask_request::mask_request` etc.) left over
+from the file moves — fixed. Two findings from the Codex pass were reconciled as contract
+misreads, not defects: that `route.rs`/`daemon.rs` still name `AnthropicCodec` directly (exactly
+the plan's own documented "fixed codec until H2a" design, which the critique's own NOT-FOUND
+section separately agreed was not a defect) and that `upstream.rs`'s `real_anthropic()`/
+`"api.anthropic.com"` remain provider-specific (H2a's canonical-origin work, never part of H2b's
+own enumerated exit gate).
+
+**Named, not solved by this milestone:** `MaskedRequest`/`MaskRequestError` (the `Codec` trait's
+mask-result/error types) are reused as-is from the Anthropic implementation rather than
+pre-generalized for a codec that doesn't exist yet — whether H3's OpenAI codec shares these
+types or gets its own is a real, undecided question for that milestone. `upstream::forward`'s
+new caller-trusted header parameter (finding 3 above) is a real, accepted trade-off, not a
+todo — fixing it would mean reintroducing codec-shaped policy into the transport layer.
+
+**Verification.** `scripts/a2-live-proof.sh` re-run twice (once before, once after the Codex
+critique's fixes) — passes end to end both times, real TLS, real streaming, real masking/
+demasking, real subscription auth, unregressed by the codec extraction. `cargo build --workspace
+--all-targets`, `cargo test --workspace --locked` (47 unit tests, up from 44 — 3 new F4 tests;
+all integration test files green, including `tests/route_classification.rs` and
+`tests/tls_upstream.rs` unchanged in behavior), `cargo clippy --workspace --all-targets --locked
+-- -D warnings`, `cargo fmt --all --check`, and `cargo bench --workspace --locked --no-run` all
+clean, both locally and in this PR's own real CI run.
+
+**Correction, caught checking this PR's real CI rather than trusting the local run:**
+`cargo deny check`/`cargo audit` were run locally against a working tree that had an
+unrelated, uncommitted `rustls` 0.23.44→0.23.45 bump (fixing RUSTSEC-2026-0285, a separate
+branch, `agent/claude/fix-rustsec-2026-0285`, blocked on a manual human commit by this
+machine's `Cargo.lock` git-guardrail) mixed in from earlier in the same session — the local
+"all clean" claim did not reflect what this PR's own committed `Cargo.lock` actually
+contains. This PR's real CI correctly shows `cargo-deny check`/`cargo-audit` FAILING on that
+same pre-existing advisory, since `Cargo.lock` was deliberately left untouched here (out of
+H2b's own scope). Not a regression this milestone introduced — the same finding, tracked and
+fixed on a separate branch, not yet mergeable due to the same guardrail this session cannot
+self-bypass. Will go green once that fix merges (or is rebased into this branch).

@@ -41,7 +41,7 @@ use serde_json::Value;
 
 use vg_core::{Namespace, PlaceholderBinding, Policy};
 
-use crate::demask_response::demask_text;
+use super::demask_response::demask_text;
 
 /// Demasks every `text_delta` fragment in `body` (an Anthropic Messages API SSE stream, fully
 /// buffered) against `bindings`, and re-serializes. Always returns bytes — see this module's own

@@ -22,7 +22,7 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -121,7 +121,7 @@ async fn accepts_a_certificate_signed_by_a_trusted_ca_for_the_right_hostname() {
     let client_config = client_config_trusting(&ca_der);
 
     let upstream = UpstreamConfig::tls("localhost", port, client_config);
-    let resp = upstream::forward(upstream, Method::GET, "/", &HeaderMap::new(), Vec::new())
+    let resp = upstream::forward(upstream, Method::GET, "/", &[], Vec::new())
         .await
         .expect("a validly-signed, right-hostname certificate must be accepted");
 
@@ -140,7 +140,7 @@ async fn refuses_a_certificate_signed_by_a_trusted_ca_for_the_wrong_hostname() {
     // The client dials "localhost", but the presented certificate is only valid for
     // "not-the-host-we-dial.example" — same trusted CA, wrong name.
     let upstream = UpstreamConfig::tls("localhost", port, client_config);
-    let err = upstream::forward(upstream, Method::GET, "/", &HeaderMap::new(), Vec::new())
+    let err = upstream::forward(upstream, Method::GET, "/", &[], Vec::new())
         .await
         .expect_err("a right-CA, wrong-hostname certificate must be refused");
 
@@ -163,7 +163,7 @@ async fn refuses_a_certificate_signed_by_an_untrusted_ca() {
     let client_config = client_config_trusting(&other_ca_der);
 
     let upstream = UpstreamConfig::tls("localhost", port, client_config);
-    let err = upstream::forward(upstream, Method::GET, "/", &HeaderMap::new(), Vec::new())
+    let err = upstream::forward(upstream, Method::GET, "/", &[], Vec::new())
         .await
         .expect_err("a certificate signed by an untrusted CA must be refused");
 

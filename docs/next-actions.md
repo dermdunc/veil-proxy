@@ -129,6 +129,40 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       a generic transport + per-provider codec) is real follow-on design work, not yet started,
       and Codex named concrete gaps in the current code for that direction (a TLS-terminating
       listener is materially new work; routing/headers/masking are all still Anthropic-specific).
+- [x] **Track H, H2b — codec trait extraction — BUILT 2026-09-15** (intent
+      `INT-2026-09-14-001`, veil-ecosystem). The Codex-generality gap the M5/A2 entry above
+      named ("routing/headers/masking are all still Anthropic-specific") is now closed for the
+      routing/masking/demasking/header-forwarding seam specifically: a new
+      `crates/vg-proxy/src/codec` module holds a `Codec` trait (route classification,
+      request-mask walk, response/SSE demasking, header-forwarding policy), with everything
+      previously scattered across `route.rs`/`upstream.rs`/`mask_request.rs`/
+      `demask_response.rs`/`stream_demask.rs` now living under `codec::anthropic` as that
+      trait's sole implementation. `route.rs`, `upstream.rs`, and `server.rs` hold zero
+      Anthropic-shaped identifiers at the top level (grep-verified). **Track H fork F4
+      (header-forwarding policy) decided as part of this milestone**: prefix allowlist
+      (`anthropic-*`, `x-claude-code-*`) + five named singletons (the pre-existing fixed list,
+      unchanged) + a credential-shaped denylist that wins over any prefix match — see this
+      file's own `docs/decisions.md` entry for the full record. `scripts/a2-live-proof.sh`
+      still passes end to end, unregressed. Two review rounds (fresh-context single-model,
+      then Codex cross-model) found and fixed real issues: a header-misclassification bug that
+      would have spammed the F4 review-candidate log on every real request; a denylist gap
+      missing "key"/"auth" substrings despite the codec's own named singletons being
+      `x-api-key`/`authorization`; a real defense-in-depth regression in `upstream::forward`
+      (now documented rather than silently accepted, since fixing it would mean putting
+      codec-shaped policy back into the transport layer, contradicting D-H-1); and a missing
+      observability path for headers silently denied by the credential-shaped pattern (now
+      surfaced via `SelectedHeaders::denied_by_credential_pattern`). `cargo build/clippy/fmt/
+      test --locked` and `cargo bench --workspace --locked --no-run` clean, both locally and
+      in this PR's own CI. `cargo deny check`/`cargo audit` FAIL in this PR's real CI on the
+      same pre-existing `RUSTSEC-2026-0285` (rustls 0.23.44) finding a separate branch already
+      fixes but hasn't merged — not a regression this milestone introduced (see
+      `docs/decisions.md`'s 2026-09-15 entry for the full correction). **Named, not solved by
+      this milestone:** `MaskedRequest`/
+      `MaskRequestError` are reused as-is by the `Codec` trait rather than pre-generalized for
+      a second codec (H3's own open question); `upstream::forward`'s new header parameter is a
+      caller-trusted slice with no self-enforced policy, unlike the pre-H2b fixed constant
+      (named explicitly in `upstream.rs`'s own doc comment, not silently accepted). H2c (bounds
+      and timeouts) and H1 (Codex interception spike) remain open under the same intent.
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`

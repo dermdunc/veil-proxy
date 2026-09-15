@@ -24,7 +24,7 @@ pub enum ProxyError {
     #[error("audit log open error: {0}")]
     AuditOpen(#[from] vg_audit::OpenError),
     #[error("request masking error: {0}")]
-    MaskRequest(#[from] crate::mask_request::MaskRequestError),
+    MaskRequest(#[from] crate::codec::MaskRequestError),
     #[error("failed to connect to upstream {host}:{port}: {source}")]
     UpstreamConnect {
         host: String,
