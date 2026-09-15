@@ -66,3 +66,4 @@ That can grow into a published site later if it earns one — see
 - [2026-09-14 — The proxy worked. The product didn't.](2026-09-14-the-proxy-worked-the-product-didnt.md)
 - [2026-09-14 — The fix was already in the repo](2026-09-14-the-fix-was-already-in-the-repo.md)
 - [2026-09-15 — The safety net that moved](2026-09-15-the-safety-net-that-moved.md)
+- [2026-09-15 — The timeout test that tested nothing](2026-09-15-the-timeout-test-that-tested-nothing.md)

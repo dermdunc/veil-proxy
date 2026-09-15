@@ -169,7 +169,7 @@ async fn handle_mask(
         Err(resp) => return *resp,
     };
     let headers = req.headers().clone();
-    let body = match collect_body(req).await {
+    let body = match collect_body(req.into_body()).await {
         Ok(body) => body,
         Err(resp) => return resp,
     };
@@ -209,12 +209,15 @@ async fn handle_mask(
             // free to ignore or honor on its own terms — decides which demask path applies.
             // `text/event-stream` is Anthropic's own real signal for an SSE response; anything
             // else (including no content-type at all) goes through the original, non-streaming
-            // JSON path unchanged.
+            // JSON path unchanged. Track H, H2c (Codex cross-model critique): this used to be
+            // its own inline, case-sensitive `starts_with` check — the exact same bug
+            // duplicated in `upstream.rs`'s own copy — now a single shared, correct
+            // implementation (`upstream::is_event_stream_content_type`) instead of two.
             let is_sse = parts
                 .headers
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| ct.starts_with("text/event-stream"));
+                .is_some_and(upstream::is_event_stream_content_type);
             let demasked_body = if is_sse {
                 daemon.demask_streaming_response(&raw_body, &namespace)
             } else {
@@ -265,7 +268,7 @@ async fn handle_pass(
     upstream: UpstreamConfig,
 ) -> Response<Full<Bytes>> {
     let headers = req.headers().clone();
-    let body = match collect_body(req).await {
+    let body = match collect_body(req.into_body()).await {
         Ok(body) => body,
         Err(resp) => return resp,
     };
@@ -319,15 +322,33 @@ fn invalid_header_response(name: &str) -> Response<Full<Bytes>> {
         .expect("static response is well-formed")
 }
 
-/// Reads the full request body. `MAX_ECHOED_TARGET_LEN`-style bounding doesn't apply here (the
-/// body isn't echoed anywhere) — a malformed/oversized body still fails closed downstream, in
-/// `mask_request`'s own JSON-parse step or the upstream's own request-size limits.
-async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Bytes>>> {
-    req.into_body()
+/// The upper bound on an inbound request body (Track H, H2c — closes the request-body half of
+/// plan §1.2 item 9; `upstream.rs`'s `MAX_RESPONSE_BODY_BYTES` closes the response half). A real
+/// Claude Code/Codex request, even a long multi-turn conversation with large tool outputs, is
+/// far smaller than this; the bound exists to fail an oversized or hostile request closed rather
+/// than read it into memory without limit. Not vendor-sourced — a reasoned engineering default.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// Reads the full request body, bounded by [`MAX_REQUEST_BODY_BYTES`] (Track H, H2c — before
+/// this milestone, `collect()` read an inbound body with no length check at all). A body
+/// exceeding the bound fails closed with 413, never reaching `mask_request`'s own JSON-parse
+/// step or the upstream.
+async fn collect_body<B>(body: B) -> Result<Vec<u8>, Response<Full<Bytes>>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    http_body_util::Limited::new(body, MAX_REQUEST_BODY_BYTES)
         .collect()
         .await
         .map(|collected| collected.to_bytes().to_vec())
         .map_err(|err| {
+            if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return request_too_large_response();
+            }
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header("x-vg-proxy-verdict", "block")
@@ -336,6 +357,16 @@ async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<B
                 ))))
                 .expect("static response is well-formed")
         })
+}
+
+fn request_too_large_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header("x-vg-proxy-verdict", "block")
+        .body(Full::new(Bytes::from(format!(
+            "vg-proxy: request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte bound — fail closed\n"
+        ))))
+        .expect("static response is well-formed")
 }
 
 fn total_masked_entities(stats: &vg_core::MaskStats) -> usize {
@@ -403,4 +434,38 @@ fn internal_error_response(err: &ProxyError) -> Response<Full<Bytes>> {
             "vg-proxy: internal error, refusing to forward — {err}\n"
         ))))
         .expect("static response is well-formed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Track H, H2c: `collect_body`'s request-body bound, exercised at its real production
+    /// size (`MAX_REQUEST_BODY_BYTES`, 32 MiB) — not a scaled-down stand-in — but against an
+    /// in-memory `Full<Bytes>` body rather than a real socket, so the test is fast and
+    /// deterministic instead of racing a real server's response against a client still writing
+    /// tens of megabytes (a real hazard: `collect_body` can return its 413 before the client
+    /// finishes sending, and a raw-socket test would need to handle that race explicitly).
+    /// `collect_body` was made generic over the body type specifically to make this possible.
+    #[tokio::test]
+    async fn a_request_body_over_the_bound_fails_closed_with_413() {
+        let oversized = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
+        let body = Full::new(Bytes::from(oversized));
+        let resp = collect_body(body)
+            .await
+            .expect_err("a body one byte over the bound must fail closed");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The mirror-image case: a body AT the bound (not over it) must still succeed — proving
+    /// this is a real "greater than," not an off-by-one that also rejects the exact limit.
+    #[tokio::test]
+    async fn a_request_body_at_the_bound_is_accepted() {
+        let at_limit = vec![b'a'; MAX_REQUEST_BODY_BYTES];
+        let body = Full::new(Bytes::from(at_limit.clone()));
+        let collected = collect_body(body)
+            .await
+            .expect("a body exactly at the bound must be accepted");
+        assert_eq!(collected.len(), MAX_REQUEST_BODY_BYTES);
+    }
 }
