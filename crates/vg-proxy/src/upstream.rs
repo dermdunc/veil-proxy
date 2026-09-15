@@ -24,20 +24,24 @@
 //! connection lifecycle and one connection per forwarded request (connection reuse/pooling is a
 //! later latency-hardening concern, plan §10.3 milestone M10, unchanged from M3).
 //!
-//! **Named gap, not solved by this milestone:** no connect/request timeout and no bound on
-//! response-body buffering — a hung or slow-drip real upstream can block a forwarded request
-//! indefinitely, or an unbounded response can grow memory without limit. Accepted as a
-//! documented trade-off (see `docs/next-actions.md`'s A2 entry) rather than built here, to keep
-//! this milestone's scope to what its own intent's confirmation criteria actually require;
-//! production-grade network hardening across every failure mode (DNS failure, peer close
-//! mid-handshake, partial reads) is real, named work for a later milestone.
+//! **Track H, H2c: bounds and timeouts.** A2 named "no connect/request timeout and no bound on
+//! response-body buffering" as an accepted gap; this milestone closes it in both directions.
+//! [`Timeouts`] names five separately-tripped timeouts (connect, response-headers, idle-body,
+//! streaming-idle, total-request) — see its own doc for each one's scope and default. Response
+//! bodies are bounded by [`MAX_RESPONSE_BODY_BYTES`]; request bodies are bounded in `server.rs`'s
+//! `collect_body` (the mirror-image gap named at the same milestone). Defaults are chosen against
+//! GROUND-13/14 (`docs/architecture/multi-harness-proxy-plan.md`): Claude Code's own documented
+//! streaming watchdogs (event-level and byte-level, both ~300s) and Codex's
+//! `stream_idle_timeout_ms` (300000ms default) — so a valid, legitimately slow-but-alive
+//! generation is never killed by an over-tight default tuned for the fast, non-streaming case.
 
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Request, Response};
@@ -51,6 +55,94 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::ProxyError;
 
+/// The upper bound on a buffered upstream response body (Track H, H2c). A real Claude/Codex
+/// text response, even a very long one, is many orders of magnitude smaller than this; the
+/// bound exists to fail a runaway or hostile upstream closed rather than let it grow this
+/// process's memory without limit. Not vendor-sourced — a reasoned engineering default, generous
+/// enough that no real response should ever approach it.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Whether `content_type` names the `text/event-stream` media type (RFC 9110 §8.3.1: type/
+/// subtype tokens are case-insensitive; any `;parameter=...` suffix, e.g. a charset, is not
+/// part of the type/subtype and must be ignored, not merely tolerated by a prefix match).
+///
+/// Track H, H2c (Codex cross-model critique): the original check (`starts_with`, case-sensitive)
+/// both under- and over-matched — `Text/Event-Stream` (a valid, differently-cased real value)
+/// was missed, while `text/event-streaming` (a different, unrelated media type sharing only a
+/// prefix) was wrongly accepted. Shared here (not duplicated) specifically because this exact
+/// bug was found duplicated between this module and `server.rs`'s own copy — one correct
+/// implementation, two callers, rather than two copies that can silently drift apart.
+pub(crate) fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
+/// Track H, H2c: five separately-tripped timeouts governing one forwarded request. Each has its
+/// own dedicated test (`tests/upstream_timeouts.rs`) proving it — and only it — fires under the
+/// matching failure condition. `Default` gives the production values; tests construct their own
+/// short-duration `Timeouts` to isolate exactly one without a real multi-minute wait.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// Bounds establishing the connection: `TcpStream::connect` plus, when TLS is configured,
+    /// the full TLS handshake. Not vendor-sourced — a reasoned default generous enough for a
+    /// slow real-world network path.
+    ///
+    /// **Named residual limitation (Codex cross-model critique, H2c), not fixed here:** for a
+    /// hostname target, `TcpStream::connect` resolves DNS via `tokio::task::spawn_blocking`
+    /// (a real `getaddrinfo` call), and tokio does not support cancelling an already-started
+    /// blocking task. Dropping this future when the timeout fires returns control to the caller
+    /// promptly, but the underlying resolver call can keep running on tokio's blocking thread
+    /// pool until the OS's own (much longer) resolver timeout — so a resolver that is itself
+    /// stalled, hit repeatedly, can accumulate blocking-pool work independent of this timeout.
+    /// A fully async resolver would close this; out of this milestone's own scope.
+    pub connect: Duration,
+    /// Bounds `hyper`'s `send_request` call end to end — which resolves once response headers
+    /// are available, before the body is read. **Not scoped to "waiting for headers" alone**
+    /// (Codex cross-model critique, H2c): `send_request` also covers writing the request body
+    /// over the wire, so a very large request (up to `server.rs`'s own 32 MiB bound) sent over a
+    /// slow or backpressured connection could plausibly exhaust this budget during upload, not
+    /// while genuinely waiting on the upstream — a real, named edge case, not fixed by adding a
+    /// sixth timeout (the plan names exactly five), since real request bodies this proxy forwards
+    /// are far smaller than the bound in practice. `ProxyError::UpstreamResponseHeadersTimeout`'s
+    /// own message is worded to cover both possibilities rather than assert only one. Not
+    /// vendor-sourced.
+    pub response_headers: Duration,
+    /// Bounds the gap between successive body-read progress for a NON-streaming (not
+    /// `text/event-stream`) response — resets every time bytes arrive. Not vendor-sourced; short
+    /// relative to `streaming_idle` because a non-streaming JSON response is fully assembled
+    /// server-side before any bytes are sent, so a real gap this long means something is stuck,
+    /// not that the model is still generating.
+    pub idle_body: Duration,
+    /// Like `idle_body`, but applied once the response's own `content-type` is seen to be
+    /// `text/event-stream` — GROUND-13/14: Claude Code's own byte-level streaming watchdog and
+    /// Codex's `stream_idle_timeout_ms` both default to 300s. A real, slow-but-alive generation
+    /// can legitimately go this long between SSE keep-alives; this is the number that keeps
+    /// H2c from killing it.
+    pub streaming_idle: Duration,
+    /// A hard ceiling on the entire forwarded request (connect through the last response byte),
+    /// independent of whether any single gap ever triggers `idle_body`/`streaming_idle` — bounds
+    /// a response that keeps trickling just enough to never go idle but never actually finishes.
+    /// Not vendor-sourced; set well above `streaming_idle` so a real long generation (which can
+    /// legitimately run several minutes) is not cut off by this ceiling in the ordinary case.
+    pub total_request: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            response_headers: Duration::from_secs(30),
+            idle_body: Duration::from_secs(30),
+            streaming_idle: Duration::from_secs(300),
+            total_request: Duration::from_secs(900),
+        }
+    }
+}
+
 /// Where `server.rs` forwards a matched request. `tls_config: None` is plain HTTP (M3's
 /// original mock-upstream test path, unchanged in shape); `Some(_)` performs a real TLS
 /// handshake with the given `rustls::ClientConfig`, verifying the certificate chain and
@@ -63,6 +155,13 @@ pub struct UpstreamConfig {
     pub host: String,
     pub port: u16,
     pub tls_config: Option<Arc<ClientConfig>>,
+    /// Track H, H2c. Defaults to [`Timeouts::default`] via every constructor below; tests
+    /// override individual fields to isolate one timeout at a time.
+    pub timeouts: Timeouts,
+    /// Track H, H2c. Defaults to [`MAX_RESPONSE_BODY_BYTES`] via every constructor below; tests
+    /// override this to a small value so a bound-exceeded test doesn't need to actually transfer
+    /// tens of megabytes over a loopback socket.
+    pub max_response_body_bytes: usize,
 }
 
 impl UpstreamConfig {
@@ -73,6 +172,8 @@ impl UpstreamConfig {
             host: host.into(),
             port,
             tls_config: None,
+            timeouts: Timeouts::default(),
+            max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
         }
     }
 
@@ -85,6 +186,8 @@ impl UpstreamConfig {
             host: host.into(),
             port,
             tls_config: Some(tls_config),
+            timeouts: Timeouts::default(),
+            max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
         }
     }
 
@@ -183,8 +286,13 @@ impl AsyncWrite for MaybeTlsStream {
 /// caller's active codec has already applied its own header-forwarding policy, Track H
 /// fork F4 — this module holds no provider-shaped header policy of its own, per D-H-1),
 /// and returns the upstream's response verbatim (status, body, headers) once fully
-/// received — M3/A2 are both non-streaming, so the response is buffered here rather
-/// than handed back as a live `Incoming` body for the caller to stream.
+/// received. The response is buffered here (not handed back as a live `Incoming` body for
+/// the caller to stream — true incremental streaming is H6's job), but Track H H2c now bounds
+/// that buffering: a size limit ([`MAX_RESPONSE_BODY_BYTES`]) and an idle-gap timeout
+/// (`config.timeouts.idle_body`/`streaming_idle`, selected by the response's own `content-type`)
+/// that resets on every chunk of real progress, so a genuinely slow-but-alive stream survives
+/// while a truly stalled one fails closed instead of holding this connection (and its memory)
+/// forever.
 ///
 /// **Security note, named at H2b (Codex cross-model critique, finding 3): this function
 /// applies NO header policy of its own and forwards `headers_to_forward` verbatim,
@@ -210,34 +318,30 @@ pub async fn forward(
     headers_to_forward: &[(HeaderName, HeaderValue)],
     body: Vec<u8>,
 ) -> Result<Response<Full<Bytes>>, ProxyError> {
-    let tcp = TcpStream::connect((config.host.as_str(), config.port))
-        .await
-        .map_err(|source| ProxyError::UpstreamConnect {
-            host: config.host.clone(),
-            port: config.port,
-            source,
-        })?;
+    let host = config.host.clone();
+    let total_request_timeout = config.timeouts.total_request;
+    match tokio::time::timeout(
+        total_request_timeout,
+        forward_inner(config, method, path_and_query, headers_to_forward, body),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProxyError::UpstreamTotalRequestTimeout {
+            host,
+            timeout: total_request_timeout,
+        }),
+    }
+}
 
-    let io = match &config.tls_config {
-        None => TokioIo::new(MaybeTlsStream::Plain(tcp)),
-        Some(tls_config) => {
-            let server_name = ServerName::try_from(config.host.clone()).map_err(|source| {
-                ProxyError::UpstreamInvalidServerName {
-                    host: config.host.clone(),
-                    source,
-                }
-            })?;
-            let connector = TlsConnector::from(Arc::clone(tls_config));
-            let tls_stream = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|source| ProxyError::UpstreamTls {
-                    host: config.host.clone(),
-                    source,
-                })?;
-            TokioIo::new(MaybeTlsStream::Tls(Box::new(tls_stream)))
-        }
-    };
+async fn forward_inner(
+    config: UpstreamConfig,
+    method: Method,
+    path_and_query: &str,
+    headers_to_forward: &[(HeaderName, HeaderValue)],
+    body: Vec<u8>,
+) -> Result<Response<Full<Bytes>>, ProxyError> {
+    let io = connect(&config).await?;
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -275,19 +379,129 @@ pub async fn forward(
         .body(Full::new(Bytes::from(body)))
         .map_err(ProxyError::UpstreamRequestBuild)?;
 
-    let resp = sender
-        .send_request(req)
+    let resp = tokio::time::timeout(config.timeouts.response_headers, sender.send_request(req))
         .await
+        .map_err(|_elapsed| ProxyError::UpstreamResponseHeadersTimeout {
+            host: config.host.clone(),
+            timeout: config.timeouts.response_headers,
+        })?
         .map_err(ProxyError::UpstreamSend)?;
-    buffer_response(resp).await
+    buffer_response(
+        resp,
+        &config.host,
+        &config.timeouts,
+        config.max_response_body_bytes,
+    )
+    .await
 }
 
-async fn buffer_response(resp: Response<Incoming>) -> Result<Response<Full<Bytes>>, ProxyError> {
+/// Establishes the connection — TCP connect, then (if configured) the full TLS handshake — under
+/// a single `config.timeouts.connect` budget (Track H, H2c). Both failure modes (a peer that
+/// never completes the TCP handshake, and one that completes it but stalls mid-TLS-negotiation)
+/// are the same practical failure from a caller's perspective: "establishing a connection never
+/// finished," so one timeout covers both rather than splitting them.
+async fn connect(config: &UpstreamConfig) -> Result<TokioIo<MaybeTlsStream>, ProxyError> {
+    let attempt = async {
+        let tcp = TcpStream::connect((config.host.as_str(), config.port))
+            .await
+            .map_err(|source| ProxyError::UpstreamConnect {
+                host: config.host.clone(),
+                port: config.port,
+                source,
+            })?;
+
+        match &config.tls_config {
+            None => Ok(TokioIo::new(MaybeTlsStream::Plain(tcp))),
+            Some(tls_config) => {
+                let server_name = ServerName::try_from(config.host.clone()).map_err(|source| {
+                    ProxyError::UpstreamInvalidServerName {
+                        host: config.host.clone(),
+                        source,
+                    }
+                })?;
+                let connector = TlsConnector::from(Arc::clone(tls_config));
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|source| ProxyError::UpstreamTls {
+                        host: config.host.clone(),
+                        source,
+                    })?;
+                Ok(TokioIo::new(MaybeTlsStream::Tls(Box::new(tls_stream))))
+            }
+        }
+    };
+
+    match tokio::time::timeout(config.timeouts.connect, attempt).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProxyError::UpstreamConnectTimeout {
+            host: config.host.clone(),
+            port: config.port,
+            timeout: config.timeouts.connect,
+        }),
+    }
+}
+
+/// Buffers the upstream response body, bounded in both size ([`MAX_RESPONSE_BODY_BYTES`]) and
+/// idle time (Track H, H2c). Reads frame-by-frame rather than a single `.collect()` so an
+/// idle-gap timeout can reset on every real chunk of progress instead of applying to the whole
+/// read as one lump sum — the exact distinction that lets a slow-but-alive stream survive while
+/// a truly stalled one still fails closed. The idle timeout itself is selected by the response's
+/// own `content-type`, known from the headers before any body byte is read: `text/event-stream`
+/// gets the longer `streaming_idle` budget (matching real vendor SSE-keepalive behavior,
+/// GROUND-13/14); everything else gets the shorter `idle_body` budget, since a non-streaming
+/// response is fully assembled server-side before any of it is sent.
+async fn buffer_response(
+    resp: Response<Incoming>,
+    host: &str,
+    timeouts: &Timeouts,
+    max_response_body_bytes: usize,
+) -> Result<Response<Full<Bytes>>, ProxyError> {
     let (parts, body) = resp.into_parts();
-    let collected = body
-        .collect()
-        .await
-        .map_err(ProxyError::UpstreamResponseBody)?
-        .to_bytes();
-    Ok(Response::from_parts(parts, Full::new(collected)))
+    let is_sse = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_event_stream_content_type);
+    let idle_timeout = if is_sse {
+        timeouts.streaming_idle
+    } else {
+        timeouts.idle_body
+    };
+
+    let mut body = Limited::new(body, max_response_body_bytes);
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Err(_elapsed) => {
+                return Err(ProxyError::UpstreamIdleTimeout {
+                    host: host.to_string(),
+                    timeout: idle_timeout,
+                    streaming: is_sse,
+                })
+            }
+            Ok(None) => break,
+            Ok(Some(Err(err))) => {
+                if err
+                    .downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    return Err(ProxyError::UpstreamResponseTooLarge {
+                        limit: max_response_body_bytes,
+                    });
+                }
+                return Err(ProxyError::UpstreamResponseBody(err));
+            }
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    collected.extend_from_slice(data);
+                }
+            }
+        }
+    }
+
+    Ok(Response::from_parts(
+        parts,
+        Full::new(Bytes::from(collected)),
+    ))
 }
