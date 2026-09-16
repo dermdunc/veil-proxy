@@ -755,3 +755,48 @@ displace it for long.
 ## Session Update: 2026-09-06 — Retire/promote review; fix yanked crate and a real test race
 
 - [ ] No action needed right now; CI is green
+
+## Session Update: 2026-09-15/16 — Track H, H1: Codex interception + auth spike (SPIKE COMPLETE, with four named, user-accepted scope deviations)
+
+- [x] ~~H1 entry gate (fork F15): scrub step + test, `.gitignore`, chained pre-commit guard~~ —
+      built and demonstrated live (a force-added raw-looking file was shown blocked from
+      commit) before any real Codex capture, per the intent's own strengthened criterion.
+- [x] ~~H1 live-run spike: `openai_base_url` override and custom `model_providers.veil` +
+      `requires_openai_auth`, against the real `codex` CLI (0.153.4) under real ChatGPT
+      subscription auth~~ — both mechanisms confirmed working end to end, each reproduced
+      twice (real "pong" responses, real "tokens used" CLI output). See `docs/decisions.md`,
+      "Track H, H1" for the full mechanism decision, and
+      `docs/architecture/multi-harness-proxy-plan.md` for F7/F11/F12's answers.
+- [ ] **Not working, recorded as a real finding, not silently dropped:** plain `HTTPS_PROXY`
+      env vars alone did not reliably work — on reproduction, `codex` issues a genuine
+      `CONNECT` tunnel request that this spike's relay (no `CONNECT` support) can't satisfy,
+      and `codex` retries indefinitely with no observed fallback. A real transparent-proxy
+      interception layer needs genuine `CONNECT` handling; this spike didn't build one. Note
+      this is a *different* thing from test-order item (d) below, not the same mechanism.
+- [ ] **Two rounds of adversarial review (a fresh-context subagent, then Codex cross-model)
+      found the first write-up and its retained corpus had real, serious problems** — most
+      seriously, a real ChatGPT account id and real session/environment data almost reached
+      a commit (once via an under-scoped scrubber, once via a regression test that
+      accidentally hardcoded the real captured value as "example" data). Full account in
+      `docs/decisions.md`'s "Corrections from review" sections; both are fixed. The retained
+      corpus is now a 5-entry, hand-authored, provenance-labeled **synthetic** artifact —
+      real-capture retention was abandoned as too risky to do safely, on Codex's own
+      recommendation, independently checked by a third model (Fable) before implementation.
+- [ ] **Four named scope deviations from H1's original confirmation criteria, put to the
+      human operator explicitly and accepted this session** (recorded as a real amendment
+      to `veil-ecosystem`'s `INT-2026-09-14-001`, "UPDATE 2026-09-16" — not merely asserted
+      in this repo's own docs): (1) API-key auth mode (`env_key`) untested — no
+      `OPENAI_API_KEY` authorized, F7 narrowed to ChatGPT-subscription-only; (2) F12's
+      specific `supports_websockets=false` pin mechanism untested, deferred to H3; (3)
+      test-order item (d) — the `network_proxy`/`respect_system_proxy` config keys — not
+      performed at all; (4) the corpus is synthetic-structure, not a redacted real capture.
+      Revisit each if a later milestone needs the fuller original scope.
+- [ ] Real follow-up work named in the decision, not yet done: a Codex header-forwarding
+      policy (H2b's `AnthropicCodec::select_headers` has no Codex counterpart yet), the
+      `prefer_websockets`-pinning mechanism for F12, a real `CONNECT`-capable relay/proxy to
+      actually test the `network_proxy`/`respect_system_proxy` config keys, and the
+      CA/trust-bundle path ((e) in H1's test order, not attempted since (a)/(b) succeeded).
+      `scrub.py`'s own module doc now names a real, unfixed structural blind spot (real
+      environment data embedded in request bodies as ordinary JSON, not token-shaped) —
+      any future real-capture attempt needs a genuinely different approach, not a bigger
+      regex.
