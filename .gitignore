@@ -79,3 +79,9 @@ CLAUDE.md
 CODEX.md
 knowledge/
 # <<< hekton-boundary <<<
+
+# Track H, H1 fixture governance (fork F15, 2026-09-14): raw Codex-spike captures may
+# contain real upstream account/session-shaped values (see scripts/h1-fixtures/scrub.py's
+# own doc comment). Never committed raw — only scripts/h1-fixtures/sanitized/*.jsonl,
+# produced by running scrub.py over a raw capture, is ever meant to reach git.
+scripts/h1-fixtures/raw/

@@ -5527,3 +5527,266 @@ during this same session hit a real "content block type unrecognized" fail-close
 `mask_request.rs` — a module this milestone never touches — most likely real-world variability
 in what the live `claude` CLI sent that run; two other re-runs, before and after, passed cleanly.
 Named here for the record, not chased further as out of scope.)
+
+## 2026-09-15/16 — Track H, H1: Codex interception + auth spike, mechanism decision (F7 narrowed, F11 answered, F12 partially answered — all four scope deviations user-accepted and recorded in the governing intent)
+
+Live-run spike against the real, installed `codex` CLI (0.153.4, confirmed on PATH, logged in
+via ChatGPT subscription — `codex login status` → "Logged in using ChatGPT", `stored auth mode:
+chatgpt` per `codex doctor --json`). Per fork F15, the entry gate was built and demonstrated
+before any real capture: `scripts/h1-fixtures/scrub.py` (+ its own passing test), a `.gitignore`
+entry for `scripts/h1-fixtures/raw/`, and a chained pre-commit hook
+(`scripts/h1-fixtures/install-guard-hook.sh`) that was shown live blocking a deliberately
+force-added raw-looking file. All prompts sent were the synthetic literal `"reply with exactly
+the word: pong"` (or, for the initial path-discovery probe, `"hi"`) — nothing else. The tool used
+to send them is `scripts/h1-fixtures/relay.py`, a throwaway stdlib-only record-and-relay HTTP
+listener (real TLS via `ssl.create_default_context()` against the OS trust store, never
+disabled).
+
+**Corrected after adversarial review, before this entry was ever committed:** a fresh-context
+review of the first draft of this entry and its corpus found a real, critical gap — see the
+"Corrections from review" section below. Nothing in this entry reached a commit before the fixes
+were made; the corpus was regenerated and this text rewritten in place. Recorded because
+doubt-driven-development's own discipline is to show the correction, not hide the draft that
+needed it.
+
+**Named contingency, disclosed rather than silently skipped:** no `OPENAI_API_KEY` is set or
+authorized in this environment, matching A2's own precedent of never creating/requesting a new
+API credential without explicit prior approval. The human operator, mid-session, instructed that
+Codex be tested "similar to claude" — via the installed `codex` CLI's own subscription auth,
+the same way A2 tested Claude Code, rather than against the raw API directly.
+
+**Correction, round 2 (Codex cross-model review):** the first draft of this entry treated that
+mid-session remark, recorded only in this same author-controlled document, as sufficient
+authorization to narrow F7's scope — "an unauthorized contract rewrite" in the reviewer's own
+words, since an author's own decision record is not independently-checkable evidence that the
+user actually accepted the resulting limitation. **This has been corrected at the source, not
+just reworded here:** this scope narrowing (plus F12's partial answer and test-order item (d)'s
+non-performance and the corpus's synthetic-not-real nature, below) was put to the human operator
+together, explicitly, via a real interactive question this session, with the exact record shown
+before the answer. Answer: accept all four. That acceptance is recorded as its own history
+amendment on the governing intent, `veil-ecosystem`'s
+`.hekton/intents/INT-2026-09-14-001/intent.yaml` (the "UPDATE 2026-09-16" section) — this
+decisions.md entry cross-references that record rather than substituting for it, per the
+reviewer's own finding that the intent registry, not this document, is where the contract lives.
+**API-key auth mode (`env_key`) was not tested this session** — the accepted, escalated
+limitation, not a silent gap.
+
+**(a) `openai_base_url` via `-c` override on the built-in provider — WORKS, reproduced twice.**
+`codex exec -c openai_base_url="http://127.0.0.1:<port>/v1" "..."` ran against the real,
+unmodified `openai`/ChatGPT-auth provider (`provider: openai` in the exec banner) redirected to
+our relay. Real, exact log evidence of the WebSocket-first / HTTP-fallback behaviour GROUND-9b
+and F12 both ask about, identical on both runs:
+
+```
+ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket:
+  WebSocket protocol error: No "Connection: upgrade" header, url: ws://127.0.0.1:<port>/v1/responses
+... (5 retries) ...
+warning: Falling back from WebSockets to HTTPS transport. stream disconnected before
+  completion: WebSocket protocol error: No "Connection: upgrade" header
+```
+followed by a real, correct `pong` response — `codex exec`'s own terminal output displayed
+"tokens used: 4,312" identically on both runs. **Precision correction (Codex cross-model round
+2):** this is the CLI's own displayed metric, not necessarily the same accounting as a raw API
+response body's `total_tokens` field — a real, now-deleted capture of a *different* mechanism
+((b) below) showed the raw API response reporting a `total_tokens` value in the tens of
+thousands on functionally similar exchanges, almost certainly because the real request body
+carries a large embedded environment/instruction context that inflates the raw API-level count
+well beyond what the CLI chooses to surface to the user. Both numbers are real; they measure
+different things; this entry originally implied they were comparable, which was imprecise. This
+confirms `codex.transport.fallback_to_http` is real and functions correctly for
+**this specific failure mode** (a WS upgrade attempt that gets a plain HTTP response back):
+it degrades cleanly to plain HTTPS/SSE on the same base URL, no user-visible break. Contrast this
+with (d) below, where a *different* failure mode (a rejected `CONNECT`) did not degrade at all.
+Also, contrary to this session's own earlier assumption stated in the intent's GROUND comment:
+`model_providers.<built-in-id>.*` field overrides (e.g. `-c model_providers.openai.wire_api=...`)
+are rejected outright ("Built-in providers cannot be overridden") — but the separate, dedicated
+top-level `openai_base_url` key exists precisely to redirect the built-in provider and is not
+subject to that restriction. These are two different override surfaces, not one.
+
+**(b) custom `model_providers.veil` entry + `requires_openai_auth = true` — WORKS, reproduced
+twice.** `-c model_providers.veil.base_url=... -c model_providers.veil.requires_openai_auth=true
+-c model_provider=veil` was accepted (`provider: veil` in the exec banner) and correctly
+attached the real ChatGPT bearer token and a real `chatgpt-account-id` header to every outgoing
+request — confirming a custom, non-built-in provider ID can reuse ChatGPT session auth without
+an API key. Unlike (a), this path went straight to plain HTTPS/SSE with no observed WebSocket
+upgrade attempt in the capture, on both runs — a real, disprovable difference between the two
+mechanisms this session did not fully root-cause (candidate explanation: WS negotiation may be
+tied to the built-in provider identity, not merely to auth mode); flagged as open detail for
+H2a/H3, not asserted as understood.
+
+**Real upstream target, both (a) and (b):** `chatgpt.com` — NOT `api.openai.com`. Confirmed by
+inspecting `codex doctor --json`'s `network.provider_reachability` (`"ChatGPT inference URL":
+"https://chatgpt.com/backend-api/<redacted> reachable"`) and by the real captured traffic. Before
+`relay.py` had any path rewriting, the client's own stderr showed the precise failure for the
+model-catalog fetch: `codex_models_manager::manager: failed to refresh available models:
+unexpected status 404 Not Found: <!DOCTYPE html>...`, `url: http://127.0.0.1:<port>/v1/models`
+— a genuine, client-observed 404. The *separate* `/v1/responses` attempts in that same
+unrewritten run did **not** show that shape in the capture: the corpus records a `location`
+response header with an empty body (redirect-shaped, not a 404-with-body), and the *redirect
+target* the client followed next (`GET /`) is what returned the generic `chatgpt.com` SPA shell
+HTML. Precisely: `/v1/models` → 404; `/v1/responses` → redirect; followed redirect → SPA shell.
+All three are real, but they are not the same failure, and this entry originally conflated them
+under one "gets a 404" sentence — corrected here. Once `relay.py`'s `--rewrite-from /v1/
+--rewrite-to /backend-api/codex/` was added, all three of these failure shapes disappeared and
+real API responses came back instead: the *client* speaks OpenAI-public-API-shaped paths
+regardless of mechanism, but ChatGPT's real backend only understands `/backend-api/codex/*`. A
+relay/codec that preserves the client's path 1:1 does not reach a working backend; a working
+interception layer for ChatGPT-authed Codex traffic needs this specific path rewrite (or
+equivalent route-mapping) as part of its request transform — this is a **new, real requirement**
+beyond what the Anthropic codec does (which forwards the client's path unchanged).
+
+**(d) `HTTPS_PROXY`/`https_proxy` env vars — INCONSISTENT; the working-looking result did not
+reproduce, and the reproducible result is a real failure mode, not a success.** The first attempt
+at this test appeared to work: with the real, unmodified `openai` provider and no codex-specific
+config, `HTTPS_PROXY=http://127.0.0.1:<port>` seemed to route real traffic — a `/v1/models`
+catalog fetch, seven WebSocket-upgrade attempts, and a final `POST /v1/responses` — through the
+relay in plain origin-form HTTP with a real `Host: chatgpt.com` header. That attempt was killed
+before completion (a `codex exec` hang unrelated to this finding) and not re-verified before this
+entry's first draft treated it as "the cleanest mechanism found." **Three independent, deliberate
+re-runs of the identical command afterward (one observed live via a real-time log monitor)
+instead showed `codex` issuing a genuine `CONNECT chatgpt.com:443 HTTP/1.1` tunnel request.**
+`relay.py` has no `do_CONNECT` handler (a plain `BaseHTTPRequestHandler`, `GET`/`POST`/`PUT`/
+`DELETE` only), so it replies `501 Unsupported method`, and `codex` retried the `CONNECT`
+indefinitely (`ERROR: Reconnecting... waiting for network`, no cap observed within several
+minutes of real wall-clock time) — **no fallback to plain forwarding was ever observed on
+reproduction**, unlike (a)'s clean WS→HTTP fallback above. This session cannot explain the
+discrepancy between the one early, unreproduced observation and the three later, reproducible
+ones (candidate causes considered and not confirmed: client-side caching of a prior
+proxy-capability probe; some other non-determinism in `codex`'s own proxy client) — it is
+recorded as a real, open, disprovable inconsistency rather than resolved in either direction.
+**Conclusion: plain `HTTPS_PROXY` routing through a relay with no `CONNECT` support is not a
+demonstrated working mechanism.** A real transparent-proxy interception layer (the shape
+`vg-proxy` already uses for Claude Code) would need genuine `CONNECT` handling — either a raw
+TCP splice or a real TLS-terminating MITM — which this spike's relay never implemented. This is
+real, unstarted, necessary work for H2a/H3, not a settled "works."
+
+**Correction, round 2 (Codex cross-model review): this `HTTPS_PROXY` env-var experiment is NOT
+the plan's test-order item (d), and calling it "partially explored" overstated what happened.**
+The plan's own item (d) names a specific, different mechanism: Codex's `network_proxy`/
+`respect_system_proxy` **configuration keys**. Those config keys were never exercised this
+session — not partially, not at all. The env-var finding above is real and worth keeping (it's
+useful, disprovable information about a *different*, adjacent mechanism), but it does not
+discharge item (d). Recorded honestly: **test-order item (d) was not performed.**
+
+**Real model-catalog detail relevant to F12:** the real `/v1/models` (rewritten to
+`/backend-api/codex/models`) response is a JSON catalog where each model entry carries its own
+`prefer_websockets` boolean. F12's proposed mechanism — pin `supports_websockets = false` in an
+*injected* provider config to force SSE-only — has a plausible real injection point (a codec
+rewriting this catalog response in flight), but this session verified only that the field exists
+in a real response; it did **not** test rewriting it and confirming Codex honours the rewritten
+value. That specific mechanism is unverified and deferred to H3, named explicitly rather than
+assumed working.
+
+**Forks answered — each of the three deviations below (from a clean, unconditional resolution)
+was put to the human operator explicitly and accepted; see the intent amendment cited above:**
+- **F7 (Codex auth mode):** **(a) ChatGPT subscription**, confirmed working end-to-end and
+  reproduced through two independent interception mechanisms this session — **within a scope the
+  user explicitly accepted as narrowed** (API-key mode not tested). The plan's own conditional
+  text ("if subscription auth fails through every interception mechanism, (b) is the honest
+  launch scope") is not fully dischargeable from this session alone, since not every mechanism in
+  the test order was exercised to success — (d) did not work. Recorded as answered within an
+  accepted, narrowed scope, not as an unconditional resolution of the fork's original two-mode
+  text.
+- **F11 (Codex redirect mode):** **(a) `openai_base_url` on the built-in provider**, confirmed
+  working and reproduced, preserves built-in provider identity, and is the mechanism OpenAI's own
+  guidance prefers for LLM proxies (GROUND-8) — **recommended as the primary mechanism on this
+  evidence**, matching the plan's own precedent. (b) the custom `model_providers.veil` path is
+  also confirmed working and reproduced, kept as a validated secondary/fallback mechanism. This is
+  a recommendation for H2a/H4 to weigh, not a final production decision — see "What this does NOT
+  decide" below; the two statements are not in tension once "adopted as primary" is read as "this
+  session's recommendation," not "the shipped default."
+- **F12 (wire transport): PARTIALLY answered, explicitly not fully resolved.** `fallback_to_http`
+  is confirmed real and correct for the failure mode this session actually observed (a WebSocket
+  upgrade attempt getting a plain HTTP response back). F12's own specific proposed mechanism —
+  deliberately pinning `supports_websockets`/`prefer_websockets` false in an injected provider
+  config to force SSE-only, rather than relying on a WS upgrade failing on its own — was **not
+  tested**. The user accepted this as an explicit, named limitation (intent amendment cited
+  above); H3 scoping must treat the pin-mechanism as real, unstarted work, not as something this
+  session already settled.
+- Test order (e) (`HTTPS_PROXY` + `CODEX_CA_CERTIFICATE` with a throwaway local CA) was **not
+  attempted** — (a) and (b) both succeeded, which is what the plan's own gating ("only if (a)-(b)
+  fail") requires before (e) is needed. Test-order item (d)'s non-performance (above) does not
+  reopen this, since (e) is gated on (a)-(b), not on (d).
+
+**What this does NOT decide:** which of (a)/(b) `vg run codex` should actually use in production
+(and (d), a plain forward proxy, is not currently a working alternative — see above); the real
+Codex codec's header-forwarding policy (this session's captures show a rich, real Codex-specific
+header set — `chatgpt-account-id`, `session-id`, `thread-id`, `originator`, `x-codex-*`,
+`openai-beta`, `version`, and the `Sec-WebSocket-*` family for the WS path — but choosing an
+allowlist mirroring H2b's `AnthropicCodec::select_headers` is H2a/H3 work, not done here); the
+CA/trust-bundle mechanism for TLS interception (untested this session; (e) was not reached); or a
+real `CONNECT`-capable relay/proxy (needed to actually test (d) and the plan's own
+`network_proxy`/`respect_system_proxy` config keys, neither of which this session's relay could
+exercise). Those remain named, unstarted work for H2a/H3/H4, per the plan's own sequencing.
+
+**Corrections from review, round 1 (fresh-context general-purpose subagent), before any of this
+reached a commit:** found (1) **critical** — `scrub.py`'s header-name allowlist covered
+credential-shaped headers (`authorization`, `cookie`, ...) but not account/session-shaped ones;
+the real ChatGPT account id and real session/thread/window UUIDs were passing through unredacted
+into the file about to be retained. (2) F7 was originally written as a clean "answered," resting
+on this session's real but nowhere-else-recorded user authorization. (3) items (d) and (e) of the
+plan's test order were originally described as succeeded/not needed without being precise about
+what was actually exercised. (4) the corpus had no way to attribute a given entry to a specific
+mechanism after the fact. (5) `relay.py` did not record the upstream HTTP status code at all.
+Round 1's fixes: widened `SENSITIVE_HEADER_NAMES`, a regression test, a required `--label` field
+on `relay.py`, precision corrections to the (d)/F7 text, and a `status` field.
+
+**Corrections from review, round 2 (Codex cross-model, `codex exec --sandbox read-only`, explicit
+per-invocation user authorization), run against the round-1-corrected entry and its regenerated
+26-entry corpus:** round 1's fixes were themselves insufficient, and this round found new, more
+severe problems. **(a) CRITICAL:** round 1's own new regression test had accidentally hardcoded
+the *actual* real captured ChatGPT account id as "example" test data — a real personal identifier
+about to be committed into source. Fixed with obviously-fake placeholder UUIDs
+(`ffffffff-0000-...`), never copied from a real capture. **(b) CRITICAL:** the raw capture
+directory, though `.gitignore`d and never committed, still violated this intent's own literal "no
+raw capture directory persists past this mission" criterion merely by existing on disk. Deleted
+immediately and unconditionally. **(c) CRITICAL:** the regenerated "sanitised" corpus's request/
+response BODIES (not headers) carried real environment data — real repo path, username, git
+commit hash, `prompt_cache_key`, more session/thread/turn/window identifiers — because `codex`'s
+own real request construction embeds this as ordinary structured JSON that no header-allowlist or
+token-shaped regex can catch. This is a structural limitation of pattern-based scrubbing, not a
+missed pattern; recorded in `scrub.py`'s own module doc as a known, unfixed blind spot. **(d)-(g)**
+F7's authorization framing, F12's "answered" framing, item (d)'s "partially explored" framing, an
+internal F11 contradiction, an overselling build-log line, and the token-count imprecision above
+— all corrected in place, above and in `docs/next-actions.md` /
+`docs/build-log/2026-09-15-the-client-asked-for-v1.md`.
+
+**Given real account/session data leaked into the retained corpus twice** — once structurally
+(headers, round 1), once directly (a hardcoded real value in source, round 2) — a further,
+distinct Codex consultation was run asking specifically how to satisfy this intent's own corpus
+criterion without a third real-data leak risk. Codex recommended abandoning real-capture
+retention entirely for a hand-authored, explicitly-labeled **synthetic** corpus. A third
+independent model (Fable, asked to validate the resulting implementation plan *before* any of it
+was executed, without having authored any of the preceding text) found this substitution was
+itself an undisclosed intent-contract deviation — the corpus criterion's text was strengthened at
+this intent's own original critique specifically to require a real artifact — and that this
+deviation, plus F7/F12/(d) above, needed one real, user-facing escalation recorded in the
+governing intent itself, not only in this document. That escalation ran this session; the user
+accepted all four deviations together. See `veil-ecosystem`'s
+`.hekton/intents/INT-2026-09-14-001/intent.yaml`, "UPDATE 2026-09-16" history section, for the
+citable record.
+
+**Resulting corpus:** `scripts/h1-fixtures/sanitized/h1-spike-01.jsonl` is now 5 hand-authored
+entries, each carrying its own `provenance` field stating plainly which parts reflect a real H1
+observation (header *names*, real paths, real SSE event-type names, the real `prefer_websockets`
+catalog field name, the real WS-rejection error text) versus which parts are fake (every header
+*value*, every id, all body content) versus which one entry is fully invented for F16 design
+purposes and was never observed in any real capture at all (labeled as such). It is explicitly
+**not** a redacted real capture, per the accepted deviation above.
+
+**Verification.** Real `codex exec` sessions (`pong` returned correctly, real "tokens used" CLI
+output, each reproduced twice) against a locally-run relay proxying to the real `chatgpt.com`,
+under two working interception mechanisms plus one reproducibly-failing one; a hand-authored,
+mechanism-tagged, provenance-labeled 5-entry synthetic corpus at
+`scripts/h1-fixtures/sanitized/h1-spike-01.jsonl`; a direct grep of every known real identifier
+this session encountered (the real account id, session/thread/window ids, the real chatgpt.com
+build hash, the real machine username) across `scripts/h1-fixtures/` and every doc this entry
+touches, confirming zero matches. The raw capture directory was deleted, not merely left
+uncommitted — "never committed" was itself round 2's finding 2(b) above, corrected here. No new
+Cargo dependency — this spike is Python-stdlib-only, as the intent's own GROUND comment predicted.
+`cargo build/clippy/fmt/test --locked`, `cargo deny check`, `cargo audit` unaffected (no Rust
+source touched by this spike). **Both adversarial review rounds and Fable's plan validation
+predate this final synthetic-corpus swap and the F7/F11/F12/(d) wording fixes above** — this
+entry's own author re-verified the specific changes (the grep above, a re-read of every edited
+paragraph against each reviewer's exact finding, `test_scrub.py` re-run green) rather than
+running a fourth external pass, a proportionality judgment named here rather than left implicit.
