@@ -153,16 +153,18 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       observability path for headers silently denied by the credential-shaped pattern (now
       surfaced via `SelectedHeaders::denied_by_credential_pattern`). `cargo build/clippy/fmt/
       test --locked` and `cargo bench --workspace --locked --no-run` clean, both locally and
-      in this PR's own CI. `cargo deny check`/`cargo audit` FAIL in this PR's real CI on the
-      same pre-existing `RUSTSEC-2026-0285` (rustls 0.23.44) finding a separate branch already
-      fixes but hasn't merged — not a regression this milestone introduced (see
-      `docs/decisions.md`'s 2026-09-15 entry for the full correction). **Named, not solved by
-      this milestone:** `MaskedRequest`/
+      in this PR's own CI. `cargo deny check`/`cargo audit` FAILED in this PR's real CI at the
+      time on the pre-existing `RUSTSEC-2026-0285` (rustls 0.23.44) finding — not a regression
+      this milestone introduced, and **closed 2026-09-16** by a separate, standalone bump (see
+      `docs/decisions.md`'s 2026-09-16 entry; `main`'s own real CI is fully green as of that
+      merge). **Named, not solved by this milestone:** `MaskedRequest`/
       `MaskRequestError` are reused as-is by the `Codec` trait rather than pre-generalized for
       a second codec (H3's own open question); `upstream::forward`'s new header parameter is a
       caller-trusted slice with no self-enforced policy, unlike the pre-H2b fixed constant
-      (named explicitly in `upstream.rs`'s own doc comment, not silently accepted). H2c (bounds
-      and timeouts) and H1 (Codex interception spike) remain open under the same intent.
+      (named explicitly in `upstream.rs`'s own doc comment, not silently accepted). **Update
+      2026-09-16: H2c and H1 have since both landed too — see their own entries below and
+      the intent's `provisionally_confirmed` status; this "remain open" note is stale and
+      kept only for the historical record of what was true when this entry was written.**
 - [x] **Track H, H2c — request/response bounds and five named timeouts — BUILT 2026-09-15**
       (same intent `INT-2026-09-14-001`, built on H2b's own branch to avoid a conflict since
       both touch `upstream.rs`/`server.rs`). Closes plan §1.2 item 9 in both directions:
@@ -197,11 +199,54 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       correct implementation. `scripts/a2-live-proof.sh` re-run and passing; `cargo
       build/clippy/fmt/test --locked` (three repeated full runs, no flakes, both before and
       after the Codex fixes) and `cargo bench --workspace --locked --no-run` all clean. Same
-      `cargo deny check`/`cargo audit` caveat as H2b's own entry: local runs are clean only
-      because of an unrelated, uncommitted `RUSTSEC-2026-0285` fix carried in the working tree —
-      this branch's own committed `Cargo.lock` is untouched and will show the same pre-existing,
-      separately-tracked failure in real CI. H1 (Codex interception spike) remains open under
-      the same intent.
+      `cargo deny check`/`cargo audit` caveat as H2b's own entry at the time — **closed
+      2026-09-16**, see H2b's entry above and `docs/decisions.md`'s 2026-09-16 entry.
+      **Update 2026-09-16: H1 has since landed too — see its own entry below.**
+- [x] **Track H, H1 — Codex interception + auth spike — SPIKE COMPLETE 2026-09-15/16, WITH
+      FOUR NAMED, USER-ACCEPTED SCOPE DEVIATIONS** (same intent `INT-2026-09-14-001`, now
+      `provisionally_confirmed`). Live-run against the real, installed `codex` CLI (0.153.4)
+      under real ChatGPT subscription auth found: `openai_base_url` via `-c` override and a
+      custom `model_providers.veil` entry (`requires_openai_auth=true`) both work and
+      reproduce; the real backend behind ChatGPT-authed Codex traffic is
+      `chatgpt.com/backend-api/codex/*`, NOT `api.openai.com` — a client speaking
+      OpenAI-public-API-shaped paths against a relay that preserves them 1:1 never reaches a
+      working backend, a new, real path-rewrite requirement the Anthropic codec doesn't have;
+      `codex.transport.fallback_to_http` (WebSocket-upgrade-attempt-then-HTTP-fallback)
+      confirmed real with an exact log line. Two adversarial review rounds (fresh-context
+      subagent, then Codex cross-model) found the first write-up's retained corpus had real
+      privacy defects — most seriously, a real ChatGPT account id nearly committed twice
+      (once via an under-scoped scrubber, once via a regression test that accidentally
+      hardcoded the real value). Both fixed; the corpus was ultimately replaced entirely with
+      a 5-entry hand-authored **synthetic** artifact (Codex's own recommendation, validated by
+      a third model, Fable, before implementation) rather than continuing to try to safely
+      redact a real one. **Four resulting deviations from H1's own original confirmation
+      criteria, put to the human operator together and accepted, recorded as a real amendment
+      to the governing intent** (not only in this repo's own docs): (1) API-key auth mode
+      (`env_key`) untested — no `OPENAI_API_KEY` authorized; (2) F12's specific
+      `supports_websockets=false` pin mechanism untested, deferred to H3; (3) test-order item
+      (d) — the `network_proxy`/`respect_system_proxy` config keys — **not performed at all**
+      (a *different*, adjacent `HTTPS_PROXY` env-var experiment was tried and reproducibly
+      failed: a real `CONNECT`-tunnel rejection with no observed fallback); (4) the corpus is
+      synthetic-structure, not a redacted real capture. Full account, both corrections shown
+      rather than hidden, in `docs/decisions.md`'s "Track H, H1" entry.
+- [ ] **Track H, next milestones (H2a/H3/H4/H5) — not started.** H2a (canonical `Origin` type
+      + per-origin routing) is now unblocked — its type shape was frozen only after H1's
+      verdict, which has now landed. H3 (OpenAI Responses codec) is built against H1's real
+      transport/path/header-name findings and its synthetic structural corpus, not a real
+      traffic sample (H1 could not safely retain one — see H1's own entry above). H4 (Codex
+      harness launch profile + live proof) needs H0 (blocked on Track 1's A3, still not
+      landed) in addition to H1/H2a/H2b/H3. H5 (CONNECT transport + process-scoped CA) is
+      conditional — only needed if H1's config-redirect mechanisms prove insufficient, which
+      they did not (both `openai_base_url` and the custom-provider path work). Real,
+      unstarted follow-up work named in H1's own entry: a Codex header-forwarding policy
+      mirroring H2b's `AnthropicCodec::select_headers` (real header names now known —
+      `chatgpt-account-id`, `session-id`, `thread-id`, `originator`, `x-codex-*`,
+      `openai-beta`, `Sec-WebSocket-*`); a real `CONNECT`-capable relay/proxy to actually test
+      the `network_proxy`/`respect_system_proxy` config keys and investigate the
+      `HTTPS_PROXY` inconsistency H1 found; `scripts/h1-fixtures/scrub.py`'s own module doc
+      now names a real, unfixed structural blind spot (real environment data embedded in
+      request bodies as ordinary JSON, not token-shaped) that any future real-capture attempt
+      needs a genuinely different approach for, not a bigger regex.
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`
