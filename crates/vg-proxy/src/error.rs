@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -60,5 +62,31 @@ pub enum ProxyError {
     #[error("failed to send request to upstream: {0}")]
     UpstreamSend(#[source] hyper::Error),
     #[error("failed to read upstream response body: {0}")]
-    UpstreamResponseBody(#[source] hyper::Error),
+    UpstreamResponseBody(#[source] Box<dyn std::error::Error + Send + Sync>),
+    // Track H, H2c: bounds and timeouts (plan §4/§1.2 item 9). Five separately-named timeouts,
+    // each its own variant so a caller (and a test) can tell exactly which one fired.
+    #[error("connecting to upstream {host}:{port} took longer than {timeout:?}")]
+    UpstreamConnectTimeout {
+        host: String,
+        port: u16,
+        timeout: Duration,
+    },
+    #[error(
+        "sending the request to {host} and receiving its response headers together took longer \
+         than {timeout:?} (this budget covers request upload as well as the wait for headers)"
+    )]
+    UpstreamResponseHeadersTimeout { host: String, timeout: Duration },
+    #[error(
+        "upstream {host} went idle for longer than {timeout:?} while reading the response body \
+         (streaming={streaming})"
+    )]
+    UpstreamIdleTimeout {
+        host: String,
+        timeout: Duration,
+        streaming: bool,
+    },
+    #[error("the request to upstream {host} took longer than {timeout:?} in total")]
+    UpstreamTotalRequestTimeout { host: String, timeout: Duration },
+    #[error("upstream response body exceeded the {limit}-byte bound")]
+    UpstreamResponseTooLarge { limit: usize },
 }

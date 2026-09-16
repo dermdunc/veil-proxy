@@ -163,6 +163,45 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       caller-trusted slice with no self-enforced policy, unlike the pre-H2b fixed constant
       (named explicitly in `upstream.rs`'s own doc comment, not silently accepted). H2c (bounds
       and timeouts) and H1 (Codex interception spike) remain open under the same intent.
+- [x] **Track H, H2c — request/response bounds and five named timeouts — BUILT 2026-09-15**
+      (same intent `INT-2026-09-14-001`, built on H2b's own branch to avoid a conflict since
+      both touch `upstream.rs`/`server.rs`). Closes plan §1.2 item 9 in both directions:
+      `server.rs::collect_body` (previously an unbounded `.collect()`) and
+      `upstream.rs::buffer_response` are both now bounded (`MAX_REQUEST_BODY_BYTES` 32 MiB,
+      `MAX_RESPONSE_BODY_BYTES` 64 MiB, the latter configurable per `UpstreamConfig` for
+      testing) — an oversized body fails closed (413 request-side, mapped-502 response-side),
+      never OOMing. Five separately-named timeouts (`upstream.rs::Timeouts`): `connect`,
+      `response_headers`, `idle_body`, `streaming_idle` (300s, matching GROUND-13/14's real
+      Claude Code/Codex vendor numbers so a genuinely slow-but-alive stream survives),
+      `total_request` — each with its own dedicated, fast (no real multi-minute wait) test in
+      the new `crates/vg-proxy/tests/upstream_timeouts.rs` (8 tests), plus a "survives" test
+      proving a real mid-length pause under `streaming_idle` doesn't get killed. A
+      fresh-context single-model review found and fixed two real bugs, both in the test suite
+      itself, not the production code: a near-zero connect-timeout test that flaked under load
+      (raced against a real fast connect, non-deterministically), fixed by switching to a
+      real, reliably-unanswered target (`192.0.2.1`, RFC 5737 TEST-NET-1); and a classic
+      async-Rust footgun (an `_stream`-named closure parameter never referenced inside its
+      `async move` body, so it dropped — closing the connection — before the future was ever
+      polled). A following Codex cross-model pass found and fixed four more real issues (full
+      account in `docs/decisions.md`'s 2026-09-15 entry): the strengthened slow-stream test's
+      original single-pause design didn't actually distinguish correct per-frame idle-reset from
+      a fixed-deadline regression (rewritten to two gaps summing over the budget, each
+      individually under it); `response_headers`'s own doc/error wording overclaimed its scope
+      (it also covers request upload, not just waiting for headers); the revised connect-timeout
+      test's TEST-NET-1 approach was itself non-hermetic (RFC 5737 only recommends, doesn't
+      guarantee, silent dropping — the critique's own sandbox got an immediate
+      `PermissionDenied` there) — replaced with a deterministic loopback TLS-stall design that
+      also newly covers `connect`'s TLS-handshake half; and SSE content-type matching was
+      neither exact nor case-insensitive, and duplicated between `upstream.rs` and `server.rs`
+      (a pre-existing A2 bug this milestone copied into a second location) — now one shared,
+      correct implementation. `scripts/a2-live-proof.sh` re-run and passing; `cargo
+      build/clippy/fmt/test --locked` (three repeated full runs, no flakes, both before and
+      after the Codex fixes) and `cargo bench --workspace --locked --no-run` all clean. Same
+      `cargo deny check`/`cargo audit` caveat as H2b's own entry: local runs are clean only
+      because of an unrelated, uncommitted `RUSTSEC-2026-0285` fix carried in the working tree —
+      this branch's own committed `Cargo.lock` is untouched and will show the same pre-existing,
+      separately-tracked failure in real CI. H1 (Codex interception spike) remains open under
+      the same intent.
 - [x] **Precision NO-GO — CLOSED AND MERGED** as `6f4ea5d` (PR #37). `vg bench` verdict is now
       **GO**, false-positive rate **0.0%** (was 16.7%). Four doubt-pass rounds run, STOP signal
       reached. Branch `agent/claude/t10-fp-detector-fixes`
