@@ -2,6 +2,14 @@
 
 **Status:** proposed, not ratified. Supersedes nothing until reviewed; see `docs/decisions.md`.
 
+**Update 2026-09-14 (same day, later session):** fork **F1** (§7) is decided — the user chose to
+widen the beta bar to require Codex parity, against this plan's own recommendation. Ratified as
+`D-BETA-8` in `veil-ecosystem/docs/decisions.md`, which is now the source of truth for whether
+Track H gates the beta; every other statement in this document assuming F1 resolved to "no" (the
+§0 summary line, §6's "nothing in this track gates the ratified beta bar") is stale and not
+edited to match, per this document's own evidence-trail discipline — see §7's F1 row for the
+decision record.
+
 **Date:** 2026-09-14 (consolidation pass; draft 2026-09-14)
 
 **Provenance — this is the third and final stage of a three-stage pipeline**, deliberately the
@@ -543,7 +551,7 @@ in this consolidation, mostly from critique #24.
 
 | # | Fork | Options | Plan's recommendation | Decide before |
 |---|---|---|---|---|
-| **F1** | Does Track H gate the beta? | (a) beta ships Claude-only, Track H lands after; (b) Codex support joins the beta bar | **(a)** — the ratified bar's condition 1 names Claude Code only; widening it re-opens a ratified decision and adds 16-35 sessions to the critical path | H1 start |
+| **F1** | Does Track H gate the beta? **DECIDED 2026-09-14 — (b), overriding this plan's own recommendation.** | (a) beta ships Claude-only, Track H lands after; (b) Codex support joins the beta bar | **(a)** was this plan's recommendation — the ratified bar's condition 1 named Claude Code only; widening it re-opens a ratified decision and adds 16-35 sessions to the critical path. **The user chose (b) instead**, via explicit `AskUserQuestion`, specified as full Codex parity: Track H's H0 through H4 complete (H5 only if H1's own spike verdict forces it) before any beta user is onboarded. Ratified as `D-BETA-8` in `veil-ecosystem/docs/decisions.md` (2026-09-14), which also reworks `beta-implementation-plan.md` §1 condition 1 and §5's critical path — see that entry for the schedule consequence, not re-derived here. This plan's own out-of-scope framing in §6 ("nothing in this track gates the ratified beta bar") and the summary line in §0 are now stale and superseded by that ratification; left as originally written elsewhere in this document as a record of the plan's own reasoning at merge time, not silently edited to match. | ~~H1 start~~ — decided |
 | **F2** | Non-allowlisted CONNECT targets under H5 | (a) **reject unknown by default**, with a *separately verified* allowlist of destinations proven not to carry model context; (b) tunnel raw everything non-terminated | **(a) — inverted from the draft** (critique #1, accepted). Tunnelling every unknown target is fail-open for the product's whole purpose: if a vendor moves model traffic to a new hostname, WebSocket endpoint, regional origin, or auth-dependent backend, Veil forwards the prompt unmasked and per-target counts only report the leak afterwards. Verified as a live hazard, not hypothetical: Codex 0.153.4 carries model context to **two** distinct origins depending on auth mode (`api.openai.com`, `chatgpt.com/backend-api/codex`). The invariant is not "terminate only exact origins" but **"model-bearing traffic never tunnels."** Operability cost is paid by curating the tunnel allowlist from H1's real observations, with per-target counts (never contents) in the local audit log. | H5 build |
 | **F3** | Migrate Claude Code onto mechanism B eventually? | (a) keep base-URL redirect indefinitely; (b) converge both harnesses on B post-beta | Defer — no evidence yet that B is strictly better in practice; re-open after H4/H5 with two live proofs in hand | Not before H5 exists |
 | **F4** | Header-forwarding policy shape, **including unknown prefixed headers** | (a) fixed enum per codec; (b) prefix allowlist + named singletons; (c) forward-all minus denylist | **(b)**, with two additions per critique #19: an explicit **denylist of credential-shaped names** that wins over any prefix match, and unknown-but-prefix-matching headers **counted (never logged by value)** with a per-release review of what actually appeared. Exact lists: `anthropic-*`/`x-claude-code-*` for the Anthropic codec; the OpenAI-side list from H1's real captured traffic, not guessed. Anthropic names specific required headers; it does not warrant a whole prefix as safe — that is Veil's choice and Veil owns the residual. | H2b merge |
