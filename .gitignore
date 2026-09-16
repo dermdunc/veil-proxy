@@ -53,6 +53,12 @@ CLAUDE.md
 CODEX.md
 .env.example
 
+# Local-only scriptorium-lab context-pilot corpus (2026-09-16): a hand-authored knowledge
+# mirror of this repo's own decisions/risks, read by `scriptorium context` for task-scoped
+# agent context during dev sessions. Same boundary as AGENTS.md/CLAUDE.md above -- describes
+# internal factory tooling, not the product, never ships in the public repo.
+knowledge/
+
 # >>> hekton-boundary (secret-sauce audit 2026-07-31) >>>
 # Control plane, vault mirror and agent config: never ship in a public repo.
 # Files stay on disk; only the published tree changes.
@@ -71,4 +77,5 @@ scripts/setup-hooks.sh
 AGENTS.md
 CLAUDE.md
 CODEX.md
+knowledge/
 # <<< hekton-boundary <<<
