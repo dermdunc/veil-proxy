@@ -12,10 +12,10 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::codec::MaskRequestError;
 use crate::daemon::Daemon;
 use crate::error::ProxyError;
-use crate::mask_request::MaskRequestError;
-use crate::route::{classify, RouteVerdict};
+use crate::route::RouteVerdict;
 use crate::session::NAMESPACE_HEADER;
 use crate::upstream::{self, UpstreamConfig};
 
@@ -143,12 +143,12 @@ async fn handle(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
 
-    match classify(&method, &target) {
+    match daemon.classify_route(&method, &target) {
         RouteVerdict::Block => Ok(block_response(&method, &target)),
         RouteVerdict::Mask => {
             Ok(handle_mask(req, &method, &target, &daemon, upstream, local_addr).await)
         }
-        RouteVerdict::Pass => Ok(handle_pass(req, &method, &target, upstream).await),
+        RouteVerdict::Pass => Ok(handle_pass(req, &method, &target, &daemon, upstream).await),
     }
 }
 
@@ -181,7 +181,16 @@ async fn handle_mask(
             Err(err) => return internal_error_response(&err),
         };
 
-    match upstream::forward(upstream, method.clone(), target, &headers, masked_body).await {
+    let selected_headers = daemon.select_headers(&headers);
+    match upstream::forward(
+        upstream,
+        method.clone(),
+        target,
+        &selected_headers.forward,
+        masked_body,
+    )
+    .await
+    {
         Ok(resp) => {
             // M4: demask the response before it reaches the client — the whole point of the
             // proxy. Infallible (see `demask_response`'s own doc): a malformed/unexpected
@@ -252,6 +261,7 @@ async fn handle_pass(
     req: Request<Incoming>,
     method: &Method,
     target: &str,
+    daemon: &Daemon,
     upstream: UpstreamConfig,
 ) -> Response<Full<Bytes>> {
     let headers = req.headers().clone();
@@ -260,7 +270,16 @@ async fn handle_pass(
         Err(resp) => return resp,
     };
 
-    match upstream::forward(upstream, method.clone(), target, &headers, body).await {
+    let selected_headers = daemon.select_headers(&headers);
+    match upstream::forward(
+        upstream,
+        method.clone(),
+        target,
+        &selected_headers.forward,
+        body,
+    )
+    .await
+    {
         Ok(mut resp) => {
             resp.headers_mut()
                 .insert("x-vg-proxy-verdict", HeaderValue::from_static("pass"));
