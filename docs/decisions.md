@@ -5395,6 +5395,9 @@ H2b's own scope). Not a regression this milestone introduced — the same findin
 fixed on a separate branch, not yet mergeable due to the same guardrail this session cannot
 self-bypass. Will go green once that fix merges (or is rebased into this branch).
 
+**Update 2026-09-16: closed.** See this file's own "`RUSTSEC-2026-0285` CLOSED" entry below —
+`main`'s real CI is fully green.
+
 ## 2026-09-15 — Track H, H2c BUILT: request/response bounds and five named timeouts
 
 Second milestone under intent `INT-2026-09-14-001` (veil-ecosystem), built on top of H2b's
@@ -5514,6 +5517,9 @@ entry above) — so a local "clean" result does not describe what this branch's 
 `Cargo.lock` (untouched, still at the vulnerable 0.23.44) will show in real CI. Expect the same
 `cargo-deny check`/`cargo-audit` failures H2b's PR shows, for the same pre-existing, separately-
 tracked, not-yet-mergeable reason — not a new or different finding.
+
+**Update 2026-09-16: closed.** See this file's own "`RUSTSEC-2026-0285` CLOSED" entry below —
+`main`'s real CI is fully green.
 
 **Verification.** `cargo build --workspace --all-targets`, `cargo test --workspace --locked`
 (three full repeated runs, no flakes, including the two new test files —
