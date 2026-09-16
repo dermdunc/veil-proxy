@@ -5790,3 +5790,21 @@ predate this final synthetic-corpus swap and the F7/F11/F12/(d) wording fixes ab
 entry's own author re-verified the specific changes (the grep above, a re-read of every edited
 paragraph against each reviewer's exact finding, `test_scrub.py` re-run green) rather than
 running a fourth external pass, a proportionality judgment named here rather than left implicit.
+
+## 2026-09-16 — `RUSTSEC-2026-0285` CLOSED: rustls bumped 0.23.44 → 0.23.45, main CI fully green
+
+Closes the pre-existing `cargo-deny check`/`cargo-audit` failure named across every recent PR
+(H2b/H2c/H1's own decisions.md entries above) — this session's own uncommitted rustls fix,
+repeatedly blocked from landing by this machine's `Cargo.lock` git-guardrail (no agent-side
+bypass by design), was finally committed by the human operator directly. `Cargo.toml` already
+declares `rustls = "0.23"` (compatible with any `0.23.x`), so this is a lockfile-only bump —
+`cargo update -p rustls` — with no source changes.
+
+**Verification.** `cargo build/clippy/fmt/test --locked` and `cargo bench --workspace --locked
+--no-run` all clean locally before commit; PR `veil-proxy#80`'s own real CI ran all 7 jobs green,
+`cargo-audit`/`cargo-deny check` included, confirmed via `gh pr checks 80 --watch` before asking
+for merge. After merge, `main`'s own push-triggered CI run
+(`https://github.com/dermdunc/veil-proxy/actions/runs/35122672528`) re-confirmed all 7 jobs green,
+checked directly rather than assumed from the PR's own run. This closes the last open item from
+H2b/H2c/H1's own "known pre-existing gap" disclosures — `main` now has zero known findings across
+`cargo-audit`/`cargo-deny check`.

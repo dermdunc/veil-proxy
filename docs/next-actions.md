@@ -800,3 +800,10 @@ displace it for long.
       environment data embedded in request bodies as ordinary JSON, not token-shaped) —
       any future real-capture attempt needs a genuinely different approach, not a bigger
       regex.
+
+## Session Update: 2026-09-16 — `RUSTSEC-2026-0285` CLOSED
+
+- [x] ~~rustls bump (0.23.44 → 0.23.45), blocked all session by this machine's `Cargo.lock`
+      git-guardrail~~ — landed by the human operator directly (`veil-proxy#80`), real CI
+      confirmed all 7 jobs green including `cargo-audit`/`cargo-deny check`. `main` now has
+      zero known findings across audit/deny. See `docs/decisions.md`'s 2026-09-16 entry.
