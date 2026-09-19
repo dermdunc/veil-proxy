@@ -85,3 +85,9 @@ knowledge/
 # own doc comment). Never committed raw — only scripts/h1-fixtures/sanitized/*.jsonl,
 # produced by running scrub.py over a raw capture, is ever meant to reach git.
 scripts/h1-fixtures/raw/
+
+# --- Hekton open-core boundary (retrofit) ---
+# Factory-internal artefacts. Untracked 2026-09-19; they remain in the
+# working tree and in this repo's history. See the private sibling for the
+# canonical copies.
+docs/retire-promote-review.md
