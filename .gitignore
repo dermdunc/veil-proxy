@@ -88,6 +88,7 @@ scripts/h1-fixtures/raw/
 
 # --- Hekton open-core boundary (retrofit) ---
 # Factory-internal artefacts. Untracked 2026-09-19; they remain in the
-# working tree and in this repo's history. See the private sibling for the
-# canonical copies.
+# working tree and in this repo's history.
+# Corrected 2026-09-19: no private-sibling repo exists for this project --
+# the original comment's claim was false, found by adversarial review.
 docs/retire-promote-review.md
