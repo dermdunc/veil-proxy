@@ -15,3 +15,24 @@ c1f58e2caf8580648188f91b2fd15897cae44951:crates/vg-core/tests/pipeline.rs:generi
 fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:179
 fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:234
 fdb3a8eaba45062a4689841781573d1ce226e926:crates/vg-detectors/src/entropy.rs:generic-api-key:242
+
+# Track H triage (2026-09-19), found by adversarial (codex) review of a false "gitleaks
+# clean" claim elsewhere in the repo's history -- these 12 are a genuinely separate set
+# from the 11 above (different files, added after the 2026-08-30 triage), confirmed false
+# positives by direct inspection, not assumed from filename alone. h1-fixtures/ files
+# self-document "synthetic-structure-only, not a redacted real capture... all values are
+# fake" inline; the two golden.json fixtures use sequential hex bytes
+# (0102030405060708...) and a textbook example JWT payload ({"sub":"1234567890"}), the
+# standard shape of synthetic test data, not real key material.
+411b8992a6f043766e47ec7b98b1f5195900cc96:crates/vg-core/tests/fixtures/custodian/key-ref-golden.json:generic-api-key:5
+411b8992a6f043766e47ec7b98b1f5195900cc96:crates/vg-core/tests/fixtures/edge_event_v1_ecdsa_golden.json:generic-api-key:16
+a627cdfd96eeef74ecbafe003f4b26204d29e821:crates/vg-core/tests/fixtures/edge_event_v2_ecdsa_golden.json:generic-api-key:16
+250f7e039fb0ebaf9eb3b1d68b5ea0c908fadb8a:scripts/h1-fixtures/sanitized/h1-spike-01.jsonl:generic-api-key:2
+3cfb916040421d12e2a1790ac71f1878d51ba1b6:scripts/h1-fixtures/sanitized/h1-spike-01.jsonl:generic-api-key:2
+c0baa6f742f6202cefaa112adf9777d7cf051f0e:scripts/h1-fixtures/sanitized/h1-spike-01.jsonl:generic-api-key:2
+250f7e039fb0ebaf9eb3b1d68b5ea0c908fadb8a:scripts/h1-fixtures/test_scrub.py:jwt:61
+3cfb916040421d12e2a1790ac71f1878d51ba1b6:scripts/h1-fixtures/test_scrub.py:jwt:61
+c0baa6f742f6202cefaa112adf9777d7cf051f0e:scripts/h1-fixtures/test_scrub.py:jwt:61
+250f7e039fb0ebaf9eb3b1d68b5ea0c908fadb8a:scripts/h1-fixtures/test_scrub.py:generic-api-key:115
+3cfb916040421d12e2a1790ac71f1878d51ba1b6:scripts/h1-fixtures/test_scrub.py:generic-api-key:115
+c0baa6f742f6202cefaa112adf9777d7cf051f0e:scripts/h1-fixtures/test_scrub.py:generic-api-key:115
