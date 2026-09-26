@@ -5922,3 +5922,54 @@ client gets the real value in the tool call, the replayed thinking block reaches
 byte-identical via the issued record, and no raw vault value appears in either upstream body.
 **Not yet done:** a live run against the real API with the default model and thinking on. That
 is the acceptance gate, owned by veil-demo's re-run of `spikes/phase-1a/` after a pin bump.
+
+## 2026-09-26 — Dev-only wire capture in `handle_mask` (`capture` feature) + A2 egress assertion made real
+
+**Trigger.** veil-demo's `/agent` evidence plan needs the exact bytes vg-proxy sends upstream
+and receives back. `scripts/a2-live-proof.sh`'s masking-before-egress check only grepped the
+harness's own stdout/stderr, which never contains request bodies, so a pure pass-through
+proxy would have passed it. veil-demo's plan (`docs/agentic-demo-plan.md` §4.1, amended by
+its §10 Q1 ruling) proposed this change on veilgremlin's own terms: the A2 fix is what
+justifies it here.
+
+**Decision.**
+- New `crates/vg-proxy/src/capture.rs`, compiled **only** with `--features capture` (the
+  feature is off by default). A default build does not contain the code, so no environment
+  variable can switch a production daemon into capturing.
+- With the feature compiled in, capture is still off unless `VG_PROXY_CAPTURE_DIR` is set
+  (read once per process). This is the first env read in vg-proxy, confined to the
+  feature-gated module.
+- Hooked in `handle_mask` only: the masked request right before `upstream::forward`, and the
+  buffered upstream response right before demasking. It is deliberately **not** in
+  `upstream::forward`, which `handle_pass` also calls with *unmasked* bodies; capturing there
+  would falsify the artifact's "nothing raw crossed the wire" claim.
+- Bodies only, never headers (keeps the forwarded credential out of the artifact; not a
+  safety boundary, since vg-proxy holds it regardless). Files are numbered
+  `NNNNNN-request.masked.json` / `NNNNNN-response.raw.{sse,json}`. Requests that fail closed
+  write nothing.
+- A write failure logs the file name to stderr and never alters the proxied request. Consumers
+  detect gaps by pairing request and response files, as A2 now does.
+- `a2-live-proof.sh` builds and runs the harness with the feature and a temp capture dir, then
+  asserts against the captured outbound bytes. The **positive** check requires the planted
+  value's placeholder at the prompt's own wording (`The synthetic test value is: EMAIL_\d+`).
+  It is anchored there because the CLI injects the account email, which also masks to
+  `EMAIL_…` and would satisfy a bare pattern for the wrong reason. The **negative** check
+  requires the raw value to be absent from every captured request. The old log grep is kept
+  as a secondary check.
+
+**Verification.**
+- New `tests/capture.rs` (its own test binary, because the env var is process-global)
+  exercises three routes: a Mask request (captured byte-for-byte equal to what the mock
+  upstream received; raw email absent, `EMAIL_001` present; the response capture equals the
+  upstream's pre-demask bytes), a Pass request carrying a raw value (forwarded raw by design,
+  **not** captured), and a Mask request that fails closed on an image block (not captured).
+  A mutation (capturing the pre-mask body) fails the test.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -D warnings`
+  (default) and `cargo clippy -p vg-proxy --all-targets --features capture -D warnings` are
+  clean. 560 workspace tests pass (default); 100 `vg-proxy` tests pass with `capture`.
+- `scripts/a2-live-proof.sh` was run live against the real API: PASS (1 outbound request
+  captured, placeholder present, raw absent).
+
+**Protected path:** `crates/vg-proxy/Cargo.toml` gains `[features] capture = []`. It was
+committed by the human operator per this machine's git-guardrail, like the 2026-09-16 rustls
+bump.

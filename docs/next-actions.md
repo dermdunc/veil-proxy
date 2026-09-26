@@ -876,3 +876,11 @@ displace it for long.
       git-guardrail~~ — landed by the human operator directly (`veil-proxy#80`), real CI
       confirmed all 7 jobs green including `cargo-audit`/`cargo-deny check`. `main` now has
       zero known findings across audit/deny. See `docs/decisions.md`'s 2026-09-16 entry.
+
+## 2026-09-26 — `capture` feature + A2 egress assertion
+
+- [x] Dev-only `handle_mask` wire capture (`--features capture` + `VG_PROXY_CAPTURE_DIR`) and a
+      real masking-before-egress assertion in `scripts/a2-live-proof.sh`. See `docs/decisions.md`.
+- [ ] Human: commit `crates/vg-proxy/Cargo.toml` (adds the `capture` feature; protected path).
+- [ ] CI does not exercise `--features capture` yet. Consider adding
+      `cargo test -p vg-proxy --features capture` to the test job.
