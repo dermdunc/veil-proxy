@@ -229,6 +229,30 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
       failed: a real `CONNECT`-tunnel rejection with no observed fallback); (4) the corpus is
       synthetic-structure, not a redacted real capture. Full account, both corrections shown
       rather than hidden, in `docs/decisions.md`'s "Track H, H1" entry.
+- [x] **`veil-proxy#86` — real multi-turn Claude Code sessions through vg-proxy (2026-09-26).**
+      Filed by veil-demo's Phase 1a spike. Thinking blocks in history no longer fail closed
+      (issued-block record + verbatim replay, masking fallback, strict shape/role checks);
+      streamed `input_json_delta` tool input is now demasked losslessly; the entropy detector's
+      path mode stops redacting ordinary paths with short mixed segments; the spaced/hex-dump
+      detection gap is filed as `RISK-0015` with known-gap tests. Full record: `docs/decisions.md`
+      2026-09-26 entry.
+- [ ] **Live acceptance for `#86`:** veil-demo bumps its veilgremlin pin to the merge commit and
+      re-runs `spikes/phase-1a/` with the default model and thinking on. Pass = the session
+      completes ≥5 turns with no 400, and the first `Edit` on the IBAN line succeeds. This also
+      settles the one unverified question: whether the API checks or rejects altered prior-turn
+      thinking (the design is safe either way).
+- [ ] **`RISK-0015` mitigation design note:** a normalising pre-pass over `tool_result` content
+      (whitespace-collapsed single-character runs, decoded hex) mapping hits back to original
+      spans; weigh CPU and false-positive cost. Flip `crates/vg-detectors/tests/known_gaps.rs`
+      if it lands.
+- [ ] **`#86` finding 5 follow-ups (informational, no urgency):** decide whether
+      `metadata.user_id` (device/account/session ids, forwarded unmasked by design) should be
+      masked or stripped; review the forwarded `anthropic-dangerous-direct-browser-access` header
+      under F4.
+- [ ] **Precision corpus for the entropy detector:** no real Claude Code request bodies were
+      kept by the spike, so `#86` finding 3's fix has a synthetic before/after only. A scrubbed
+      corpus (same F15 governance as `scripts/h1-fixtures/`) would let path-mode precision be
+      measured on real traffic.
 - [ ] **Track H, next milestones (H2a/H3/H4/H5) — not started.** H2a (canonical `Origin` type
       + per-origin routing) is now unblocked — its type shape was frozen only after H1's
       verdict, which has now landed. H3 (OpenAI Responses codec) is built against H1's real

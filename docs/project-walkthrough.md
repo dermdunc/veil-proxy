@@ -23,6 +23,7 @@ The product is built and working end to end. A hardened Rust core does the maski
 - **An append-only audit log** that records what was masked, blocked, and demasked, without storing raw values.
 - **A Claude Code adapter and the `vg` CLI**, so the same engine the hooks use is also driveable by hand (`vg run`, `vg inspect`, `vg diff`, `vg demask`, `vg audit`).
 - **A Go/No-Go eval harness** (`vg bench`) that runs the whole thing over a synthetic corpus and prints a verdict.
+- **A local masking proxy** (`vg-proxy`) that sits between Claude Code and the model API: it masks each request before it leaves the machine and puts the real values back into the reply. As of 2026-09-26 it handles real multi-turn, tool-using sessions: the model's own "thinking" is carried back and forth untouched, tool calls come back with real values so edits land on the real file, and ordinary file paths are no longer mistaken for secrets (issue `veil-proxy#86`). A live re-run by veil-demo is still the final check.
 
 ## How the pieces fit together
 
@@ -30,7 +31,7 @@ The core does the work on a deterministic "hot path": parse → detect → vault
 
 ## What it does NOT do yet, and what it does not claim
 
-- **Detection is measured, not perfect.** The eval harness returned a NO-GO on precision: too many false positives (see "Current confidence"). Separately, there is a known false-negative class: low-entropy or prose-style passwords, structured licence keys, and dotenv-shaped content with no filename hint can currently pass through undetected. So the plain promise is "the cloud model sees placeholders instead of the values the detectors caught", not "no real value can ever leak".
+- **Detection is measured, not perfect.** The eval harness returned a NO-GO on precision: too many false positives (see "Current confidence"). Separately, there is a known false-negative class: low-entropy or prose-style passwords, structured licence keys, and dotenv-shaped content with no filename hint can currently pass through undetected. So the plain promise is "the cloud model sees placeholders instead of the values the detectors caught", not "no real value can ever leak". One concrete case, seen in a real session: if a tool prints a file one character at a time (`od -c`), no detector recognises the pieces, and the model can reassemble the value (`RISK-0015`).
 - **Demask authorisation is attribution, not authentication.** Reversal is explicit, local, and audited, but in this single-user Phase 1 the `--actor`/`--role` labels are self-asserted for the audit trail, not an enforcement gate. The genuine boundary is the hard-deny on sending raw values to a remote model or observability sink. Tightening the actor gate is a follow-up.
 - **Warm-path local NER** (GLiNER) is designed but off by default.
 - **LiteLLM gateway, MCP server mode, CI/CD mode, cloud-agent packaging** are later phases.

@@ -35,6 +35,16 @@ pub(crate) enum ContentBlockKind {
     Document,
     /// `{"type": "image", ...}` — blocks the whole request (plan §10.2, unchanged).
     Image,
+    /// `{"type": "thinking", "thinking": "...", "signature": "..."}` — a model-issued extended-
+    /// thinking block the client replays in `messages[]` history (veil-proxy#86 finding 1:
+    /// classifying it `Unknown` failed every real default Claude Code session closed at the
+    /// first request after a thinking turn). Only the `thinking` text is masked; `signature`
+    /// is never touched. See `mask_request.rs`'s module doc for the round-trip design.
+    Thinking,
+    /// `{"type": "redacted_thinking", "data": "..."}` — API-encrypted, opaque thinking content.
+    /// Forwarded unchanged: there is no plaintext to mask, and masking its ciphertext (which the
+    /// entropy detector would flag) would corrupt it.
+    RedactedThinking,
     /// Anything else, including a missing or non-string `"type"` field. Blocks the whole
     /// request — the fail-closed default for a shape this crate doesn't recognize.
     Unknown(String),
@@ -52,6 +62,8 @@ impl ContentBlockKind {
             Some("tool_result") => Self::ToolResult,
             Some("document") => Self::Document,
             Some("image") => Self::Image,
+            Some("thinking") => Self::Thinking,
+            Some("redacted_thinking") => Self::RedactedThinking,
             Some(other) => Self::Unknown(other.to_string()),
             None => Self::Unknown(String::new()),
         }
@@ -85,6 +97,14 @@ mod tests {
         assert_eq!(
             ContentBlockKind::of(&json!({"type": "image"})),
             ContentBlockKind::Image
+        );
+        assert_eq!(
+            ContentBlockKind::of(&json!({"type": "thinking", "thinking": "", "signature": ""})),
+            ContentBlockKind::Thinking
+        );
+        assert_eq!(
+            ContentBlockKind::of(&json!({"type": "redacted_thinking", "data": "x"})),
+            ContentBlockKind::RedactedThinking
         );
     }
 

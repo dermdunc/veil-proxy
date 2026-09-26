@@ -14,21 +14,32 @@
 //! (across the *whole* stream, not a bounded window) before rehydration is ever attempted, so it
 //! is never demasked as two separate, unresolvable fragments.
 //!
-//! **Only `text_delta` content is demasked.** Every other event kind — `message_start`,
-//! `content_block_start`, `content_block_stop`, `message_delta`, `message_stop`, `ping`, tool-use
-//! `input_json_delta` fragments, thinking-block deltas, anything this parser doesn't specifically
-//! recognize — round-trips unchanged, matching `demask_response.rs`'s own "text-bearing fields
-//! only" scope precedent (`BLOCK_METADATA_KEYS`) rather than a new policy decision. Extending
-//! demasking to tool-use/thinking content is out of scope here, same as it is for
-//! `demask_response.rs`'s non-streaming path.
+//! **`text_delta` and `input_json_delta` content is demasked.** Every other event kind —
+//! `message_start`, `content_block_start`, `content_block_stop`, `message_delta`,
+//! `message_stop`, `ping`, `thinking_delta`/`signature_delta`, anything this parser doesn't
+//! specifically recognize — round-trips unchanged. Thinking is left alone on purpose: the client
+//! replays it verbatim and the API checks it against its signature (veil-proxy#86 finding 1, see
+//! `mask_request.rs`'s module doc).
+//!
+//! **`input_json_delta` (veil-proxy#86 finding 2).** Tool-call arguments stream as `partial_json`
+//! fragments. An earlier version passed them through, so the client received tool calls with
+//! literal placeholders (`Edit {old_string: "… IBAN_001 …"}`) that could never match the real
+//! file — while the non-streaming path already demasked `tool_use.input`. Now, per content-block
+//! index, every fragment is concatenated, checked to be valid JSON, and each string *value* in
+//! it is demasked in place (keys, numbers and layout are copied byte-for-byte; see
+//! [`demask_input_json`]), then emitted as one `input_json_delta`. If nothing resolved, or the
+//! concatenation doesn't parse, that index's original fragments pass through unchanged.
+//! Demasking tool input means real values reach local tools: that is the intended trust
+//! boundary, since the client side already holds them.
 //!
 //! **Consolidation, not true re-streaming.** For each content-block `index` that carries at
-//! least one `text_delta`, this module emits exactly one `content_block_delta` event carrying
-//! the *entire* demasked text for that index (at the position of that index's first delta in the
-//! original stream) and drops every subsequent original delta for the same index — their content
-//! is already included. A client parsing this as ordinary SSE per the Anthropic streaming
-//! protocol (concatenate `text_delta.text` per index in event order) reconstructs the identical
-//! final text either way; only the number/size of the delta events differs.
+//! least one demaskable delta, this module emits exactly one `content_block_delta` event carrying
+//! the *entire* demasked text (or tool-input JSON) for that index, at the position of that
+//! index's first delta in the original stream, and drops every later original delta for the same
+//! index — their content is already included. A client parsing this as ordinary SSE per the
+//! Anthropic streaming protocol (concatenate `text_delta.text` / `input_json_delta.partial_json`
+//! per index in event order) reconstructs the identical final content either way; only the
+//! number/size of the delta events differs.
 //!
 //! **Deliberately infallible**, same posture as `demask_response.rs`: an unparseable frame, a
 //! non-UTF-8 body, or any other unexpected shape passes through unchanged rather than blocking a
@@ -42,76 +53,228 @@ use serde_json::Value;
 use vg_core::{Namespace, PlaceholderBinding, Policy};
 
 use super::demask_response::demask_text;
+use crate::codec::{DemaskedResponse, IssuedBlock};
 
-/// Demasks every `text_delta` fragment in `body` (an Anthropic Messages API SSE stream, fully
-/// buffered) against `bindings`, and re-serializes. Always returns bytes — see this module's own
-/// doc for why it cannot fail. `body` that isn't valid UTF-8 is returned unchanged: real SSE is
-/// always UTF-8 text, so this is a defensive fallback, not an expected path.
+/// Demasks every `text_delta` and `input_json_delta` fragment in `body` (an Anthropic Messages
+/// API SSE stream, fully buffered) against `bindings`, and re-serializes. Always returns bytes —
+/// see this module's own doc for why it cannot fail. `body` that isn't valid UTF-8 is returned
+/// unchanged: real SSE is always UTF-8 text, so this is a defensive fallback, not an expected
+/// path.
 pub(crate) fn demask_sse_response(
     body: &[u8],
     bindings: &[PlaceholderBinding],
     policy: &Policy,
     ns: &Namespace,
-) -> Vec<u8> {
+) -> DemaskedResponse {
     let Ok(text) = std::str::from_utf8(body) else {
-        return body.to_vec();
+        return DemaskedResponse {
+            body: body.to_vec(),
+            issued: Vec::new(),
+        };
     };
 
     let frames = parse_frames(text);
+    let issued = issued_blocks(&frames);
 
-    // Pass 1: accumulate every `text_delta`'s text per content-block index, across the WHOLE
-    // buffered stream — never demasked per-chunk, which is exactly the partial-placeholder trap
-    // this module's own doc names.
-    let mut text_by_index: BTreeMap<u64, String> = BTreeMap::new();
+    // Pass 1: accumulate every demaskable delta's content per content-block index, across the
+    // WHOLE buffered stream — never demasked per-chunk, which is exactly the partial-placeholder
+    // trap this module's own doc names.
+    let mut raw_by_index: BTreeMap<u64, (DeltaKind, String)> = BTreeMap::new();
     for frame in &frames {
-        if let Some(delta_text) = text_delta_text(frame) {
-            let index = frame
-                .parsed
-                .as_ref()
-                .and_then(|v| v.get("index"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            text_by_index.entry(index).or_default().push_str(delta_text);
+        if let Some((kind, fragment)) = demaskable_delta(frame) {
+            let entry = raw_by_index
+                .entry(frame_index(frame))
+                .or_insert_with(|| (kind, String::new()));
+            // An index mixing delta kinds isn't a shape the protocol produces; leave it alone
+            // rather than guess (its fragments are then passed through, see pass 2).
+            if entry.0 != kind {
+                entry.0 = DeltaKind::Mixed;
+            }
+            entry.1.push_str(fragment);
         }
     }
 
-    let demasked_by_index: BTreeMap<u64, String> = text_by_index
+    // `None` means "pass this index's original fragments through unchanged".
+    let demasked_by_index: BTreeMap<u64, Option<String>> = raw_by_index
         .into_iter()
-        .map(|(index, raw)| (index, demask_text(&raw, bindings, policy, ns)))
+        .map(|(index, (kind, raw))| {
+            let demasked = match kind {
+                DeltaKind::Text => Some(demask_text(&raw, bindings, policy, ns)),
+                DeltaKind::InputJson => demask_input_json(&raw, bindings, policy, ns),
+                DeltaKind::Mixed => None,
+            };
+            (index, demasked)
+        })
         .collect();
 
-    // Pass 2: re-emit every frame verbatim, except a `content_block_delta` text_delta event —
-    // the first one for a given index carries the whole demasked text; every later one for the
-    // same index is dropped.
+    // Pass 2: re-emit every frame verbatim, except a demaskable delta — the first one for a
+    // given index carries the whole demasked content; every later one for the same index is
+    // dropped.
     let mut already_emitted: HashSet<u64> = HashSet::new();
     let mut out = String::with_capacity(text.len());
     for frame in &frames {
-        match text_delta_text(frame) {
-            Some(_) => {
-                let index = frame
-                    .parsed
-                    .as_ref()
-                    .and_then(|v| v.get("index"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if !already_emitted.insert(index) {
-                    continue; // already consolidated into this index's first delta
-                }
-                let Some(mut parsed) = frame.parsed.clone() else {
-                    push_raw_frame(&mut out, frame.raw);
+        let Some((kind, _)) = demaskable_delta(frame) else {
+            push_raw_frame(&mut out, frame.raw);
+            continue;
+        };
+        let index = frame_index(frame);
+        let Some(Some(demasked)) = demasked_by_index.get(&index) else {
+            push_raw_frame(&mut out, frame.raw);
+            continue;
+        };
+        if !already_emitted.insert(index) {
+            continue; // already consolidated into this index's first delta
+        }
+        let Some(mut parsed) = frame.parsed.clone() else {
+            push_raw_frame(&mut out, frame.raw);
+            continue;
+        };
+        if let Some(delta) = parsed.get_mut("delta").and_then(Value::as_object_mut) {
+            delta.insert(kind.field().to_string(), Value::String(demasked.clone()));
+        }
+        write_frame(&mut out, frame.event, &parsed);
+    }
+    DemaskedResponse {
+        body: out.into_bytes(),
+        issued,
+    }
+}
+
+/// Reassembles every thinking block the stream carries, for the session's issued-thinking
+/// record: `content_block_start` opens a `thinking`/`redacted_thinking` block at an index, and
+/// that index's `thinking_delta`/`signature_delta` fragments append to it. Read-only: nothing
+/// here changes what is emitted.
+fn issued_blocks(frames: &[Frame<'_>]) -> Vec<IssuedBlock> {
+    let mut by_index: BTreeMap<u64, IssuedBlock> = BTreeMap::new();
+    for frame in frames {
+        let Some(parsed) = frame.parsed.as_ref() else {
+            continue;
+        };
+        let str_of =
+            |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        match parsed.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(block) = parsed.get("content_block") else {
                     continue;
                 };
-                if let Some(delta) = parsed.get_mut("delta").and_then(Value::as_object_mut) {
-                    if let Some(demasked) = demasked_by_index.get(&index) {
-                        delta.insert("text".to_string(), Value::String(demasked.clone()));
-                    }
-                }
-                write_frame(&mut out, frame.event, &parsed);
+                let started = match block.get("type").and_then(Value::as_str) {
+                    Some("thinking") => IssuedBlock::Thinking {
+                        signature: str_of(block, "signature"),
+                        thinking: str_of(block, "thinking"),
+                    },
+                    Some("redacted_thinking") => IssuedBlock::Redacted {
+                        data: str_of(block, "data"),
+                    },
+                    _ => continue,
+                };
+                by_index.insert(frame_index(frame), started);
             }
-            None => push_raw_frame(&mut out, frame.raw),
+            Some("content_block_delta") => {
+                let Some(IssuedBlock::Thinking {
+                    signature,
+                    thinking,
+                }) = by_index.get_mut(&frame_index(frame))
+                else {
+                    continue;
+                };
+                let Some(delta) = parsed.get("delta") else {
+                    continue;
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("thinking_delta") => thinking.push_str(&str_of(delta, "thinking")),
+                    Some("signature_delta") => signature.push_str(&str_of(delta, "signature")),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
-    out.into_bytes()
+    by_index.into_values().collect()
+}
+
+/// Reassembled `input_json_delta` content for one `tool_use` block, demasked **losslessly**:
+/// every JSON string *value* is decoded, demasked, and re-encoded only if a placeholder in it
+/// resolved; object keys, numbers, whitespace and key order are copied byte-for-byte. The first
+/// version parsed into a `serde_json::Value` and re-serialized it, which (review finding) sorted
+/// keys, collapsed duplicate keys, and turned big integers and `1e2` into lossy floats on
+/// every tool call, placeholder or not. `None` (pass the original fragments through unchanged)
+/// when nothing resolved, when the concatenation isn't valid JSON, or when it's empty (a
+/// no-argument tool call).
+fn demask_input_json(
+    raw: &str,
+    bindings: &[PlaceholderBinding],
+    policy: &Policy,
+    ns: &Namespace,
+) -> Option<String> {
+    if raw.is_empty() || serde_json::from_str::<Value>(raw).is_err() {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut changed = false;
+    let mut copied_to = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // Scanning bytes is safe for UTF-8: no multi-byte sequence contains `"` or `\`.
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        let end = i + 1; // one past the closing quote
+        i = end;
+        let is_key = raw[end..].trim_start().starts_with(':');
+        if is_key {
+            continue;
+        }
+        let token = &raw[start..end];
+        let Ok(decoded) = serde_json::from_str::<String>(token) else {
+            continue;
+        };
+        let demasked = demask_text(&decoded, bindings, policy, ns);
+        if demasked != decoded {
+            out.push_str(&raw[copied_to..start]);
+            out.push_str(&Value::String(demasked).to_string());
+            copied_to = end;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&raw[copied_to..]);
+    Some(out)
+}
+
+/// Which demaskable delta kind one content-block index carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaKind {
+    Text,
+    InputJson,
+    Mixed,
+}
+
+impl DeltaKind {
+    /// The `delta` field holding this kind's content.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::InputJson | Self::Mixed => "partial_json",
+        }
+    }
+}
+
+fn frame_index(frame: &Frame<'_>) -> u64 {
+    frame
+        .parsed
+        .as_ref()
+        .and_then(|v| v.get("index"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// One SSE frame: the fields this module understands (`event:`, a JSON-parsed `data:`, if any),
@@ -169,18 +332,22 @@ fn push_raw_frame(out: &mut String, raw: &str) {
     out.push_str("\n\n");
 }
 
-/// `Some(text)` iff `frame` is a `content_block_delta` event whose `delta.type` is `text_delta`
-/// — the only shape this module rewrites. Returns the delta's own text (not yet accumulated).
-fn text_delta_text<'a>(frame: &'a Frame<'_>) -> Option<&'a str> {
+/// `Some((kind, fragment))` iff `frame` is a `content_block_delta` event whose `delta.type` is
+/// `text_delta` or `input_json_delta` — the only shapes this module rewrites. Returns the
+/// delta's own fragment (not yet accumulated).
+fn demaskable_delta<'a>(frame: &'a Frame<'_>) -> Option<(DeltaKind, &'a str)> {
     let parsed = frame.parsed.as_ref()?;
     if parsed.get("type").and_then(Value::as_str) != Some("content_block_delta") {
         return None;
     }
     let delta = parsed.get("delta")?;
-    if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
-        return None;
-    }
-    delta.get("text").and_then(Value::as_str)
+    let kind = match delta.get("type").and_then(Value::as_str)? {
+        "text_delta" => DeltaKind::Text,
+        "input_json_delta" => DeltaKind::InputJson,
+        _ => return None,
+    };
+    let fragment = delta.get(kind.field()).and_then(Value::as_str)?;
+    Some((kind, fragment))
 }
 
 fn write_frame(out: &mut String, event: Option<&str>, data: &Value) {
@@ -328,7 +495,7 @@ mod tests {
             &serde_json::json!({"type": "message_stop"}),
         ));
 
-        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace);
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
         let demasked = String::from_utf8(demasked).expect("valid utf-8");
 
         assert!(
@@ -373,10 +540,9 @@ mod tests {
         }
     }
 
-    /// Non-`text_delta` events — including a `ping` and a tool-use `input_json_delta` — round-
-    /// trip completely unchanged, proving this module doesn't touch content it doesn't
-    /// specifically understand (matching `demask_response.rs`'s own `BLOCK_METADATA_KEYS`
-    /// precedent: no classifier, but a real scope boundary).
+    /// Events with nothing to demask — a `ping`, and a tool-use `input_json_delta` holding no
+    /// placeholder — come back with the same content (the single-fragment tool input is
+    /// re-serialized, which for this compact input is byte-identical).
     #[test]
     fn non_text_delta_events_round_trip_unchanged() {
         let dir = TempDir::new().expect("temp dir");
@@ -398,11 +564,257 @@ mod tests {
         stream.push_str(&ping);
         stream.push_str(&tool_delta);
 
-        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace);
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
         let demasked = String::from_utf8(demasked).expect("valid utf-8");
 
         assert!(demasked.contains("\"partial_json\":\"{\\\"a\\\":1}\""));
         assert!(demasked.contains("\"type\":\"ping\""));
+    }
+
+    fn input_json_delta(index: u64, partial_json: &str) -> String {
+        sse_event(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": partial_json}
+            }),
+        )
+    }
+
+    /// Streams a `tool_use` block named `name` whose input JSON is `input_json`, split into
+    /// fragments at `split_points` (byte offsets into `input_json`).
+    fn tool_use_stream(name: &str, input_json: &str, split_points: &[usize]) -> String {
+        let mut stream = String::new();
+        stream.push_str(&sse_event(
+            "content_block_start",
+            &serde_json::json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": name, "input": {}}}),
+        ));
+        let mut last = 0;
+        for &at in split_points
+            .iter()
+            .chain(std::iter::once(&input_json.len()))
+        {
+            stream.push_str(&input_json_delta(1, &input_json[last..at]));
+            last = at;
+        }
+        stream.push_str(&sse_event(
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": 1}),
+        ));
+        stream
+    }
+
+    /// Reassembles a demasked stream's `tool_use` input the way the client does: concatenate
+    /// every `input_json_delta.partial_json` for index 1 in order, then parse.
+    fn reassembled_tool_input(demasked: &str) -> Value {
+        let mut json = String::new();
+        let mut delta_frames = 0;
+        for frame in demasked.split("\n\n") {
+            let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data:")) else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(data.trim()).expect("frame data is JSON");
+            if v["delta"]["type"] == "input_json_delta" && v["index"] == 1 {
+                json.push_str(v["delta"]["partial_json"].as_str().unwrap());
+                delta_frames += 1;
+            }
+        }
+        assert_eq!(
+            delta_frames, 1,
+            "fragments consolidate into one delta: {demasked}"
+        );
+        serde_json::from_str(&json).expect("reassembled input parses")
+    }
+
+    /// veil-proxy#86 finding 2: the exact failure the spike hit. The model saw a masked value,
+    /// emitted an `Edit` whose `old_string` held the placeholder, and — with `input_json_delta`
+    /// passed through — the client got the literal placeholder, so the edit could never match
+    /// the real file. The placeholder is split mid-token across two fragments here.
+    #[test]
+    fn a_placeholder_split_across_input_json_fragments_is_demasked() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (masked_text, bindings) = mask_and_get_bindings(
+            "send to jane.doe@example.com within 30 days",
+            &namespace,
+            &policy,
+        );
+        assert!(masked_text.contains("EMAIL_001"), "masked: {masked_text}");
+
+        let input_json = serde_json::json!({
+            "file_path": "billing/invoice.py",
+            "old_string": masked_text,
+            "new_string": "fixed"
+        })
+        .to_string();
+        let split = input_json.find("EMAIL_").unwrap() + "EMA".len();
+        let stream = tool_use_stream("Edit", &input_json, &[10, split]);
+
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        let demasked = String::from_utf8(demasked).expect("valid utf-8");
+
+        let input = reassembled_tool_input(&demasked);
+        assert_eq!(
+            input["old_string"],
+            "send to jane.doe@example.com within 30 days"
+        );
+        assert_eq!(input["file_path"], "billing/invoice.py");
+        assert!(!demasked.contains("EMAIL_001"), "demasked: {demasked}");
+        // The block's own id/name (in content_block_start) are untouched.
+        assert!(
+            demasked.contains("\"name\":\"Edit\""),
+            "demasked: {demasked}"
+        );
+        assert!(
+            demasked.contains("\"id\":\"toolu_1\""),
+            "demasked: {demasked}"
+        );
+    }
+
+    /// A tool literally named like a placeholder keeps its name — the stream-side counterpart
+    /// of `demask_response.rs`'s `BLOCK_METADATA_KEYS` regression. The name lives in
+    /// `content_block_start`, which this module never rewrites.
+    #[test]
+    fn a_tool_named_like_a_placeholder_keeps_its_name() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (masked_text, bindings) =
+            mask_and_get_bindings("jane.doe@example.com", &namespace, &policy);
+        assert_eq!(masked_text, "EMAIL_001");
+
+        let stream = tool_use_stream("EMAIL_001", "{\"q\":\"EMAIL_001\"}", &[]);
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        let demasked = String::from_utf8(demasked).expect("valid utf-8");
+
+        assert!(
+            demasked.contains("\"name\":\"EMAIL_001\""),
+            "demasked: {demasked}"
+        );
+        assert_eq!(
+            reassembled_tool_input(&demasked)["q"],
+            "jane.doe@example.com"
+        );
+    }
+
+    /// Fragments that don't reassemble into valid JSON pass through byte-for-byte, fragment by
+    /// fragment — the module's infallible posture.
+    #[test]
+    fn malformed_input_json_passes_through_unchanged() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (_masked, bindings) =
+            mask_and_get_bindings("jane.doe@example.com", &namespace, &policy);
+
+        let stream = tool_use_stream("Edit", "{\"old_string\": \"EMAIL_001", &[5]);
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        assert_eq!(String::from_utf8(demasked).unwrap(), stream);
+    }
+
+    /// Review finding (fresh-context adversarial round): the first version parsed the tool input
+    /// into a `Value` and re-serialized it on every tool call, sorting keys and corrupting big
+    /// integers and exponent literals. Only string values that actually resolve may change.
+    #[test]
+    fn tool_input_is_demasked_losslessly_and_untouched_when_nothing_resolves() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (masked_text, bindings) =
+            mask_and_get_bindings("jane.doe@example.com", &namespace, &policy);
+
+        let tail =
+            r#""n":12345678901234567890123,"f":1e2,"big":18446744073709551616,"u":"\u00e9 é"}"#;
+        let without = format!(r#"{{"z":1,"k":"k","k":"dup",{tail}"#);
+        let stream = tool_use_stream("Bash", &without, &[9]);
+        let out = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            stream,
+            "no placeholder: fragments pass through byte-for-byte"
+        );
+
+        let with = format!(r#"{{"z":1,"to":"{masked_text}",{tail}"#);
+        let stream = tool_use_stream("Bash", &with, &[9]);
+        let out = String::from_utf8(
+            demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body,
+        )
+        .unwrap();
+        let expected = with.replace(&masked_text, "jane.doe@example.com");
+        let reassembled: String = out
+            .split("\n\n")
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data:")))
+            .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+            .filter(|v| v["delta"]["type"] == "input_json_delta")
+            .map(|v| v["delta"]["partial_json"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            reassembled, expected,
+            "only the placeholder's string value changes"
+        );
+    }
+
+    /// The same logical response demasks `tool_use.input` identically whether it arrives as
+    /// one JSON body (`demask_response.rs`) or as SSE (this module).
+    #[test]
+    fn streaming_and_non_streaming_demask_tool_input_identically() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (masked_text, bindings) = mask_and_get_bindings(
+            "cc jane.doe@example.com and ops@example.com",
+            &namespace,
+            &policy,
+        );
+
+        let input = serde_json::json!({"command": "notify", "args": {"to": [masked_text], "n": 2}});
+        let json_body = serde_json::json!({
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": input}]
+        });
+        let non_streamed = super::super::demask_response::demask_response(
+            &serde_json::to_vec(&json_body).unwrap(),
+            &bindings,
+            &policy,
+            &namespace,
+        )
+        .body;
+        let non_streamed: Value = serde_json::from_slice(&non_streamed).unwrap();
+
+        let input_json = input.to_string();
+        let stream = tool_use_stream("Bash", &input_json, &[7, 19, 30]);
+        let streamed = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        let streamed = reassembled_tool_input(&String::from_utf8(streamed).unwrap());
+
+        assert_eq!(streamed, non_streamed["content"][0]["input"]);
+        assert!(
+            streamed.to_string().contains("ops@example.com"),
+            "{streamed}"
+        );
+    }
+
+    /// Thinking deltas (and their signature) stay exactly as issued — veil-proxy#86 finding 1.
+    #[test]
+    fn thinking_and_signature_deltas_round_trip_unchanged() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+        let (_masked, bindings) =
+            mask_and_get_bindings("jane.doe@example.com", &namespace, &policy);
+
+        let mut stream = String::new();
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            &serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "contact EMAIL_001"}}),
+        ));
+        stream.push_str(&sse_event(
+            "content_block_delta",
+            &serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "EqQBCkYIBxgC"}}),
+        ));
+
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
+        assert_eq!(String::from_utf8(demasked).unwrap(), stream);
     }
 
     /// A malformed/unparseable frame among otherwise-valid ones doesn't panic and doesn't
@@ -422,7 +834,7 @@ mod tests {
             &serde_json::json!({"type": "message_stop"}),
         ));
 
-        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace);
+        let demasked = demask_sse_response(stream.as_bytes(), &bindings, &policy, &namespace).body;
         let demasked = String::from_utf8(demasked).expect("valid utf-8");
 
         assert!(demasked.contains("not valid json at all"));
@@ -440,7 +852,7 @@ mod tests {
             mask_and_get_bindings("contact jane.doe@example.com", &namespace, &policy);
 
         let invalid = vec![0xff, 0xfe, 0xfd];
-        let out = demask_sse_response(&invalid, &bindings, &policy, &namespace);
+        let out = demask_sse_response(&invalid, &bindings, &policy, &namespace).body;
         assert_eq!(out, invalid);
     }
 }

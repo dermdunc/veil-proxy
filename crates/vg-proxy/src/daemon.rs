@@ -187,8 +187,13 @@ impl Daemon {
             body,
             bindings,
             stats,
-        } =
-            self.with_context(|ctx| self.codec.mask_request(body, ctx, &self.policy, &namespace))?;
+        } = {
+            let issued = self.session_shim.issued_thinking_for(&namespace);
+            self.with_context(|ctx| {
+                self.codec
+                    .mask_request(body, ctx, &self.policy, &namespace, &issued)
+            })?
+        };
         self.session_shim.record_bindings(&namespace, bindings);
         Ok((body, stats, namespace))
     }
@@ -263,8 +268,12 @@ impl Daemon {
     /// this milestone's own scope.
     pub fn demask_response(&self, body: &[u8], namespace: &Namespace) -> Vec<u8> {
         let bindings = self.session_shim.bindings_for(namespace);
-        self.codec
-            .demask_response(body, &bindings, &self.policy, namespace)
+        let demasked = self
+            .codec
+            .demask_response(body, &bindings, &self.policy, namespace);
+        self.session_shim
+            .record_issued_thinking(namespace, &demasked.issued);
+        demasked.body
     }
 
     /// A2 (pulled forward from M6, `amendment-2026-09-14-001.yaml`): the SSE-response
@@ -275,8 +284,12 @@ impl Daemon {
     /// for the buffer-first design and its scope (text_delta only, not full M6).
     pub fn demask_streaming_response(&self, body: &[u8], namespace: &Namespace) -> Vec<u8> {
         let bindings = self.session_shim.bindings_for(namespace);
-        self.codec
-            .demask_streaming_response(body, &bindings, &self.policy, namespace)
+        let demasked =
+            self.codec
+                .demask_streaming_response(body, &bindings, &self.policy, namespace);
+        self.session_shim
+            .record_issued_thinking(namespace, &demasked.issued);
+        demasked.body
     }
 
     /// Runs `f` with a fresh [`Context`] over the owned detector/parser registries. Same shape

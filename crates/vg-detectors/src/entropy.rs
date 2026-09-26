@@ -205,24 +205,128 @@ fn is_structured_identifier(token: &[u8]) -> bool {
 /// segments mix letters and digits (the vast majority of real base64/hex/API-key
 /// shapes) is unaffected, since a mixed segment is neither purely alphabetic nor purely
 /// numeric and fails this exclusion.
+///
+/// **Path mode (veil-proxy#86 finding 3, 2026-09-26).** A real Claude Code session sends its
+/// working directory and file paths in every request, and the rule above flagged any path with
+/// one mixed letter/digit segment (`phase-1a`, `run3`, `v2`, `abc123`, `@types`). Every `Secret`
+/// hit is an irreversible redaction, so the agent saw `[REDACTED:SECRET]/billing/invoice.py`,
+/// built tool calls from it, and failed. Measured before this fix: paths made only of letters
+/// (`/Users/alice/Development/acme-billing`) were already excluded; the mixed segment was the
+/// real trigger. So a token containing `/` gets two relaxations: an npm-scope `@` at the start of
+/// a `/` component is stripped (`@types`), and a short lowercase letter/digit segment of at
+/// most [`MAX_SHORT_MIXED_SEGMENT`] bytes is allowed ([`is_short_mixed`]). Guards, each added
+/// for a concrete counterexample: at most one such segment per `/` component (grouped keys put
+/// several in one); no uppercase in it (short random credentials mix case); at least one real
+/// word segment (letters only, >=3 bytes); at most two such segments totalling at most 8
+/// bytes in the whole token, with no digit-only segment longer than 4 bytes beside them (a
+/// round-2 review showed a per-component limit alone let `/`-separated key groups through);
+/// every letters-only segment word-cased
+/// ([`is_word_cased`], which keeps AWS-style `wJalrXUtnFEMI/K7MDENG/...` flagged). `@` anywhere
+/// else is not a split character, so URL userinfo (`postgres://app:Xk9mQ2vL@db.internal/prod`)
+/// stays one failing segment and is still flagged. The first version of this fix split on every
+/// `@` and allowed any number of mixed-case segments; a fresh-context adversarial review showed
+/// it stopped flagging database URLs, share/reset links and grouped keys, all flagged on `main`.
+/// Tokens without `/` are unchanged.
+///
+/// **Accepted residuals of path mode:** a single lowercase letter/digit token of <=8 bytes as its
+/// own path component next to word components is excluded (`https://app.example.com/reset/hq7vk2mx`,
+/// or a webhook path like `hooks/catch/1234/abc1xyz`);
+/// a long random path segment (macOS `$TMPDIR`'s `/var/folders/xx/<random>/T/`) is still
+/// flagged, the right call for a component indistinguishable from a token. Measured separately
+/// and pre-existing, not introduced here: about 2.6% of random 20-byte base64 strings containing
+/// `/` are excluded by the letters-only rule above.
 fn is_structured_segments(s: &str) -> bool {
+    let path_mode = s.contains('/');
     // Empty segments (a leading/trailing delimiter, e.g. the dotfile in
     // `.hekton/risk-register.yaml`, or a doubled delimiter) are common and not
     // themselves suspicious -- filtered out rather than treated as disqualifying.
-    let segments: Vec<&str> = s
-        .split(['/', '.', '_', '-'])
-        .filter(|seg| !seg.is_empty())
-        .collect();
-    if segments.len() < 2 {
+    let mut segment_count = 0;
+    let mut has_word = false;
+    let mut all_words_cased = true;
+    let mut short_mixed_count = 0;
+    let mut short_mixed_bytes = 0;
+    let mut longest_digit_run = 0;
+    for component in s.split('/').filter(|c| !c.is_empty()) {
+        // An npm scope (`@types`) is the one place `@` is structural. Anywhere else it is left
+        // in the segment, which then fails, so `pass@host` userinfo is never split apart.
+        let component = if path_mode {
+            component.strip_prefix('@').unwrap_or(component)
+        } else {
+            component
+        };
+        let mut short_mixed_here = 0;
+        for seg in component
+            .split(['.', '_', '-'])
+            .filter(|seg| !seg.is_empty())
+        {
+            segment_count += 1;
+            let bytes = seg.as_bytes();
+            if bytes.iter().all(|b| b.is_ascii_alphabetic()) {
+                has_word |= bytes.len() >= 3;
+                all_words_cased &= is_word_cased(bytes);
+            } else if bytes.iter().all(|b| b.is_ascii_digit()) {
+                if bytes.len() > 8 {
+                    return false;
+                }
+                longest_digit_run = longest_digit_run.max(bytes.len());
+            } else if path_mode && is_short_mixed(bytes) {
+                short_mixed_here += 1;
+                short_mixed_count += 1;
+                short_mixed_bytes += bytes.len();
+            } else {
+                return false;
+            }
+        }
+        // Grouped keys (`a8f3k2m9-x7q4w1z6-...`, `VK7JG-NPHTM-...`) put several mixed groups in
+        // one component; real path components (`phase-1a`, `abc123`, `v2`) carry at most one.
+        if short_mixed_here > 1 {
+            return false;
+        }
+    }
+    if segment_count < 2 {
         return false;
     }
-    segments.iter().all(|seg| {
-        let bytes = seg.as_bytes();
-        let all_alpha = bytes.iter().all(|b| b.is_ascii_alphabetic());
-        let all_digit = bytes.iter().all(|b| b.is_ascii_digit());
-        all_alpha || (all_digit && bytes.len() <= 8)
-    })
+    if short_mixed_count == 0 {
+        return true;
+    }
+    // Whole-token budget (round-2 review finding): a per-component limit alone let `/`-separated
+    // groups through (`/share/k3j9x2q8/p5r8t3v2/n6b9c4d7`, `/v1/keys/9f86d081/884c7d65/...`).
+    // Real paths need at most two short mixed pieces totalling a few bytes (`phase-1a/run3`),
+    // and don't pair them with long digit runs (`reset/a8f3k2m9-12345678-87654321`).
+    has_word
+        && all_words_cased
+        && short_mixed_count <= MAX_SHORT_MIXED_PER_TOKEN
+        && short_mixed_bytes <= MAX_SHORT_MIXED_BYTES_PER_TOKEN
+        && longest_digit_run <= MAX_DIGIT_RUN_BESIDE_SHORT_MIXED
 }
+
+/// Path-mode whole-token budget (see [`is_structured_segments`]).
+const MAX_SHORT_MIXED_PER_TOKEN: usize = 2;
+const MAX_SHORT_MIXED_BYTES_PER_TOKEN: usize = 8;
+const MAX_DIGIT_RUN_BESIDE_SHORT_MIXED: usize = 4;
+
+/// A path-mode "short mixed" segment: letters and digits, at most [`MAX_SHORT_MIXED_SEGMENT`]
+/// bytes, and **no uppercase**. Real path pieces with digits are lowercase (`1a`, `run3`, `v2`,
+/// `abc123`, `py3`); random short credentials mix case (`Xk9mQ2vL`, `aB3dE5fG`).
+fn is_short_mixed(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_SHORT_MIXED_SEGMENT
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether a letters-only segment is cased the way a real path word is: `lower`, `UPPER`, or
+/// `Capitalized`. Random base64 letter runs almost never are (`wJalrXUtnFEMI`), which is what
+/// keeps AWS-style keys with a `/` in them (`wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) flagged
+/// under path mode. Only consulted when a short mixed segment needs the path-mode allowance;
+/// camelCase words still pass the plain rule on their own.
+fn is_word_cased(bytes: &[u8]) -> bool {
+    let rest_lower = bytes[1..].iter().all(u8::is_ascii_lowercase);
+    rest_lower || bytes.iter().all(u8::is_ascii_uppercase)
+}
+
+/// Longest mixed letter/digit segment path mode allows (see [`is_structured_segments`]).
+const MAX_SHORT_MIXED_SEGMENT: usize = 8;
 
 /// Case-insensitive markers that, immediately before a hex-shaped token (skipping a
 /// single separator like `:`/whitespace), corroborate "this is a git object hash", not a
@@ -456,6 +560,85 @@ mod tests {
         let lenient = EntropyDetector::new(10, 0.5);
         let uuid_like = "550e8400-e29b-41d4-a716-446655440000";
         assert!(!lenient.detect(uuid_like.as_bytes(), &[]).is_empty());
+    }
+
+    /// veil-proxy#86 finding 3: paths a real Claude Code session sends in every request. Each
+    /// was redacted irreversibly before the path-mode fix (the mixed segment was the trigger),
+    /// breaking every tool call built from it. The first three were already excluded; kept as
+    /// the issue's own reported cases.
+    #[test]
+    fn ignores_ordinary_paths_with_short_mixed_segments() {
+        let detector = EntropyDetector::default();
+        for path in [
+            "/Users/alice/Development/acme-billing",
+            "/Users/alice/acme-billing/billing/invoice.py",
+            "test_invoice.InvoiceTests.test_invoice_total_includes_vat",
+            "/Users/alice/Development/acme/demo-site/spikes/phase-1a/fixture",
+            "/private/tmp/phase-1a/run3/acme-billing",
+            "/private/var/folders/xy/abc123/T/tmp.XXXX",
+            "/Users/alice/src/acme-billing2",
+            "/Users/alice/Development/acme-billing/v2/src",
+            "node_modules/@types/node/index.d.ts",
+            "crates/vg-proxy/src/codec/anthropic/stream_demask.rs",
+        ] {
+            let findings = detector.detect(path.as_bytes(), &[]);
+            assert!(
+                findings.is_empty(),
+                "{path} must not be flagged: {findings:?}"
+            );
+            let in_prose = format!("Working directory: {path}\n");
+            assert!(
+                detector.detect(in_prose.as_bytes(), &[]).is_empty(),
+                "{path} in prose must not be flagged"
+            );
+        }
+    }
+
+    /// The other side of finding 3's fix: secrets that must still flag, including ones that
+    /// contain `/` or short mixed groups.
+    #[test]
+    fn path_mode_still_flags_real_secrets() {
+        let detector = EntropyDetector::default();
+        for secret in [
+            "whsec_9fK2xQ7mZ4pL8vR1tY6nB3cH5jD0gWq",
+            // 40-char standard base64 with `/` and `+`.
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aB3/dE5fG7hI9jK1lM2nP+qR4sT6uV8wX0yZ/abc",
+            "sk-ant-api03-Zx9Kq2Lm7Pw4Rt6Yv1Bn8Fs3Hd5Jc0Ga4We",
+            "aB3!xY7@qR2#nM8$pL5%zK",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            // Grouped key with no `/`: path mode doesn't apply.
+            "VK7JG-NPHTM-C97JM-9MPGT-3V66T",
+            // Found by the fresh-context adversarial review of the first path-mode version:
+            // URL userinfo, share/reset links, and grouped keys once a `/` appears.
+            "postgres://app:Xk9mQ2vL@db.internal/prod",
+            "postgres://app:zQvLmXpRwTuYbNdKfJhC@db.example.com/prod",
+            "redis://:hQ7vK2mX@cache.internal/0",
+            "https://deploy:Tq8Zr3Wk@git.example.com/org/repo.git",
+            "keys/VK7JG-NPHTM-C97JM-9MPGT-3V66T",
+            "/share/3kF9x2Q-7mZ4pL8v-R1tY6nB3",
+            "https://example.com/invite/aB3dE5fG-hI9jK1lM-2nP4qR6s",
+            "https://app.example.com/reset/Zk3P9q-Xm7L2w-Rt6Y1v-Bn8F4s",
+            "recovery/a8f3k2m9-x7q4w1z6-p5r8t3v2-n6b9c4d7",
+            // Round-2 review: `/`-separated groups, digit runs beside a mixed piece, and the
+            // same inside a `KEY=value`.
+            "/v1/keys/9f86d081/884c7d65/9a2feaa0/8fb4ab5c",
+            "tokens/a8f3k2m9/x7q4w1z6/p5r8t3v2/n6b9c4d7",
+            "/share/k3j9x2q8/p5r8t3v2/n6b9c4d7",
+            "https://example.com/s/k3j9x2q8/p5r8t3v2",
+            "codes/2fa/a8f3k2m9/x7q4w1z6",
+            "reset/a8f3k2m9-12345678-87654321",
+            "backup/a8f3k2m9_12345678/x7q4w1z6_87654321",
+            "api_key=reset/k3j9x2q8/x7q4w1z6",
+            "AWS_SECRET=keys/a8f3k2m9/x7q4w1z6/p5r8",
+            // A random `$TMPDIR` component stays flagged (named residual).
+            "/var/folders/7k/q1x2y3z4000gn/T/tmp.aB3dE5fG",
+        ] {
+            assert!(
+                !detector.detect(secret.as_bytes(), &[]).is_empty(),
+                "{secret} must still be flagged"
+            );
+        }
     }
 
     #[test]

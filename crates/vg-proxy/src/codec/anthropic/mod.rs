@@ -26,7 +26,7 @@ use vg_core::{Context, Namespace, PlaceholderBinding, Policy};
 
 use crate::route::RouteVerdict;
 
-use super::{Codec, SelectedHeaders};
+use super::{Codec, DemaskedResponse, IssuedThinking, SelectedHeaders};
 use mask_request::{MaskRequestError, MaskedRequest};
 
 pub(crate) struct AnthropicCodec;
@@ -46,8 +46,9 @@ impl Codec for AnthropicCodec {
         ctx: &Context,
         policy: &Policy,
         namespace: &Namespace,
+        issued: &IssuedThinking,
     ) -> Result<MaskedRequest, MaskRequestError> {
-        mask_request::mask_request(body, ctx, policy, namespace)
+        mask_request::mask_request(body, ctx, policy, namespace, issued)
     }
 
     fn demask_response(
@@ -56,7 +57,7 @@ impl Codec for AnthropicCodec {
         bindings: &[PlaceholderBinding],
         policy: &Policy,
         namespace: &Namespace,
-    ) -> Vec<u8> {
+    ) -> DemaskedResponse {
         demask_response::demask_response(body, bindings, policy, namespace)
     }
 
@@ -66,7 +67,7 @@ impl Codec for AnthropicCodec {
         bindings: &[PlaceholderBinding],
         policy: &Policy,
         namespace: &Namespace,
-    ) -> Vec<u8> {
+    ) -> DemaskedResponse {
         stream_demask::demask_sse_response(body, bindings, policy, namespace)
     }
 }
