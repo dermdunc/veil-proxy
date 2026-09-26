@@ -9,6 +9,12 @@ description = "Local masking-proxy daemon front door (vg-daemon/vg-proxy): a pla
 [lints]
 workspace = true
 
+[features]
+# Dev-only wire capture of `handle_mask`'s exact masked request and pre-demask response bytes
+# (`src/capture.rs`), for veil-demo's `/agent` evidence capture and `scripts/a2-live-proof.sh`'s
+# masking-before-egress assertion. Off by default: a default build does not contain the code.
+capture = []
+
 [dependencies]
 vg-core = { workspace = true }
 vg-vault = { workspace = true }
