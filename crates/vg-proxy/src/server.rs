@@ -288,6 +288,11 @@ async fn handle_pass(
         Err(resp) => return resp,
     };
 
+    // Dev-only wire capture (`capture.rs`): metadata only, never the body, which goes upstream
+    // unmasked on this route.
+    #[cfg(feature = "capture")]
+    crate::capture::record_pass(method.as_str(), target, body.len());
+
     let selected_headers = daemon.select_headers(&headers);
     match upstream::forward(
         upstream,

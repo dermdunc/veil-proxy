@@ -884,3 +884,8 @@ displace it for long.
 - [ ] Human: commit `crates/vg-proxy/Cargo.toml` (adds the `capture` feature; protected path).
 - [ ] CI does not exercise `--features capture` yet. Consider adding
       `cargo test -p vg-proxy --features capture` to the test job.
+- [x] Adversarial-review fixes for the capture feature: Pass-route metadata, `capture-info.json`
+      format marker, hardened `a2-live-proof.sh` (see `docs/decisions.md`).
+- [ ] Human (protected path): add a CI step to the test job, e.g.
+      `- run: cargo test -p vg-proxy --locked --features capture` and a matching clippy step,
+      so the capture feature and `tests/capture.rs` cannot bit-rot unnoticed.

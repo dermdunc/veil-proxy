@@ -117,8 +117,8 @@ fn capture_files(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Capture records exactly the bytes that crossed the wire on the `Mask` route, and nothing from
-/// the `Pass` route (which forwards raw bodies) or from a request that failed closed.
+/// Capture records exactly the bytes that crossed the wire on the `Mask` route; the `Pass` route
+/// (which forwards raw bodies) only as metadata; and nothing from a request that failed closed.
 #[tokio::test]
 async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route() {
     let capture_dir = TempDir::new().expect("capture dir");
@@ -191,12 +191,38 @@ async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route
         .expect("clean shutdown");
     let _ = upstream_shutdown.send(());
 
-    // Exactly one exchange captured: the successful mask-route round trip.
+    // Exactly one body-bearing exchange (the successful mask round trip), the Pass exchange as
+    // metadata only, and the format marker.
     assert_eq!(
         capture_files(capture_dir.path()),
-        vec!["000001-request.masked.json", "000001-response.raw.json"],
-        "only the Mask-route exchange may be captured"
+        vec![
+            "000001-request.masked.json",
+            "000001-response.raw.json",
+            "P000001-pass.meta.json",
+            "capture-info.json",
+        ],
+        "only the Mask-route exchange may carry bodies; Pass is metadata only"
     );
+    let info: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(capture_dir.path().join("capture-info.json")).expect("info file"),
+    )
+    .expect("info is JSON");
+    assert_eq!(info["format"], 2);
+    assert_eq!(info["pass_route_metadata"], true);
+
+    // Pass metadata: method, path and body length, never the (raw) body itself.
+    let pass_meta_raw =
+        std::fs::read(capture_dir.path().join("P000001-pass.meta.json")).expect("pass meta");
+    let pass_meta_text = String::from_utf8_lossy(&pass_meta_raw);
+    assert!(
+        !pass_meta_text.contains(RAW_EMAIL),
+        "pass meta carries body: {pass_meta_text}"
+    );
+    let pass_meta: serde_json::Value =
+        serde_json::from_slice(&pass_meta_raw).expect("pass meta JSON");
+    assert_eq!(pass_meta["method"], "GET");
+    assert_eq!(pass_meta["path_and_query"], "/v1/models");
+    assert_eq!(pass_meta["body_len"], pass_body.len());
 
     let received: Vec<(String, Vec<u8>)> = received.lock().unwrap().clone();
     let upstream_mask_body = &received
