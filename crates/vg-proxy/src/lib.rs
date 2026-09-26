@@ -10,6 +10,8 @@
 //! nothing schema-aware exists yet to route toward (M3+). Zero egress risk by construction
 //! throughout: there is still no upstream client anywhere in this crate.
 
+#[cfg(feature = "capture")]
+pub mod capture;
 pub mod codec;
 pub mod daemon;
 pub mod error;

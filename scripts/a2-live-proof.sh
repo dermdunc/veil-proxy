@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # A2's live-run proof (INT-2026-09-13-001, confirmation criteria 1-2 as amended by
-# amendment-2026-09-13-001.yaml): routes one real, non-streaming Claude Code CLI session
+# amendment-2026-09-13-001.yaml): routes one real (streaming, as the CLI always is) Claude Code CLI session
 # through a real vg-proxy TLS connection to https://api.anthropic.com, authenticating via
 # the real `claude` CLI's own existing subscription session (never a raw API key this
 # script reads, requests, or handles), and proves a synthetic sensitive value planted in
@@ -14,12 +14,20 @@ set -euo pipefail
 # (never a real credential), and the real Anthropic credential itself is never read,
 # echoed, or handled by this script at all -- it already lives inside the `claude` CLI's
 # own session, which this script only ever invokes, never inspects.
+#
+# Masking-before-egress is asserted against the exact bytes that went upstream, captured by
+# vg-proxy's dev-only `capture` feature (`crates/vg-proxy/src/capture.rs`) into a temp dir:
+# a positive check (the planted value's placeholder is present in the outbound body) and a
+# negative check (the raw value is absent from every outbound body). An earlier version only
+# checked the harness's own stdout/stderr log, which never contains request bodies at all, so
+# a pure pass-through proxy would have passed it (veil-demo docs/agentic-demo-plan.md §1.10).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 HARNESS_LOG="$(mktemp -t vg-a2-proof-harness.XXXXXX)"
 PROOF_LOG="$(mktemp -t vg-a2-proof-claude.XXXXXX)"
+CAPTURE_DIR="$(mktemp -d -t vg-a2-proof-capture.XXXXXX)"
 HARNESS_PID=""
 
 cleanup() {
@@ -28,14 +36,16 @@ cleanup() {
     wait "$HARNESS_PID" 2>/dev/null || true
   fi
   rm -f "$HARNESS_LOG" "$PROOF_LOG"
+  rm -rf "$CAPTURE_DIR"
 }
 trap cleanup EXIT
 
 echo "==> building the dev-harness binary"
-cargo build -p vg-proxy --example live_proof_harness --quiet
+cargo build -p vg-proxy --example live_proof_harness --features capture --quiet
 
 echo "==> starting the dev-harness (real TLS to real https://api.anthropic.com)"
-cargo run -p vg-proxy --example live_proof_harness --quiet </dev/null >"$HARNESS_LOG" 2>&1 &
+VG_PROXY_CAPTURE_DIR="$CAPTURE_DIR" \
+  cargo run -p vg-proxy --example live_proof_harness --features capture --quiet </dev/null >"$HARNESS_LOG" 2>&1 &
 HARNESS_PID=$!
 
 PORT=""
@@ -84,9 +94,37 @@ if ! grep -q "$SYNTHETIC_SECRET" "$PROOF_LOG"; then
 fi
 echo "PASS: synthetic secret round-tripped through real mask -> real TLS upstream -> real demask"
 
-echo "==> checking the dev-harness's own log for a masking-never-ran indicator"
+echo "==> checking the exact outbound bytes vg-proxy sent upstream (capture feature)"
+shopt -s nullglob
+REQUEST_CAPTURES=("$CAPTURE_DIR"/*-request.masked.json)
+shopt -u nullglob
+if [[ ${#REQUEST_CAPTURES[@]} -eq 0 ]]; then
+  echo "FAIL: no outbound request was captured -- cannot assert anything about egress" >&2
+  exit 1
+fi
+for req in "${REQUEST_CAPTURES[@]}"; do
+  if [[ ! -f "${req%-request.masked.json}-response.raw.json" && ! -f "${req%-request.masked.json}-response.raw.sse" ]]; then
+    echo "FAIL: capture gap -- $(basename "$req") has no matching response file" >&2
+    exit 1
+  fi
+done
+# Negative: the raw planted value never crossed the wire, in any captured request.
+if grep -lF "$SYNTHETIC_SECRET" "${REQUEST_CAPTURES[@]}" >/dev/null; then
+  echo "FAIL: the raw synthetic secret is present in a captured outbound body -- it crossed the wire unmasked" >&2
+  exit 1
+fi
+# Positive: the planted value's own placeholder is in an outbound body, at the prompt's own
+# wording (anchored there because the CLI also injects the account email, which masks to an
+# EMAIL_ placeholder too and would otherwise satisfy a bare pattern for the wrong reason).
+if ! grep -lE "The synthetic test value is: EMAIL_[0-9]+" "${REQUEST_CAPTURES[@]}" >/dev/null; then
+  echo "FAIL: no captured outbound body carries the planted value's placeholder -- masking may not have run on it" >&2
+  exit 1
+fi
+echo "PASS: ${#REQUEST_CAPTURES[@]} captured outbound request(s): placeholder present, raw value absent"
+
+echo "==> secondary: the dev-harness's own log never contains the raw synthetic secret"
 if grep -q "$SYNTHETIC_SECRET" "$HARNESS_LOG"; then
-  echo "FAIL: the harness's own stderr log contains the raw synthetic secret -- masking may not have run before egress" >&2
+  echo "FAIL: the harness's own stderr log contains the raw synthetic secret" >&2
   exit 1
 fi
 

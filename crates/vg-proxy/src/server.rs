@@ -181,6 +181,16 @@ async fn handle_mask(
             Err(err) => return internal_error_response(&err),
         };
 
+    // Dev-only wire capture (`capture.rs`): the exact bytes about to go upstream. Compiled only
+    // with `--features capture`, and a no-op unless `VG_PROXY_CAPTURE_DIR` is set.
+    // Deliberately absent from `handle_pass`, which forwards bodies unmasked.
+    #[cfg(feature = "capture")]
+    let capture = crate::capture::begin();
+    #[cfg(feature = "capture")]
+    if let Some(slot) = &capture {
+        slot.write_request(&masked_body);
+    }
+
     let selected_headers = daemon.select_headers(&headers);
     match upstream::forward(
         upstream,
@@ -218,6 +228,11 @@ async fn handle_mask(
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(upstream::is_event_stream_content_type);
+            // Dev-only wire capture: the upstream's exact bytes, before any demasking.
+            #[cfg(feature = "capture")]
+            if let Some(slot) = &capture {
+                slot.write_response(&raw_body, is_sse);
+            }
             let demasked_body = if is_sse {
                 daemon.demask_streaming_response(&raw_body, &namespace)
             } else {
