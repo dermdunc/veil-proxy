@@ -38,8 +38,18 @@
 //! ability to dispatch that tool call). [`BLOCK_METADATA_KEYS`] is the fix: still no per-kind
 //! classifier (forward-compatible with any future block kind's own payload fields), but a
 //! block's own known structural keys are never substituted, only recursed past.
+//!
+//! **One deliberate exception: `thinking`/`redacted_thinking` blocks are never demasked**
+//! (veil-proxy#86 finding 1). The client replays them verbatim in later requests, and the API
+//! verifies each against its `signature`. A demasked copy would either carry raw values back to
+//! the proxy, or (after re-masking) risk not matching the signed bytes. Leaving them exactly as
+//! issued makes the replay byte-identical and matches the streaming path, which has never
+//! demasked `thinking_delta`. Cost: a placeholder the model mentions in its thinking stays a
+//! placeholder in the client's thinking display. See `mask_request.rs`'s module doc.
 
 use serde_json::Value;
+
+use crate::codec::{DemaskedResponse, IssuedBlock};
 
 use vg_core::{
     rehydrate, Actor, ActorId, Destination, MappingRef, MaskStats, MaskedPack, Namespace,
@@ -60,28 +70,52 @@ fn proxy_actor() -> Actor {
 }
 
 /// Demasks every text-bearing field reachable from a response body's `content[]` array against
-/// `bindings`. Always returns bytes — see this module's own doc for why it cannot fail.
+/// `bindings`, and collects every thinking block in it for the session's issued-thinking record.
+/// Always returns bytes — see this module's own doc for why it cannot fail.
 pub(crate) fn demask_response(
     body: &[u8],
     bindings: &[PlaceholderBinding],
     policy: &Policy,
     ns: &Namespace,
-) -> Vec<u8> {
+) -> DemaskedResponse {
+    let unchanged = || DemaskedResponse {
+        body: body.to_vec(),
+        issued: Vec::new(),
+    };
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return body.to_vec();
+        return unchanged();
     };
     let Some(root) = value.as_object_mut() else {
-        return body.to_vec();
+        return unchanged();
     };
     let Some(content) = root.get_mut("content").and_then(Value::as_array_mut) else {
-        return body.to_vec();
+        return unchanged();
     };
 
+    let issued: Vec<IssuedBlock> = content.iter().filter_map(issued_block).collect();
     for block in content.iter_mut() {
         demask_content_block(block, bindings, policy, ns);
     }
 
-    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+    DemaskedResponse {
+        body: serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
+        issued,
+    }
+}
+
+/// `Some` iff `block` is a well-formed `thinking` or `redacted_thinking` block.
+fn issued_block(block: &Value) -> Option<IssuedBlock> {
+    let text = |key: &str| block.get(key).and_then(Value::as_str).map(str::to_string);
+    match block.get("type").and_then(Value::as_str)? {
+        "thinking" => Some(IssuedBlock::Thinking {
+            signature: text("signature")?,
+            thinking: text("thinking")?,
+        }),
+        "redacted_thinking" => Some(IssuedBlock::Redacted {
+            data: text("data")?,
+        }),
+        _ => None,
+    }
 }
 
 /// Structural/metadata field names on a content block that must never be substituted — round-2
@@ -100,7 +134,8 @@ const BLOCK_METADATA_KEYS: &[&str] = &["type", "id", "name", "signature", "tool_
 /// Demasks one content block: every field except [`BLOCK_METADATA_KEYS`] is recursively
 /// demasked, regardless of the block's `"type"` — still classifier-free (forward-compatible
 /// with any future block kind's own payload fields), just no longer blind to which top-level
-/// keys are structural.
+/// keys are structural. `thinking`/`redacted_thinking` blocks are the one exception, left
+/// entirely untouched (see the module doc).
 fn demask_content_block(
     block: &mut Value,
     bindings: &[PlaceholderBinding],
@@ -110,6 +145,12 @@ fn demask_content_block(
     let Value::Object(map) = block else {
         return;
     };
+    if matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    ) {
+        return;
+    }
     for (key, v) in map.iter_mut() {
         if BLOCK_METADATA_KEYS.contains(&key.as_str()) {
             continue;
@@ -202,6 +243,8 @@ mod tests {
 
     use serde_json::{json, Value};
     use tempfile::TempDir;
+
+    use crate::codec::IssuedBlock;
 
     use vg_audit::JsonlAuditSink;
     use vg_core::{
@@ -316,7 +359,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         let text = demasked["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("jane.doe@example.com"), "text: {text}");
@@ -345,7 +388,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         let text = demasked["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("jane.doe@example.com"), "text: {text}");
@@ -359,7 +402,7 @@ mod tests {
         let namespace = ns();
 
         let body = b"not json at all";
-        let demasked = demask_response(body, &[], &policy, &namespace);
+        let demasked = demask_response(body, &[], &policy, &namespace).body;
         assert_eq!(demasked, body);
     }
 
@@ -370,7 +413,7 @@ mod tests {
         let namespace = ns();
 
         let body = serde_json::to_vec(&json!({"id": "msg_1", "type": "message"})).unwrap();
-        let demasked = demask_response(&body, &[], &policy, &namespace);
+        let demasked = demask_response(&body, &[], &policy, &namespace).body;
         assert_eq!(demasked, body);
     }
 
@@ -393,7 +436,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         let to = demasked["content"][0]["input"]["to"].as_str().unwrap();
         assert_eq!(to, "jane.doe@example.com");
@@ -404,13 +447,12 @@ mod tests {
         );
     }
 
-    /// Round-2 doubt-pass regression (Codex-class finding, single-model round): an earlier
-    /// version classified content blocks via `ContentBlockKind` and only special-cased `text`/
-    /// `tool_use`, silently leaving any other real Anthropic block kind (`thinking`,
-    /// `server_tool_use`, ...) untouched — a placeholder echoed inside one would never resolve.
-    /// `thinking` is real, not hypothetical: extended-thinking responses carry it today.
+    /// Round-2 doubt-pass regression (single-model round): an earlier version classified
+    /// content blocks via `ContentBlockKind` and only special-cased `text`/`tool_use`, silently
+    /// leaving other real block kinds (`server_tool_use`, ...) untouched — a placeholder echoed
+    /// inside one would never resolve. Still true for every kind except thinking (next test).
     #[test]
-    fn a_placeholder_echoed_inside_a_thinking_block_still_resolves() {
+    fn a_placeholder_echoed_inside_a_non_text_block_kind_still_resolves() {
         let dir = TempDir::new().expect("temp dir");
         let policy = build_policy(dir.path());
         let namespace = ns();
@@ -420,23 +462,63 @@ mod tests {
 
         let response = json!({
             "content": [
-                {"type": "thinking", "thinking": format!("I should contact {masked_text}"), "signature": "sig"},
-                {"type": "text", "text": "Done."}
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": format!("who is {masked_text}")}}
             ]
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
-        let thinking = demasked["content"][0]["thinking"].as_str().unwrap();
-        assert!(
-            thinking.contains("jane.doe@example.com"),
-            "thinking: {thinking}"
+        let query = demasked["content"][0]["input"]["query"].as_str().unwrap();
+        assert!(query.contains("jane.doe@example.com"), "query: {query}");
+        assert_eq!(demasked["content"][0]["name"], json!("web_search"));
+    }
+
+    /// veil-proxy#86 finding 1: thinking blocks are left exactly as the API issued them, so the
+    /// client's replay in the next request is byte-identical to what `signature` covers. This
+    /// reverses the earlier "a placeholder inside a thinking block resolves" behaviour on
+    /// purpose; the streaming path (what the real CLI uses) never demasked thinking anyway.
+    #[test]
+    fn thinking_and_redacted_thinking_blocks_are_left_placeholder_bearing() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let namespace = ns();
+
+        let (masked_text, bindings) =
+            mask_and_get_bindings("jane.doe@example.com", &namespace, &policy);
+
+        let thinking = json!({"type": "thinking", "thinking": format!("I should contact {masked_text}"), "signature": "sig"});
+        let redacted =
+            json!({"type": "redacted_thinking", "data": format!("opaque {masked_text}")});
+        let response = json!({
+            "content": [
+                thinking.clone(),
+                redacted.clone(),
+                {"type": "text", "text": format!("Contacting {masked_text}.")}
+            ]
+        });
+        let body = serde_json::to_vec(&response).unwrap();
+
+        let result = demask_response(&body, &bindings, &policy, &namespace);
+        assert_eq!(
+            result.issued,
+            vec![
+                IssuedBlock::Thinking {
+                    signature: "sig".to_string(),
+                    thinking: format!("I should contact {masked_text}"),
+                },
+                IssuedBlock::Redacted {
+                    data: format!("opaque {masked_text}"),
+                },
+            ],
+            "both blocks are recorded for verbatim replay"
         );
-        assert!(!thinking.contains("EMAIL_001"), "thinking: {thinking}");
-        // The block's own structural fields survive untouched.
-        assert_eq!(demasked["content"][0]["type"], json!("thinking"));
-        assert_eq!(demasked["content"][0]["signature"], json!("sig"));
+        let demasked: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(demasked["content"][0], thinking);
+        assert_eq!(demasked["content"][1], redacted);
+        // Ordinary text in the same response is still demasked.
+        let text = demasked["content"][2]["text"].as_str().unwrap();
+        assert!(text.contains("jane.doe@example.com"), "text: {text}");
     }
 
     /// Round-2 doubt-pass regression (Codex): the fix for the *previous* finding (demask every
@@ -468,7 +550,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         assert_eq!(
             demasked["content"][0]["name"],
@@ -492,7 +574,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &[], &policy, &namespace);
+        let demasked = demask_response(&body, &[], &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         assert_eq!(demasked["id"], json!("msg_1"));
         assert_eq!(demasked["model"], json!("claude-x"));
@@ -515,7 +597,7 @@ mod tests {
         let response = json!({"content": [{"type": "text", "text": masked_text.clone()}]});
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &bindings, &denying_policy, &namespace);
+        let demasked = demask_response(&body, &bindings, &denying_policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         let text = demasked["content"][0]["text"].as_str().unwrap();
         assert_eq!(
@@ -533,7 +615,7 @@ mod tests {
         let response = json!({"content": [{"type": "text", "text": "EMAIL_001 is here"}]});
         let body = serde_json::to_vec(&response).unwrap();
 
-        let demasked = demask_response(&body, &[], &policy, &namespace);
+        let demasked = demask_response(&body, &[], &policy, &namespace).body;
         let demasked: Value = serde_json::from_slice(&demasked).unwrap();
         assert_eq!(demasked["content"][0]["text"], json!("EMAIL_001 is here"));
     }

@@ -23,6 +23,9 @@
 
 pub mod anthropic;
 
+use std::collections::HashSet;
+use std::hash::{BuildHasher, RandomState};
+
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method};
 use vg_core::{Context, Namespace, PlaceholderBinding, Policy};
@@ -36,6 +39,80 @@ use crate::route::RouteVerdict;
 // `pub(crate)`, matching its pre-H2b visibility exactly.
 pub use anthropic::mask_request::MaskRequestError;
 pub(crate) use anthropic::mask_request::MaskedRequest;
+
+/// One extended-thinking block exactly as the upstream issued it in a response (veil-proxy#86
+/// finding 1). Recorded per session so a later request replaying it can be forwarded verbatim:
+/// the upstream wrote those bytes, so sending them back discloses nothing new, and keeping them
+/// byte-identical keeps their signature valid even when the model's own thinking holds text a
+/// detector would flag (which re-masking would change).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssuedBlock {
+    Thinking { signature: String, thinking: String },
+    Redacted { data: String },
+}
+
+/// A session's record of every [`IssuedBlock`] seen so far, as keyed 64-bit fingerprints (the
+/// block text itself is never retained). `RandomState` is seeded per process, so a client can't
+/// precompute a collision to get an unissued block forwarded unmasked.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IssuedThinking {
+    hasher: RandomState,
+    seen: HashSet<u64>,
+}
+
+impl IssuedThinking {
+    fn fingerprint(&self, block: IssuedBlockRef<'_>) -> u64 {
+        match block {
+            IssuedBlockRef::Thinking {
+                signature,
+                thinking,
+            } => self.hasher.hash_one(("thinking", signature, thinking)),
+            IssuedBlockRef::Redacted { data } => self.hasher.hash_one(("redacted", data)),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, block: &IssuedBlock) {
+        let fingerprint = self.fingerprint(block.as_ref());
+        self.seen.insert(fingerprint);
+    }
+
+    pub(crate) fn contains(&self, block: IssuedBlockRef<'_>) -> bool {
+        self.seen.contains(&self.fingerprint(block))
+    }
+}
+
+/// Borrowed form of [`IssuedBlock`], for lookups straight from a request body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IssuedBlockRef<'a> {
+    Thinking {
+        signature: &'a str,
+        thinking: &'a str,
+    },
+    Redacted {
+        data: &'a str,
+    },
+}
+
+impl IssuedBlock {
+    fn as_ref(&self) -> IssuedBlockRef<'_> {
+        match self {
+            Self::Thinking {
+                signature,
+                thinking,
+            } => IssuedBlockRef::Thinking {
+                signature,
+                thinking,
+            },
+            Self::Redacted { data } => IssuedBlockRef::Redacted { data },
+        }
+    }
+}
+
+/// A demasked response body plus every thinking block the upstream issued in it.
+pub(crate) struct DemaskedResponse {
+    pub(crate) body: Vec<u8>,
+    pub(crate) issued: Vec<IssuedBlock>,
+}
 
 /// The result of applying a codec's header-forwarding policy (Track H fork F4,
 /// decided 2026-09-14: prefix allowlist + named singletons + a credential-shaped
@@ -72,13 +149,15 @@ pub(crate) trait Codec: Send + Sync {
     fn select_headers(&self, inbound: &HeaderMap) -> SelectedHeaders;
 
     /// Masks a request body through the shared `vg_core::mask` pipeline, using this
-    /// codec's own request-tree walk shape.
+    /// codec's own request-tree walk shape. `issued` is the session's record of thinking
+    /// blocks the upstream issued, which may be forwarded verbatim.
     fn mask_request(
         &self,
         body: &[u8],
         ctx: &Context,
         policy: &Policy,
         namespace: &Namespace,
+        issued: &IssuedThinking,
     ) -> Result<MaskedRequest, MaskRequestError>;
 
     /// Demasks a complete, non-streaming response body. Infallible by design — see
@@ -89,7 +168,7 @@ pub(crate) trait Codec: Send + Sync {
         bindings: &[PlaceholderBinding],
         policy: &Policy,
         namespace: &Namespace,
-    ) -> Vec<u8>;
+    ) -> DemaskedResponse;
 
     /// Demasks a complete, fully-buffered SSE response body (A2's buffer-first
     /// design). See [`anthropic::stream_demask`]'s own doc for its scope.
@@ -99,5 +178,5 @@ pub(crate) trait Codec: Send + Sync {
         bindings: &[PlaceholderBinding],
         policy: &Policy,
         namespace: &Namespace,
-    ) -> Vec<u8>;
+    ) -> DemaskedResponse;
 }

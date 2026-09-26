@@ -828,3 +828,228 @@ async fn send_request_with_namespace(
         .expect("read response");
     response
 }
+
+/// `(addr, captured request bodies, the SSE body every response streams — settable between
+/// requests, shutdown sender, server task handle)`.
+type SseMockUpstream = (
+    SocketAddr,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<String>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+);
+
+/// A mock upstream that answers every request with a settable `text/event-stream` body and
+/// records every request body — the shape the real `claude` CLI actually gets (it always
+/// streams). Same "await each round trip before changing the body" caveat as
+/// `spawn_configurable_mock_upstream`.
+fn spawn_sse_mock_upstream() -> SseMockUpstream {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock upstream");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let listener = TcpListener::from_std(listener).expect("tokio listener");
+    let addr = listener
+        .local_addr()
+        .expect("mock upstream has a local addr");
+
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sse_body = Arc::new(Mutex::new(String::new()));
+    let captured_for_task = Arc::clone(&captured);
+    let sse_body_for_task = Arc::clone(&sse_body);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => return,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let io = TokioIo::new(stream);
+                    let captured = Arc::clone(&captured_for_task);
+                    let sse_body = Arc::clone(&sse_body_for_task);
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let captured = Arc::clone(&captured);
+                            let sse_body = Arc::clone(&sse_body);
+                            async move {
+                                let body = req
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .map(|c| c.to_bytes().to_vec())
+                                    .unwrap_or_default();
+                                captured.lock().unwrap().push(body);
+                                let text = sse_body.lock().unwrap().clone();
+                                let resp = Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/event-stream")
+                                    .body(Full::new(Bytes::from(text)))
+                                    .unwrap();
+                                Ok::<_, Infallible>(resp)
+                            }
+                        });
+                        let _ = http1::Builder::new().serve_connection(io, service).await;
+                    });
+                }
+            }
+        }
+    });
+
+    (addr, captured, sse_body, shutdown_tx, join)
+}
+
+fn sse(data: serde_json::Value) -> String {
+    format!(
+        "event: {}\ndata: {data}\n\n",
+        data["type"].as_str().expect("event has a type")
+    )
+}
+
+/// veil-proxy#86 findings 1 and 2 together, over real HTTP — the loop a default Claude Code
+/// session runs. Turn 1's streamed response carries a thinking block and an `Edit` tool call
+/// whose `old_string` holds a placeholder split across `input_json_delta` fragments. The client
+/// must get the real value in the tool call (finding 2) and the thinking block exactly as
+/// issued. Turn 2 replays that assistant turn plus a raw `tool_result`: it must be forwarded,
+/// not fail closed (finding 1), with the thinking block byte-identical (via the session's
+/// issued-thinking record, since its text holds a detectable value) and no raw vault value in
+/// the upstream body.
+#[tokio::test]
+async fn a_multi_turn_thinking_and_tool_use_session_round_trips_without_raw_egress() {
+    let dir = TempDir::new().expect("temp dir");
+    let daemon = Arc::new(open_daemon(&dir));
+    let (upstream_addr, captured, sse_body, upstream_shutdown, upstream_join) =
+        spawn_sse_mock_upstream();
+    let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
+
+    let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind should succeed on loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(vg_proxy::server::run_with_listener(
+        listener,
+        Arc::clone(&daemon),
+        upstream,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    let namespace = session_header();
+    let raw = "jane.doe@example.com";
+
+    // Turn 1: the file content the model reads carries the raw email; it's masked to EMAIL_001.
+    // The model's own thinking names a fixture address it made up. It is upstream-authored, so
+    // replaying it discloses nothing, but a detector flags it: only the issued-thinking record
+    // (filled from this streamed response) keeps the replay byte-identical in turn 2.
+    let thinking_text =
+        "The invoice line mentions EMAIL_001; I'll edit it and add fixture.user@example.com.";
+    let signature =
+        "EqQBCkYIBxgCKkDzQ9vR2kLm7Pw4Rt6Yv1Bn8Fs3Hd5Jc0Ga4WeZx9Kq2Lm7Pw4Rt6Yv1Bn8Fs3Hd5";
+    let input_json = r#"{"file_path":"billing/invoice.py","old_string":"send to EMAIL_001 now","new_string":"fixed"}"#;
+    let split = input_json.find("EMAIL_").unwrap() + 3;
+    let mut stream = String::new();
+    stream.push_str(&sse(serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "role": "assistant", "content": []}})));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}})));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking_text}})));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": signature}})));
+    stream.push_str(&sse(
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    ));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "Edit", "input": {}}})));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": &input_json[..split]}})));
+    stream.push_str(&sse(serde_json::json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": &input_json[split..]}})));
+    stream.push_str(&sse(
+        serde_json::json!({"type": "content_block_stop", "index": 1}),
+    ));
+    stream.push_str(&sse(serde_json::json!({"type": "message_stop"})));
+    *sse_body.lock().unwrap() = stream;
+
+    let body_1 = serde_json::json!({
+        "stream": true,
+        "thinking": {"type": "adaptive"},
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "fix billing/invoice.py"},
+            {"type": "tool_result", "tool_use_id": "toolu_0", "content": format!("send to {raw} now")}
+        ]}]
+    });
+    let response_1 = send_request_with_namespace(
+        addr,
+        "POST",
+        "/v1/messages",
+        body_1.to_string().as_bytes(),
+        Some(&namespace),
+    )
+    .await;
+    assert!(
+        response_1.starts_with("HTTP/1.1 200"),
+        "response_1: {response_1}"
+    );
+    // Finding 2: the client's tool call carries the real value, reassembled in one fragment.
+    assert!(
+        response_1.contains(r#"\"old_string\":\"send to jane.doe@example.com now\""#),
+        "the tool call must reach the client demasked: {response_1}"
+    );
+    // Finding 1: the thinking block reaches the client exactly as issued.
+    assert!(
+        response_1.contains(thinking_text),
+        "response_1: {response_1}"
+    );
+    assert!(response_1.contains(signature), "response_1: {response_1}");
+
+    // Turn 2: the client replays turn 1 as it holds it — thinking verbatim, the tool call with
+    // its now-real input — plus the tool's raw output.
+    *sse_body.lock().unwrap() = sse(serde_json::json!({"type": "message_stop"}));
+    let thinking_block =
+        serde_json::json!({"type": "thinking", "thinking": thinking_text, "signature": signature});
+    let body_2 = serde_json::json!({
+        "stream": true,
+        "thinking": {"type": "adaptive"},
+        "messages": [
+            {"role": "user", "content": "fix billing/invoice.py"},
+            {"role": "assistant", "content": [
+                thinking_block.clone(),
+                {"type": "tool_use", "id": "toolu_1", "name": "Edit", "input": {
+                    "file_path": "billing/invoice.py",
+                    "old_string": format!("send to {raw} now"),
+                    "new_string": "fixed"
+                }}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": format!("edited the line that mailed {raw}")}
+            ]}
+        ]
+    });
+    let response_2 = send_request_with_namespace(
+        addr,
+        "POST",
+        "/v1/messages",
+        body_2.to_string().as_bytes(),
+        Some(&namespace),
+    )
+    .await;
+    assert!(
+        response_2.starts_with("HTTP/1.1 200"),
+        "a replayed thinking turn must not fail closed: {response_2}"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should shut down promptly")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    let captured = captured.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2, "both turns reach the upstream");
+    for body in &captured {
+        let body = String::from_utf8_lossy(body);
+        assert!(!body.contains(raw), "no raw value may egress: {body}");
+    }
+    let forwarded_2: serde_json::Value = serde_json::from_slice(&captured[1]).unwrap();
+    assert_eq!(
+        forwarded_2["messages"][1]["content"][0], thinking_block,
+        "the replayed thinking block must reach the upstream byte-identical"
+    );
+
+    let _ = upstream_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), upstream_join).await;
+}

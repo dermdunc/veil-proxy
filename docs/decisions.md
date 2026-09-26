@@ -5814,3 +5814,111 @@ for merge. After merge, `main`'s own push-triggered CI run
 checked directly rather than assumed from the PR's own run. This closes the last open item from
 H2b/H2c/H1's own "known pre-existing gap" disclosures — `main` now has zero known findings across
 `cargo-audit`/`cargo-deny check`.
+
+## 2026-09-26 — `veil-proxy#86`: real multi-turn Claude Code sessions through vg-proxy (thinking round-trip, streamed tool input, path precision, spaced-output residual)
+
+**Trigger.** veil-demo's Phase 1a feasibility spike ran the real `claude` CLI (2.1.283) through
+vg-proxy at `c98d5c8e` against the real API, on a multi-turn, tool-using task, and filed five
+findings as `dermdunc/veil-proxy#86`. This entry records what was decided for each. The issue
+itself left the design choices to maintainers.
+
+**Finding 1 (blocking): `thinking`/`redacted_thinking` blocks in request history failed the
+whole request closed** (`ContentBlockKind::Unknown`), so a default Opus 5.5 session died at the
+first request after a thinking turn. **Decision: forward them, with a round-trip designed so no
+raw value can go upstream however the API treats an altered block.**
+- The response side never demasks thinking. Streaming never did (`thinking_delta` was always
+  passed through); the non-streaming path now skips `thinking`/`redacted_thinking` to match,
+  **deliberately reversing** the 2026-08-24 M4 round-1 fix that made placeholders inside
+  thinking resolve. Cost: a placeholder the model mentions in its thinking stays a placeholder
+  in the client's thinking display.
+- Every thinking block a response carries (streamed or not) is recorded per session as a keyed
+  64-bit fingerprint (`codec::IssuedThinking`, held in `SessionShim`). A replayed block matching
+  the record is forwarded verbatim: the upstream wrote those bytes, so returning them discloses
+  nothing new, and the signature stays valid even when the model's own thinking holds text a
+  detector flags.
+- A block not on the record falls back to masking the `thinking` text (never `signature`). At
+  worst the API rejects an altered block; nothing raw goes upstream through the text.
+- Thinking blocks are accepted only in `assistant` messages and only with their own fields.
+  Unissued `signature`/`redacted_thinking.data` must be non-empty base64/base64url (shape
+  only; see round 2 below for why no detector check). Named residual: base64-alphabet raw
+  content (a bare IBAN, a hex secret) can ride in an unissued signature.
+- **Not verified:** whether the API checks earlier turns' thinking against its signature, or
+  accepts altered/stripped thinking. The design is safe either way; the live re-run below
+  settles which case applies.
+
+**Finding 2: streaming demask skipped `input_json_delta`**, so tool calls reached the client with
+literal placeholders and `Edit` could never match the real file (the non-streaming path already
+demasked `tool_use.input`). **Decision: per content-block index, reassemble the fragments,
+demask each JSON string value in place, and emit one consolidated delta**, mirroring the
+existing `text_delta` consolidation. Keys, numbers and layout are copied byte-for-byte; if
+nothing resolves, or the JSON doesn't parse, the original fragments pass through untouched.
+
+**Finding 3: entropy detector flagged ordinary paths.** Measuring the issue's own tokens against
+the real detector first showed its table was partly wrong: letters-only paths
+(`/Users/alice/Development/acme-billing`) and identifiers were **already excluded** by
+`is_structured_segments`. The real trigger was any one segment mixing letters and digits
+(`phase-1a`, `run3`, `v2`, `abc123`) or an npm scope (`@types`). **Decision: a "path mode" for
+tokens containing `/`**: a leading `@` per `/` component is stripped, and short lowercase
+letter/digit segments are allowed within a whole-token budget (at most one per `/` component,
+at most two per token, at most 8 bytes in total, no digit-only segment over 4 bytes beside
+them), provided a real word segment exists and every letters-only segment is word-cased. Measured on 200k random keys per shape, the
+false-negative rate for 20-, 32- and 40-byte base64/base64url secrets is essentially unchanged
+(20-byte: 2.56% → 2.67% under the first version; the final version is strictly tighter). That
+2.6% baseline for short base64 containing `/` is pre-existing and now named in the code. No
+real Claude Code request corpus was available for a precision before/after (the spike kept
+none); named, not faked.
+
+**Finding 4: character-per-cell and hex-dump tool output evades every detector.** **Decision:
+name and measure, don't mitigate yet.** Filed as `RISK-0015`; `crates/vg-detectors/tests/
+known_gaps.rs` pins the current "not detected" behaviour for `od -c`, `xxd` and `fold -w1`, with
+entity-specific assertions (the `xxd` hex groups already trip the phone detector, a false
+positive that says nothing about the email inside). A normalising pre-pass is a candidate for
+its own design note.
+
+**Finding 5 (informational): no code change.** `metadata.user_id` is forwarded unmasked by
+design (masking walks only `system`/`messages`); the forwarded
+`anthropic-dangerous-direct-browser-access` header is an F4 review candidate. Both are queued in
+`docs/next-actions.md`.
+
+**Adversarial review, round 1 (fresh-context subagent).** Found three real problems in the first
+version, all fixed, each with a regression test reproducing the reviewer's own counterexample:
+- **Critical:** path mode as first written (split on every `@`, any number of mixed-case short
+  segments) stopped flagging credentials that `main` flagged: database URLs with userinfo
+  (`postgres://app:Xk9mQ2vL@db.internal/prod`), share/reset/invite links, and grouped keys once
+  a `/` appeared. Fixed by the guards above.
+- **High:** the first thinking fix forwarded raw values that `main` blocked: a raw value in
+  `signature`, in `redacted_thinking.data`, in an extra field, or in a thinking block with
+  `role: user`. Fixed by the shape, role and opaque-token checks.
+- **Medium:** the first tool-input fix re-serialized every streamed tool input through
+  `serde_json::Value`, sorting keys, collapsing duplicates and turning big integers/`1e2` into
+  lossy floats even when nothing needed demasking. Fixed by the byte-preserving substitution.
+- **Plausible:** re-masking the model's own thinking could change the signed bytes on every
+  later turn and stall a session permanently. Addressed by the issued-thinking record.
+
+**Adversarial review, round 2 (fresh-context subagent, targeted at round 1's fixes).** Two
+real problems, both fixed with regression tests; the lossless tool-input demask (14 edge cases
+compared against parse-and-compare semantics) and the issued-thinking record itself (keyed,
+length-delimited fingerprint, per-namespace, recorded only from upstream responses) held up.
+- **High:** the per-component limit on short mixed segments was bypassed by `/`-separated
+  groups (`/share/k3j9x2q8/p5r8t3v2/n6b9c4d7`, `/v1/keys/9f86d081/884c7d65/...`), digit runs
+  beside a mixed piece, and the same inside a `KEY=value` (the `=` split calls
+  `is_structured_segments` on each half). Fixed by the whole-token budget.
+- **High (resumed sessions):** the detector check on unissued signatures rejected about 8.6%
+  of random 200-800 char base64 strings (the IBAN detector matches fragments), so after a
+  proxy restart or `--resume` one false hit would fail every later request. Dropped the
+  detector check; shape only, residual named above.
+- Named, not fixed: `issued_thinking_for` clones the whole per-session set on every request,
+  O(n) in a long session (cost only, 8 bytes per block).
+
+**Stopping point.** The round-2 fixes were small and targeted (budget constants on an existing
+rule; removing a check), and each reviewer counterexample from both rounds is a passing test.
+A third external round was judged disproportionate; named here rather than left implicit, same
+posture as earlier entries.
+
+**Verification.** `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
+`cargo test --workspace` (560 passed, 0 failed). New tests include an over-HTTP two-turn
+session (streamed thinking + a split-placeholder `Edit` call, then a replay) asserting the
+client gets the real value in the tool call, the replayed thinking block reaches the upstream
+byte-identical via the issued record, and no raw vault value appears in either upstream body.
+**Not yet done:** a live run against the real API with the default model and thinking on. That
+is the acceptance gate, owned by veil-demo's re-run of `spikes/phase-1a/` after a pin bump.

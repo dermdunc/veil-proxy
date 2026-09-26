@@ -6,6 +6,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use vg_core::{Namespace, PlaceholderBinding, SessionId};
 
+use crate::codec::{IssuedBlock, IssuedThinking};
+
 /// The header `vg run` injects to carry a session's namespace token (plan §5 H2). Header-name
 /// lookups against `hyper::HeaderMap` are already case-insensitive, so the exact casing here
 /// only matters for what gets written on the injection side.
@@ -92,6 +94,7 @@ pub enum SessionError {
 pub struct SessionShim {
     addr_registrations: Mutex<HashMap<SocketAddr, Namespace>>,
     binding_store: Mutex<HashMap<Namespace, Vec<PlaceholderBinding>>>,
+    issued_thinking: Mutex<HashMap<Namespace, IssuedThinking>>,
 }
 
 impl SessionShim {
@@ -99,6 +102,7 @@ impl SessionShim {
         Self {
             addr_registrations: Mutex::new(HashMap::new()),
             binding_store: Mutex::new(HashMap::new()),
+            issued_thinking: Mutex::new(HashMap::new()),
         }
     }
 
@@ -208,6 +212,30 @@ impl SessionShim {
     /// for it, which is the expected state for every namespace in M2.
     pub fn bindings_for(&self, namespace: &Namespace) -> Vec<PlaceholderBinding> {
         lock(&self.binding_store)
+            .get(namespace)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+impl SessionShim {
+    /// Records thinking blocks the upstream issued to `namespace` (veil-proxy#86 finding 1).
+    /// Same unbounded, no-eviction lifetime as the binding store above (the plan's own open
+    /// question), at 8 bytes per block.
+    pub(crate) fn record_issued_thinking(&self, namespace: &Namespace, blocks: &[IssuedBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+        let mut store = lock(&self.issued_thinking);
+        let record = store.entry(namespace.clone()).or_default();
+        for block in blocks {
+            record.insert(block);
+        }
+    }
+
+    /// `namespace`'s issued-thinking record so far (empty if none).
+    pub(crate) fn issued_thinking_for(&self, namespace: &Namespace) -> IssuedThinking {
+        lock(&self.issued_thinking)
             .get(namespace)
             .cloned()
             .unwrap_or_default()

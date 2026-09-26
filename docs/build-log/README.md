@@ -68,3 +68,4 @@ That can grow into a published site later if it earns one — see
 - [2026-09-15 — The safety net that moved](2026-09-15-the-safety-net-that-moved.md)
 - [2026-09-15 — The timeout test that tested nothing](2026-09-15-the-timeout-test-that-tested-nothing.md)
 - [2026-09-15 — The client asked for /v1. The server only understood /backend-api/codex.](2026-09-15-the-client-asked-for-v1.md)
+- [2026-09-26 — The bug report that measured the wrong thing](2026-09-26-the-bug-report-that-measured-the-wrong-thing.md)

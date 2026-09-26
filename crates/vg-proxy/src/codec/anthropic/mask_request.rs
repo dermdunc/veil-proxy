@@ -39,6 +39,35 @@
 //! text vs. base64 vs. url — is a named, deferred gap, not built here). Any other/unrecognized
 //! content-block `"type"` also blocks the whole request — fail-closed, per plan §10.2.
 //!
+//! **Thinking blocks (veil-proxy#86 finding 1).** A real default Claude Code session replays
+//! the model's own `thinking`/`redacted_thinking` blocks in `messages[]` history on every later
+//! turn (the CLI keeps them via `context_management` `clear_thinking_… keep: all`). Classifying
+//! them `Unknown` failed every such session closed at the first request after a thinking turn.
+//! The round-trip design, chosen so that **no raw value can egress whichever way the API treats
+//! an altered block**:
+//!
+//! - The response side never demasks thinking text (`stream_demask.rs` never touched
+//!   `thinking_delta`; `demask_response.rs` now skips `thinking`/`redacted_thinking` blocks to
+//!   match). So the client's copy of a thinking block is exactly what the API issued:
+//!   placeholder-bearing, byte-identical to what its `signature` covers.
+//! - Every thinking block a response carries is recorded per session as a keyed fingerprint
+//!   (`IssuedThinking`, filled by `Daemon` from both demask paths). A replayed block that
+//!   matches the record is forwarded verbatim: the upstream wrote those bytes, so returning them
+//!   discloses nothing new, and its signature stays valid even when the model's own thinking
+//!   holds text a detector would flag. Without this, re-masking that text would change the
+//!   signed bytes on every later turn (the CLI replays all thinking), a plausible way for a
+//!   session to fail permanently, raised by the fresh-context review of this change.
+//! - A block not on the record (the proxy restarted, or the client built it) falls back to
+//!   masking: the `thinking` text is masked like any other leaf and the `signature` must pass
+//!   `check_opaque_token` (base64 shape). At worst the API rejects the altered block with a 4xx; no raw value
+//!   goes upstream through the text.
+//! - Thinking blocks are accepted only in `assistant` messages and only with their own fields
+//!   (`type`/`thinking`/`signature`, `type`/`data`). `redacted_thinking.data` is API-encrypted
+//!   ciphertext: forwarded unchanged if issued, otherwise it must pass `check_opaque_token` too.
+//!   Named residual: an unissued `signature`/`data` carrying base64-alphabet raw content (a bare
+//!   IBAN, a hex secret) still goes upstream; `check_opaque_token` explains why no detector check
+//!   is applied. The client is the user's own tool; accepted.
+//!
 //! **Named trade-off, not fixed here: a block partway through does not undo vault interning
 //! already done by earlier fields in the same request.** `system`/`messages` are masked field
 //! by field, in order; if a later field triggers `BlockedContentBlock` (an `image` block in
@@ -59,6 +88,7 @@ use vg_core::{
     PlaceholderBinding, Policy,
 };
 
+use crate::codec::{IssuedBlockRef, IssuedThinking};
 use crate::schema::anthropic::ContentBlockKind;
 
 /// The result of masking one request body: the re-serialized masked bytes, plus everything the
@@ -97,6 +127,7 @@ pub(crate) fn mask_request(
     ctx: &Context,
     policy: &Policy,
     ns: &Namespace,
+    issued: &IssuedThinking,
 ) -> Result<MaskedRequest, MaskRequestError> {
     let mut value: Value = serde_json::from_slice(body)?;
     let root = value.as_object_mut().ok_or(MaskRequestError::NotAnObject)?;
@@ -121,7 +152,7 @@ pub(crate) fn mask_request(
                 "messages must be an array",
             ))?;
         for message in messages.iter_mut() {
-            mask_message(message, ctx, policy, ns, &mut acc)?;
+            mask_message(message, ctx, policy, ns, issued, &mut acc)?;
         }
     }
 
@@ -167,8 +198,10 @@ fn mask_message(
     ctx: &Context,
     policy: &Policy,
     ns: &Namespace,
+    issued: &IssuedThinking,
     acc: &mut MaskAccumulator,
 ) -> Result<(), MaskRequestError> {
+    let from_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
     let content = message
         .get_mut("content")
         .ok_or(MaskRequestError::MalformedMessage(
@@ -178,7 +211,7 @@ fn mask_message(
         Value::String(s) => mask_leaf_in_place(s, ctx, policy, ns, acc),
         Value::Array(blocks) => {
             for block in blocks.iter_mut() {
-                mask_content_block(block, ctx, policy, ns, acc)?;
+                mask_content_block(block, ctx, policy, ns, issued, from_assistant, acc)?;
             }
             Ok(())
         }
@@ -190,12 +223,15 @@ fn mask_message(
 
 /// One content block, dispatched by [`ContentBlockKind`]. `text` masks its own `text` field;
 /// `tool_use`/`tool_result` mask every string leaf inside `input`/`content` recursively;
+/// `thinking` masks its `thinking` text only; `redacted_thinking` passes through unchanged;
 /// `document`/`image`/anything unrecognized blocks the whole request.
 fn mask_content_block(
     block: &mut Value,
     ctx: &Context,
     policy: &Policy,
     ns: &Namespace,
+    issued: &IssuedThinking,
+    from_assistant: bool,
     acc: &mut MaskAccumulator,
 ) -> Result<(), MaskRequestError> {
     match ContentBlockKind::of(block) {
@@ -220,6 +256,21 @@ fn mask_content_block(
             Some(content) => mask_value_strings_recursive(content, ctx, policy, ns, acc),
             None => Ok(()),
         },
+        ContentBlockKind::Thinking => {
+            mask_thinking_block(block, ctx, policy, ns, issued, from_assistant, acc)
+        }
+        ContentBlockKind::RedactedThinking => {
+            check_thinking_shape(block, from_assistant, &["type", "data"])?;
+            let Some(Value::String(data)) = block.get("data") else {
+                return Err(MaskRequestError::MalformedMessage(
+                    "redacted_thinking content block missing its data field",
+                ));
+            };
+            if issued.contains(IssuedBlockRef::Redacted { data }) {
+                return Ok(());
+            }
+            check_opaque_token(data)
+        }
         ContentBlockKind::Document => Err(MaskRequestError::BlockedContentBlock(
             "document".to_string(),
         )),
@@ -232,6 +283,88 @@ fn mask_content_block(
         ContentBlockKind::Unknown(_) => Err(MaskRequestError::BlockedContentBlock(
             "unrecognized".to_string(),
         )),
+    }
+}
+
+/// A `thinking` block: forwarded verbatim if the upstream issued exactly this block to this
+/// session; otherwise its `signature` must be an opaque token and its `thinking` text is masked.
+/// See the module doc's "Thinking blocks" section.
+fn mask_thinking_block(
+    block: &mut Value,
+    ctx: &Context,
+    policy: &Policy,
+    ns: &Namespace,
+    issued: &IssuedThinking,
+    from_assistant: bool,
+    acc: &mut MaskAccumulator,
+) -> Result<(), MaskRequestError> {
+    check_thinking_shape(block, from_assistant, &["type", "thinking", "signature"])?;
+    let (Some(Value::String(signature)), Some(Value::String(thinking))) =
+        (block.get("signature"), block.get("thinking"))
+    else {
+        return Err(MaskRequestError::MalformedMessage(
+            "thinking content block needs string thinking and signature fields",
+        ));
+    };
+    if issued.contains(IssuedBlockRef::Thinking {
+        signature,
+        thinking,
+    }) {
+        return Ok(());
+    }
+    check_opaque_token(signature)?;
+    match block.get_mut("thinking") {
+        Some(Value::String(s)) => mask_leaf_in_place(s, ctx, policy, ns, acc),
+        _ => unreachable!("checked to be a string just above"),
+    }
+}
+
+/// Thinking blocks are model output, so they are only valid in `assistant` messages, and they
+/// may carry no field beyond `allowed`. Review finding: without both checks, a thinking-shaped
+/// block in a `user` message, or an extra field on one, forwarded content unmasked that `main`
+/// used to block.
+fn check_thinking_shape(
+    block: &Value,
+    from_assistant: bool,
+    allowed: &[&str],
+) -> Result<(), MaskRequestError> {
+    if !from_assistant {
+        return Err(MaskRequestError::MalformedMessage(
+            "thinking blocks are only valid in assistant messages",
+        ));
+    }
+    let Value::Object(map) = block else {
+        return Err(MaskRequestError::MalformedMessage(
+            "content block is not an object",
+        ));
+    };
+    if map.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return Err(MaskRequestError::MalformedMessage(
+            "thinking content block carries an unexpected field",
+        ));
+    }
+    Ok(())
+}
+
+/// A `signature` or `redacted_thinking.data` value that isn't on the issued record goes upstream
+/// unmasked (masking would corrupt it), so it must at least be shaped like what the API issues:
+/// non-empty base64/base64url. That alone rejects anything with spaces, `@`, `.`, `:` and the
+/// like (an email, prose, a URL). **Deliberately no detector check** (round-2 review finding):
+/// the IBAN detector matches fragments of about 8.6% of random 200-800 char base64 strings, and
+/// one false hit fails every later request in a resumed session, since history replays all
+/// thinking. Named residual: a raw value that is itself base64-alphabet (a bare IBAN, a hex or
+/// base64 secret) can ride in an unissued `signature`/`data`.
+fn check_opaque_token(token: &str) -> Result<(), MaskRequestError> {
+    let base64_shaped = !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if base64_shaped {
+        Ok(())
+    } else {
+        Err(MaskRequestError::MalformedMessage(
+            "thinking signature/data is not an opaque base64 token",
+        ))
     }
 }
 
@@ -353,6 +486,7 @@ mod tests {
     use vg_vault::{Vault, VaultConfig};
 
     use super::{mask_request, MaskRequestError};
+    use crate::codec::{IssuedBlock, IssuedThinking};
 
     const TEST_KEY: [u8; 32] = [7u8; 32];
     const SECRET_TOKEN: &str = "Zx9Kq2Lm7Pw4Rt6Yv1Bn8Fs3Hd5Jc0Ga4We";
@@ -397,7 +531,9 @@ mod tests {
     fn run(body: &Value, policy: &Policy) -> Result<Value, MaskRequestError> {
         let bytes = serde_json::to_vec(body).expect("fixture serializes");
         let namespace = ns();
-        let masked = with_real_context(|ctx| mask_request(&bytes, ctx, policy, &namespace))?;
+        let masked = with_real_context(|ctx| {
+            mask_request(&bytes, ctx, policy, &namespace, &IssuedThinking::default())
+        })?;
         Ok(serde_json::from_slice(&masked.body).expect("masked body is valid JSON"))
     }
 
@@ -665,6 +801,197 @@ mod tests {
         assert!(matches!(err, MaskRequestError::MalformedMessage(_)));
     }
 
+    /// veil-proxy#86 finding 1: the exact history shape a default Claude Code session sends
+    /// after a thinking turn — an assistant `[thinking, tool_use]` turn followed by a
+    /// `tool_result` user turn. It must be forwarded, not blocked, and the thinking block must
+    /// reach the upstream byte-identical (its `signature` covers the text) when its text is
+    /// already placeholder-bearing, which is what the client holds since responses never
+    /// demask thinking.
+    #[test]
+    fn a_replayed_thinking_block_is_forwarded_byte_identical_with_its_signature() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        // A realistic signature is long base64 — the exact shape the entropy detector redacts
+        // if anything ever masks it.
+        let signature = "EqQBCkYIBxgCKkDzQ9vR2kLm7Pw4Rt6Yv1Bn8Fs3Hd5Jc0Ga4WeZx9Kq2Lm7Pw4Rt6Yv1Bn8Fs3Hd5Jc0Ga4We";
+        let thinking_block = json!({
+            "type": "thinking",
+            "thinking": "The user wants invoices sent to EMAIL_001. I should read billing/invoice.py first.",
+            "signature": signature
+        });
+        let body = json!({
+            "system": "hi",
+            "messages": [
+                {"role": "user", "content": "fix the failing test"},
+                {"role": "assistant", "content": [
+                    thinking_block.clone(),
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "billing/invoice.py"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "send to jane.doe@example.com"}
+                ]}
+            ]
+        });
+
+        let masked = run(&body, &policy).expect("a thinking turn in history must not fail closed");
+
+        assert_eq!(masked["messages"][1]["content"][0], thinking_block);
+        let masked_str = serde_json::to_string(&masked).unwrap();
+        assert!(
+            !masked_str.contains("jane.doe@example.com"),
+            "masked: {masked_str}"
+        );
+    }
+
+    /// A thinking block carrying a raw value (a client that demasked it itself) never sends the
+    /// raw value upstream: the text is masked, the signature is still left alone.
+    #[test]
+    fn a_raw_value_inside_a_replayed_thinking_block_is_masked_not_forwarded() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should email jane.doe@example.com", "signature": "sig"}
+                ]}
+            ]
+        });
+
+        let masked = run(&body, &policy).expect("masks successfully");
+        let block = &masked["messages"][0]["content"][0];
+        let thinking = block["thinking"].as_str().unwrap();
+        assert!(
+            !thinking.contains("jane.doe@example.com"),
+            "thinking: {thinking}"
+        );
+        assert!(thinking.contains("EMAIL_001"), "thinking: {thinking}");
+        assert_eq!(block["signature"], json!("sig"));
+    }
+
+    #[test]
+    fn a_redacted_thinking_block_is_forwarded_unchanged() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let redacted = json!({
+            "type": "redacted_thinking",
+            "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YfWXGmKDxH4mPnZ5sQ7vB8zT"
+        });
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": [redacted.clone(), {"type": "text", "text": "done"}]}
+            ]
+        });
+
+        let masked = run(&body, &policy).expect("redacted_thinking must not fail closed");
+        assert_eq!(masked["messages"][0]["content"][0], redacted);
+    }
+
+    #[test]
+    fn a_thinking_block_missing_its_text_or_a_redacted_block_missing_its_data_fails_closed() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        for block in [
+            json!({"type": "thinking", "signature": "sig"}),
+            json!({"type": "redacted_thinking"}),
+        ] {
+            let body = json!({"messages": [{"role": "assistant", "content": [block]}]});
+            let err = run(&body, &policy).expect_err("malformed thinking block must fail closed");
+            assert!(
+                matches!(err, MaskRequestError::MalformedMessage(_)),
+                "{err}"
+            );
+        }
+    }
+
+    /// Review findings (fresh-context adversarial round): each of these forwarded a raw value
+    /// unmasked under the first version of the thinking fix, and all were fail-closed on `main`.
+    #[test]
+    fn thinking_blocks_that_could_smuggle_raw_content_fail_closed() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let raw = "jane.doe@example.com";
+        let cases = [
+            // thinking in a user message
+            json!({"role": "user", "content": [{"type": "thinking", "thinking": "x", "signature": "sig"}]}),
+            // raw value in the signature
+            json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "x", "signature": raw}]}),
+            // extra field on a thinking block
+            json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "x", "signature": "sig", "extra": raw}]}),
+            // raw values in redacted data
+            json!({"role": "assistant", "content": [{"type": "redacted_thinking", "data": format!("{raw} GB33BUKB20201555555555")}]}),
+            // nested extra object on redacted_thinking
+            json!({"role": "assistant", "content": [{"type": "redacted_thinking", "data": "abc", "meta": {"note": raw}}]}),
+            // redacted_thinking in a user message
+            json!({"role": "user", "content": [{"type": "redacted_thinking", "data": "abc"}]}),
+        ];
+        for message in cases {
+            let body = json!({"messages": [message.clone()]});
+            let err = run(&body, &policy).expect_err("must fail closed");
+            assert!(
+                matches!(err, MaskRequestError::MalformedMessage(_)),
+                "{message}: {err}"
+            );
+        }
+    }
+
+    /// Round-2 review finding: a detector check on unissued signatures rejected ~8.6% of random
+    /// base64 signatures (IBAN false positives), permanently breaking resumed sessions. Realistic
+    /// random signatures must all pass the shape check.
+    #[test]
+    fn random_base64_signatures_are_accepted_by_the_opaque_token_check() {
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..500 {
+            let signature: String = (0..400)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    B64[(x % 64) as usize] as char
+                })
+                .collect();
+            super::check_opaque_token(&signature).expect("random base64 is accepted");
+        }
+    }
+
+    /// Review finding (plausible, not reproducible without the real API): the model's own
+    /// thinking can hold text a detector flags, and re-masking it would change the signed bytes
+    /// on every later turn. A block the upstream issued to this session is forwarded verbatim;
+    /// the same block not on the record is still masked.
+    #[test]
+    fn an_issued_thinking_block_is_forwarded_verbatim_and_an_unissued_one_is_masked() {
+        let dir = TempDir::new().expect("temp dir");
+        let policy = build_policy(dir.path());
+        let thinking = "I'll add a test fixture user, test.user@example.com, to the suite.";
+        let block = json!({"type": "thinking", "thinking": thinking, "signature": "EqQBCkYIBxgC"});
+        let body = json!({"messages": [{"role": "assistant", "content": [block.clone()]}]});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let namespace = ns();
+
+        let mut issued = IssuedThinking::default();
+        issued.insert(&IssuedBlock::Thinking {
+            signature: "EqQBCkYIBxgC".to_string(),
+            thinking: thinking.to_string(),
+        });
+        let masked =
+            with_real_context(|ctx| mask_request(&bytes, ctx, &policy, &namespace, &issued))
+                .expect("masks successfully");
+        let masked: Value = serde_json::from_slice(&masked.body).unwrap();
+        assert_eq!(
+            masked["messages"][0]["content"][0], block,
+            "issued: verbatim"
+        );
+
+        let masked = run(&body, &policy).expect("masks successfully");
+        let text = masked["messages"][0]["content"][0]["thinking"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !text.contains("test.user@example.com"),
+            "unissued: masked: {text}"
+        );
+    }
+
     #[test]
     fn unrecognized_content_block_type_blocks_the_whole_request() {
         let dir = TempDir::new().expect("temp dir");
@@ -726,7 +1053,15 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let policy = build_policy(dir.path());
         let namespace = ns();
-        let result = with_real_context(|ctx| mask_request(b"not json", ctx, &policy, &namespace));
+        let result = with_real_context(|ctx| {
+            mask_request(
+                b"not json",
+                ctx,
+                &policy,
+                &namespace,
+                &IssuedThinking::default(),
+            )
+        });
         assert!(matches!(result, Err(MaskRequestError::InvalidJson(_))));
     }
 
@@ -735,7 +1070,15 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let policy = build_policy(dir.path());
         let namespace = ns();
-        let result = with_real_context(|ctx| mask_request(b"[1,2,3]", ctx, &policy, &namespace));
+        let result = with_real_context(|ctx| {
+            mask_request(
+                b"[1,2,3]",
+                ctx,
+                &policy,
+                &namespace,
+                &IssuedThinking::default(),
+            )
+        });
         assert!(matches!(result, Err(MaskRequestError::NotAnObject)));
     }
 
