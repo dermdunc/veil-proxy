@@ -103,18 +103,19 @@ if grep -q "vg-proxy capture:" "$HARNESS_LOG"; then
   exit 1
 fi
 # Structure: format marker present, Mask exchanges numbered 1..N with no holes and every request
-# paired with a response (and no orphan responses), and no Pass-route request that carried a body
-# (Pass bodies go upstream unmasked and are never captured, so they could not be checked).
-python3 - "$CAPTURE_DIR" <<'PYEOF'
+# paired with a response and its metadata (and no orphan responses), no Pass-route request that
+# carried a body (Pass bodies go upstream unmasked and are never captured, so they could not be
+# checked), and the raw value in no recorded path or query string (those cross the wire unmasked).
+python3 - "$CAPTURE_DIR" "$SYNTHETIC_SECRET" <<'PYEOF'
 import json, os, re, sys
-d = sys.argv[1]
+d, secret = sys.argv[1], sys.argv[2]
 names = os.listdir(d)
 fail = lambda msg: sys.exit(f"FAIL: {msg}")
 if "capture-info.json" not in names:
     fail("capture-info.json missing: this vg-proxy build cannot vouch for Pass-route egress")
 info = json.load(open(os.path.join(d, "capture-info.json")))
-if info.get("format", 0) < 2 or not info.get("pass_route_metadata"):
-    fail(f"capture format too old to vouch for Pass-route egress: {info}")
+if info.get("format", 0) < 3 or not info.get("pass_route_metadata") or not info.get("mask_request_metadata"):
+    fail(f"capture format too old to vouch for every egress path: {info}")
 req = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-request\.masked\.json", n))}
 resp = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-response\.raw\.(?:sse|json)", n))}
 if not req:
@@ -123,10 +124,16 @@ if req != set(range(1, max(req) + 1)):
     fail(f"capture gap: request numbers are not contiguous: {sorted(req)}")
 if req != resp:
     fail(f"capture gap: unpaired exchanges (requests {sorted(req - resp)}, responses {sorted(resp - req)})")
+req_meta = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-request\.meta\.json", n))}
+if req_meta != req:
+    fail(f"capture gap: Mask request metadata does not match requests ({sorted(req_meta ^ req)})")
 for n in names:
-    if re.fullmatch(r"P\d{6,}-pass\.meta\.json", n):
+    is_pass = re.fullmatch(r"P\d{6,}-pass\.meta\.json", n)
+    if is_pass or re.fullmatch(r"\d{6,}-request\.meta\.json", n):
         meta = json.load(open(os.path.join(d, n)))
-        if meta.get("body_len", 1) != 0:
+        if secret in str(meta.get("path_and_query", "")):
+            fail(f"the raw synthetic secret is in a recorded path/query string ({n}) -- it crossed the wire unmasked")
+        if is_pass and meta.get("body_len", 1) != 0:
             fail(f"Pass-route request {meta.get('path_and_query')} carried a {meta.get('body_len')}-byte body upstream unmasked")
 print(f"    structure ok: {len(req)} paired Mask exchange(s), capture format {info['format']}")
 PYEOF

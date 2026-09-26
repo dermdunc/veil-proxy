@@ -6014,3 +6014,20 @@ protected); proposed in `docs/next-actions.md`.
 - fmt and clippy `-D warnings` clean by default and with `--features capture`. 560 workspace
   tests pass by default and 100 `vg-proxy` tests with `capture`.
 - `scripts/a2-live-proof.sh`: live PASS.
+
+**Cycle-2 addendum (same day).** A second fresh-context review of this follow-up found two more
+veilgremlin-side gaps, both fixed on the same branch:
+- **Mask-route query strings were uncaptured.** `classify_route` ignores the query, so `POST
+  /v1/messages?<anything>` is Mask and its query crosses the wire unmasked, with no record.
+  Each Mask exchange now also writes `NNNNNN-request.meta.json` (method, path-and-query), and
+  the capture format is now **3** (`mask_request_metadata: true`).
+- **A reused capture dir could mix runs.** Sequence numbers restart at 1 per process, so stale
+  higher-numbered files from an earlier run could pass contiguity checks. Capture now refuses a
+  non-empty directory, logging a `vg-proxy capture:` line that both consumers treat as fatal.
+  This has its own test binary, `tests/capture_nonempty_dir.rs`, and a mutation removing the
+  check fails it.
+
+`a2-live-proof.sh` now requires format 3, pairs request metadata with requests, and fails if
+the raw value appears in any recorded path or query string (Mask or Pass). Each of these was
+exercised offline against crafted dirs. Suite: 560 default / 101 with `capture`. A2 live PASS
+(format 3).

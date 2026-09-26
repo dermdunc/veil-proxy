@@ -5,8 +5,10 @@
 //!
 //! With the feature compiled in, capture is still off unless `VG_PROXY_CAPTURE_DIR` names a
 //! directory (read once, on the first masked request). Each `Mask`-route round trip then writes
-//! two files, numbered in arrival order:
+//! three files, numbered in arrival order:
 //!
+//! - `NNNNNN-request.meta.json`: the method and path-and-query the request was sent to (the
+//!   query string also crosses the wire and is not masked, so it must be on record too).
 //! - `NNNNNN-request.masked.json`: the exact bytes `upstream::forward` sends upstream, i.e.
 //!   after masking. This is what "nothing raw crossed the wire" is asserted against.
 //! - `NNNNNN-response.raw.{sse,json}`: the exact buffered upstream response bytes, **before**
@@ -27,6 +29,9 @@
 //!
 //! On first use, `capture-info.json` is written to the directory, declaring this format. A
 //! consumer can require it and so reject captures from a build without Pass-route metadata.
+//! Capture refuses to start in a **non-empty** directory (logging a `vg-proxy capture:` line):
+//! sequence numbers restart at 1 per process, so reusing a directory could silently mix an
+//! earlier run's files into this one's.
 //!
 //! **Known trade-offs (dev-only feature):** the request file is written just *before*
 //! `upstream::forward`, so if the send then fails (connect, TLS, timeout) a request file exists
@@ -46,7 +51,7 @@ use std::sync::OnceLock;
 pub const CAPTURE_DIR_ENV: &str = "VG_PROXY_CAPTURE_DIR";
 
 /// Version of the on-disk layout; bumped when a consumer-visible file kind changes.
-pub const CAPTURE_FORMAT: u32 = 2;
+pub const CAPTURE_FORMAT: u32 = 3;
 
 static CAPTURE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -70,9 +75,21 @@ fn capture_dir() -> Option<&'static Path> {
                 eprintln!("vg-proxy capture: cannot create capture dir, capture disabled: {err}");
                 return None;
             }
+            match std::fs::read_dir(&dir).map(|mut entries| entries.next().is_some()) {
+                Ok(false) => {}
+                Ok(true) => {
+                    eprintln!("vg-proxy capture: capture dir is not empty, capture disabled");
+                    return None;
+                }
+                Err(err) => {
+                    eprintln!("vg-proxy capture: cannot read capture dir, capture disabled: {err}");
+                    return None;
+                }
+            }
             let info = serde_json::json!({
                 "format": CAPTURE_FORMAT,
                 "pass_route_metadata": true,
+                "mask_request_metadata": true,
                 "request_written_before_send": true,
             });
             write_file(&dir, "capture-info.json", info.to_string().as_bytes());
@@ -112,8 +129,14 @@ fn write_file(dir: &Path, name: &str, bytes: &[u8]) {
 }
 
 impl CaptureSlot {
-    /// Writes the exact masked request body about to be sent upstream.
-    pub(crate) fn write_request(&self, masked_body: &[u8]) {
+    /// Writes where the request is going (method, path-and-query) and the exact masked body
+    /// about to be sent upstream.
+    pub(crate) fn write_request(&self, method: &str, path_and_query: &str, masked_body: &[u8]) {
+        let meta = serde_json::json!({ "method": method, "path_and_query": path_and_query });
+        self.write(
+            &format!("{:06}-request.meta.json", self.seq),
+            meta.to_string().as_bytes(),
+        );
         self.write(&format!("{:06}-request.masked.json", self.seq), masked_body);
     }
 

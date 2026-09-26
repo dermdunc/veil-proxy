@@ -1,9 +1,7 @@
-//! Dev-only wire capture (`src/capture.rs`), exercised over real HTTP against a mock upstream.
-//! Built only with `cargo test -p vg-proxy --features capture`.
-//!
-//! This is its own test binary, with a single test, on purpose: capture is configured by a
-//! process-wide environment variable read once per process, so sharing a binary with other tests
-//! would make them race on it.
+//! Dev-only wire capture refuses a non-empty capture directory: sequence numbers restart at 1 per
+//! process, so a reused directory could silently mix an earlier run's files into this one's.
+//! Its own test binary for the same reason as `tests/capture.rs`: the configuration is read once
+//! per process from a process-wide environment variable.
 
 #![cfg(feature = "capture")]
 
@@ -117,12 +115,13 @@ fn capture_files(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Capture records exactly the bytes that crossed the wire on the `Mask` route; the `Pass` route
-/// (which forwards raw bodies) only as metadata; and nothing from a request that failed closed.
+/// A capture directory that already holds files disables capture entirely: nothing new is written,
+/// and the stale files are left untouched for the operator to deal with.
 #[tokio::test]
-async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route() {
+async fn capture_refuses_a_non_empty_capture_dir() {
     let capture_dir = TempDir::new().expect("capture dir");
-    // Set before the proxy handles its first request: capture reads the variable once.
+    let stale = capture_dir.path().join("000002-request.masked.json");
+    std::fs::write(&stale, b"stale from an earlier run").expect("seed stale file");
     std::env::set_var(CAPTURE_DIR_ENV, capture_dir.path());
 
     let state_dir = TempDir::new().expect("state dir");
@@ -139,7 +138,7 @@ async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route
         )
         .expect("daemon opens"),
     );
-    let (upstream_addr, received, upstream_shutdown) = spawn_mock_upstream();
+    let (upstream_addr, _received, upstream_shutdown) = spawn_mock_upstream();
     let upstream = UpstreamConfig::plain(upstream_addr.ip().to_string(), upstream_addr.port());
     let listener = vg_proxy::server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -154,34 +153,23 @@ async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route
             let _ = shutdown_rx.await;
         },
     ));
-    let ns = Uuid::new_v4().to_string();
 
-    // 1. Mask route: captured.
     let mask_body = format!(
         r#"{{"model":"claude-x","system":"contact {RAW_EMAIL}","messages":[{{"role":"user","content":"hi"}}]}}"#
     );
+    let ns = Uuid::new_v4().to_string();
     let resp = send(
         addr,
         "POST",
-        "/v1/messages?beta=true",
+        "/v1/messages",
         mask_body.as_bytes(),
         Some(&ns),
     )
     .await;
-    assert!(resp.starts_with("HTTP/1.1 200"), "mask route: {resp}");
-
-    // 2. Pass route carrying a raw value: forwarded raw by design, and must NOT be captured.
-    let pass_body = format!(r#"{{"note":"{RAW_EMAIL}"}}"#);
-    let resp = send(addr, "GET", "/v1/models", pass_body.as_bytes(), None).await;
     assert!(
-        resp.contains("x-vg-proxy-verdict: pass"),
-        "pass route: {resp}"
+        resp.starts_with("HTTP/1.1 200"),
+        "proxying must be unaffected: {resp}"
     );
-
-    // 3. Mask route that fails closed (image block): nothing reaches upstream, nothing captured.
-    let blocked = r#"{"model":"claude-x","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#;
-    let resp = send(addr, "POST", "/v1/messages", blocked.as_bytes(), Some(&ns)).await;
-    assert!(resp.starts_with("HTTP/1.1 400"), "blocked request: {resp}");
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), server)
@@ -191,88 +179,9 @@ async fn capture_records_the_exact_masked_wire_bytes_and_only_for_the_mask_route
         .expect("clean shutdown");
     let _ = upstream_shutdown.send(());
 
-    // Exactly one body-bearing exchange (the successful mask round trip), the Pass exchange as
-    // metadata only, and the format marker.
     assert_eq!(
         capture_files(capture_dir.path()),
-        vec![
-            "000001-request.masked.json",
-            "000001-request.meta.json",
-            "000001-response.raw.json",
-            "P000001-pass.meta.json",
-            "capture-info.json",
-        ],
-        "only the Mask-route exchange may carry bodies; Pass is metadata only"
+        vec!["000002-request.masked.json"],
+        "a non-empty dir must disable capture: no marker, no new files"
     );
-    let info: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(capture_dir.path().join("capture-info.json")).expect("info file"),
-    )
-    .expect("info is JSON");
-    assert_eq!(info["format"], 3);
-    assert_eq!(info["pass_route_metadata"], true);
-    assert_eq!(info["mask_request_metadata"], true);
-
-    // Mask metadata: where the masked body went, including the (unmasked) query string.
-    let mask_meta: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(capture_dir.path().join("000001-request.meta.json")).expect("mask meta"),
-    )
-    .expect("mask meta JSON");
-    assert_eq!(mask_meta["method"], "POST");
-    assert_eq!(mask_meta["path_and_query"], "/v1/messages?beta=true");
-
-    // Pass metadata: method, path and body length, never the (raw) body itself.
-    let pass_meta_raw =
-        std::fs::read(capture_dir.path().join("P000001-pass.meta.json")).expect("pass meta");
-    let pass_meta_text = String::from_utf8_lossy(&pass_meta_raw);
-    assert!(
-        !pass_meta_text.contains(RAW_EMAIL),
-        "pass meta carries body: {pass_meta_text}"
-    );
-    let pass_meta: serde_json::Value =
-        serde_json::from_slice(&pass_meta_raw).expect("pass meta JSON");
-    assert_eq!(pass_meta["method"], "GET");
-    assert_eq!(pass_meta["path_and_query"], "/v1/models");
-    assert_eq!(pass_meta["body_len"], pass_body.len());
-
-    let received: Vec<(String, Vec<u8>)> = received.lock().unwrap().clone();
-    let upstream_mask_body = &received
-        .iter()
-        .find(|(p, _)| p == "/v1/messages")
-        .expect("upstream got the mask request")
-        .1;
-    let upstream_pass_body = &received
-        .iter()
-        .find(|(p, _)| p == "/v1/models")
-        .expect("upstream got the pass request")
-        .1;
-
-    // The captured request is byte-for-byte what the upstream received: masked, not raw.
-    let captured_request =
-        std::fs::read(capture_dir.path().join("000001-request.masked.json")).expect("request file");
-    assert_eq!(
-        &captured_request, upstream_mask_body,
-        "capture must equal the real wire bytes"
-    );
-    let captured_request = String::from_utf8_lossy(&captured_request);
-    assert!(
-        !captured_request.contains(RAW_EMAIL),
-        "raw value in capture: {captured_request}"
-    );
-    assert!(
-        captured_request.contains("EMAIL_001"),
-        "placeholder missing: {captured_request}"
-    );
-
-    // The captured response is the upstream's exact bytes, before demasking (placeholder kept).
-    let captured_response =
-        std::fs::read(capture_dir.path().join("000001-response.raw.json")).expect("response file");
-    assert_eq!(
-        captured_response,
-        MOCK_RESPONSE.as_bytes(),
-        "capture must be pre-demask bytes"
-    );
-
-    // Sanity: the Pass route really did forward the raw value, which is exactly why it must stay
-    // out of the capture.
-    assert!(String::from_utf8_lossy(upstream_pass_body).contains(RAW_EMAIL));
 }
