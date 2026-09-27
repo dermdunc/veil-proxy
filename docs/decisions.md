@@ -6036,3 +6036,27 @@ exercised offline against crafted dirs. Suite: 560 default / 101 with `capture`.
 changes. One small `a2-live-proof.sh` fix: path/query strings are URL-decoded before the
 raw-value check, so an encoded `@` (`%40`) cannot hide the synthetic value. This was
 exercised offline against a crafted capture and passes live.
+
+## 2026-09-27 — `vg-vault`: portable `c_char` buffer for `getpwuid_r` (aarch64 Linux build fix)
+
+**Problem.** `real_home_dir()` in `crates/vg-vault/src/enrol.rs` passed a hard-coded `[i8; 16_384]`
+buffer to `libc::getpwuid_r`, whose buffer argument is `*mut c_char`. `c_char` is `i8` on
+x86_64 and on macOS, but `u8` on aarch64 Linux, so the crate failed to compile there
+(`E0308: expected *mut u8, found *mut i8`). veil-demo's native arm64 Docker build (colima on
+Apple silicon) found it.
+
+**Why CI missed it.** Every compiling CI job runs on `macos-latest` (aarch64-apple-darwin, where
+`c_char` is `i8`); the only Linux job is `cargo-deny`, which does not compile the workspace.
+
+**Decision.** Type the buffer as `libc::c_char`. This is the only `i8`/`c_char` site in the
+workspace.
+
+**Evidence.**
+- Native `linux/arm64` container (`rust:1-bookworm`, `uname -m` = aarch64): the unfixed code
+  fails with E0308, and the fixed code passes `cargo check` and `cargo test -p vg-vault`
+  (46 + 16 pass).
+- Host (macOS): fmt, clippy `-D warnings` (default and `--features vg-proxy/capture`), and the
+  full workspace tests are clean.
+
+**Follow-up (human, protected path).** Add a Linux compile job to `.github/workflows/ci.yml`,
+ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See next-actions.

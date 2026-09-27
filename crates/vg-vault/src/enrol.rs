@@ -700,7 +700,9 @@ fn real_home_dir() -> Result<PathBuf, VaultError> {
     // 16 KiB comfortably covers every real-world `passwd` string-table size; `getpwuid_r`
     // reports `ERANGE` rather than overflowing if it doesn't, so this can't silently corrupt
     // memory even if some exotic directory service returns something larger.
-    let mut buf = [0i8; 16_384];
+    // `c_char` is `i8` on x86_64 and macOS but `u8` on aarch64 Linux: a hard-coded `i8` buffer
+    // fails to compile there (veil-demo's arm64 Docker build found this).
+    let mut buf = [0 as libc::c_char; 16_384];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
 
     // SAFETY: `pwd`/`buf`/`result` are all valid, appropriately-sized local buffers for the
