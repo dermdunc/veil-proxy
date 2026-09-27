@@ -5973,3 +5973,66 @@ justifies it here.
 **Protected path:** `crates/vg-proxy/Cargo.toml` gains `[features] capture = []`. It was
 committed by the human operator per this machine's git-guardrail, like the 2026-09-16 rustls
 bump.
+
+## 2026-09-26 — Capture feature: adversarial-review fixes (Pass-route visibility, A2 hardening)
+
+**Trigger.** A two-pass doubt-driven review of veil-proxy#88 and veil-demo's capture pipeline
+(a fresh-context agent plus a Codex cross-model pass, each given only the diffs and a written
+contract) found gaps. This entry covers the ones on veilgremlin's side.
+
+**Fixed.**
+- **Pass-route egress was invisible** (Codex). The capture recorded bodies only on Mask routes,
+  by design, so a Pass request carrying a raw value upstream would leave no trace, and a
+  consumer could wrongly vouch for "the whole wire". Each Pass exchange is now recorded as
+  metadata only (`PNNNNNN-pass.meta.json`: method, path-and-query, body length; never the
+  body).
+- **Format marker.** On first use, `capture-info.json` (`format: 2`, `pass_route_metadata:
+  true`) is written, so consumers can refuse captures from builds without Pass visibility.
+- **`a2-live-proof.sh` hardened** (both reviewers). It now fails on:
+  - any `vg-proxy capture:` write-failure line in the harness log;
+  - a missing or old format marker;
+  - non-contiguous Mask sequence numbers, unpaired requests or orphan responses;
+  - any Pass request that carried a body (which went upstream unmasked and uncaptured);
+  - a grep read error (exit 2), which was previously treated as "not found" by the negative
+    check.
+  
+  The structural checks were each exercised offline against crafted capture dirs, and the
+  script passed live.
+
+**Documented as trade-offs, not fixed** (module doc in `capture.rs`):
+- The request file is written just before `upstream::forward`, so a failed send leaves an
+  unpaired request. Consumers must treat that as a failed exchange; A2 now does.
+- Capture writes are synchronous `std::fs` on the async worker. That's acceptable for a
+  dev-only feature writing to a local directory.
+
+**Still open:** CI does not build or test `--features capture` (`.github/workflows/**` is
+protected); proposed in `docs/next-actions.md`.
+
+**Verification:**
+- `tests/capture.rs` extended: exact file set, format marker, and Pass metadata carrying
+  method/path/length but not the raw body. A mutation removing the Pass hook fails it.
+- fmt and clippy `-D warnings` clean by default and with `--features capture`. 560 workspace
+  tests pass by default and 100 `vg-proxy` tests with `capture`.
+- `scripts/a2-live-proof.sh`: live PASS.
+
+**Cycle-2 addendum (same day).** A second fresh-context review of this follow-up found two more
+veilgremlin-side gaps, both fixed on the same branch:
+- **Mask-route query strings were uncaptured.** `classify_route` ignores the query, so `POST
+  /v1/messages?<anything>` is Mask and its query crosses the wire unmasked, with no record.
+  Each Mask exchange now also writes `NNNNNN-request.meta.json` (method, path-and-query), and
+  the capture format is now **3** (`mask_request_metadata: true`).
+- **A reused capture dir could mix runs.** Sequence numbers restart at 1 per process, so stale
+  higher-numbered files from an earlier run could pass contiguity checks. Capture now refuses a
+  non-empty directory, logging a `vg-proxy capture:` line that both consumers treat as fatal.
+  This has its own test binary, `tests/capture_nonempty_dir.rs`, and a mutation removing the
+  check fails it.
+
+`a2-live-proof.sh` now requires format 3, pairs request metadata with requests, and fails if
+the raw value appears in any recorded path or query string (Mask or Pass). Each of these was
+exercised offline against crafted dirs. Suite: 560 default / 101 with `capture`. A2 live PASS
+(format 3).
+
+**Cycle-3 addendum (same day).** The final review cycle found no material issue in the Rust
+changes. One small `a2-live-proof.sh` fix: path/query strings are URL-decoded before the
+raw-value check, so an encoded `@` (`%40`) cannot hide the synthetic value. This was
+exercised offline against a crafted capture and passes live.

@@ -95,29 +95,70 @@ fi
 echo "PASS: synthetic secret round-tripped through real mask -> real TLS upstream -> real demask"
 
 echo "==> checking the exact outbound bytes vg-proxy sent upstream (capture feature)"
-shopt -s nullglob
+# Write failures are only ever reported on the harness's stderr; any one means the capture
+# may be missing an exchange, so nothing below could be trusted.
+if grep -q "vg-proxy capture:" "$HARNESS_LOG"; then
+  echo "FAIL: the harness reported a capture write failure:" >&2
+  grep "vg-proxy capture:" "$HARNESS_LOG" >&2
+  exit 1
+fi
+# Structure: format marker present, Mask exchanges numbered 1..N with no holes and every request
+# paired with a response and its metadata (and no orphan responses), no Pass-route request that
+# carried a body (Pass bodies go upstream unmasked and are never captured, so they could not be
+# checked), and the raw value in no recorded path or query string (those cross the wire unmasked).
+python3 - "$CAPTURE_DIR" "$SYNTHETIC_SECRET" <<'PYEOF'
+import json, os, re, sys, urllib.parse
+d, secret = sys.argv[1], sys.argv[2]
+names = os.listdir(d)
+fail = lambda msg: sys.exit(f"FAIL: {msg}")
+if "capture-info.json" not in names:
+    fail("capture-info.json missing: this vg-proxy build cannot vouch for Pass-route egress")
+info = json.load(open(os.path.join(d, "capture-info.json")))
+if info.get("format", 0) < 3 or not info.get("pass_route_metadata") or not info.get("mask_request_metadata"):
+    fail(f"capture format too old to vouch for every egress path: {info}")
+req = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-request\.masked\.json", n))}
+resp = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-response\.raw\.(?:sse|json)", n))}
+if not req:
+    fail("no outbound request was captured")
+if req != set(range(1, max(req) + 1)):
+    fail(f"capture gap: request numbers are not contiguous: {sorted(req)}")
+if req != resp:
+    fail(f"capture gap: unpaired exchanges (requests {sorted(req - resp)}, responses {sorted(resp - req)})")
+req_meta = {int(m.group(1)) for n in names if (m := re.fullmatch(r"(\d{6,})-request\.meta\.json", n))}
+if req_meta != req:
+    fail(f"capture gap: Mask request metadata does not match requests ({sorted(req_meta ^ req)})")
+for n in names:
+    is_pass = re.fullmatch(r"P\d{6,}-pass\.meta\.json", n)
+    if is_pass or re.fullmatch(r"\d{6,}-request\.meta\.json", n):
+        meta = json.load(open(os.path.join(d, n)))
+        # URL-decoded too: an encoded "@" (%40) must not hide the value.
+        if secret in urllib.parse.unquote(str(meta.get("path_and_query", ""))):
+            fail(f"the raw synthetic secret is in a recorded path/query string ({n}) -- it crossed the wire unmasked")
+        if is_pass and meta.get("body_len", 1) != 0:
+            fail(f"Pass-route request {meta.get('path_and_query')} carried a {meta.get('body_len')}-byte body upstream unmasked")
+print(f"    structure ok: {len(req)} paired Mask exchange(s), capture format {info['format']}")
+PYEOF
 REQUEST_CAPTURES=("$CAPTURE_DIR"/*-request.masked.json)
-shopt -u nullglob
-if [[ ${#REQUEST_CAPTURES[@]} -eq 0 ]]; then
-  echo "FAIL: no outbound request was captured -- cannot assert anything about egress" >&2
-  exit 1
-fi
-for req in "${REQUEST_CAPTURES[@]}"; do
-  if [[ ! -f "${req%-request.masked.json}-response.raw.json" && ! -f "${req%-request.masked.json}-response.raw.sse" ]]; then
-    echo "FAIL: capture gap -- $(basename "$req") has no matching response file" >&2
-    exit 1
-  fi
-done
-# Negative: the raw planted value never crossed the wire, in any captured request.
-if grep -lF "$SYNTHETIC_SECRET" "${REQUEST_CAPTURES[@]}" >/dev/null; then
-  echo "FAIL: the raw synthetic secret is present in a captured outbound body -- it crossed the wire unmasked" >&2
-  exit 1
-fi
+# Negative: the raw planted value never crossed the wire, in any captured request. grep exits 1
+# for "no match" and 2 for a read error; only 1 is a pass.
+set +e
+grep -qF "$SYNTHETIC_SECRET" "${REQUEST_CAPTURES[@]}"
+NEG_RC=$?
 # Positive: the planted value's own placeholder is in an outbound body, at the prompt's own
 # wording (anchored there because the CLI also injects the account email, which masks to an
 # EMAIL_ placeholder too and would otherwise satisfy a bare pattern for the wrong reason).
-if ! grep -lE "The synthetic test value is: EMAIL_[0-9]+" "${REQUEST_CAPTURES[@]}" >/dev/null; then
-  echo "FAIL: no captured outbound body carries the planted value's placeholder -- masking may not have run on it" >&2
+grep -qE "The synthetic test value is: EMAIL_[0-9]+" "${REQUEST_CAPTURES[@]}"
+POS_RC=$?
+set -e
+if [[ $NEG_RC -eq 0 ]]; then
+  echo "FAIL: the raw synthetic secret is present in a captured outbound body -- it crossed the wire unmasked" >&2
+  exit 1
+elif [[ $NEG_RC -ne 1 ]]; then
+  echo "FAIL: could not read the captured outbound bodies (grep exit $NEG_RC)" >&2
+  exit 1
+fi
+if [[ $POS_RC -ne 0 ]]; then
+  echo "FAIL: no captured outbound body carries the planted value's placeholder (grep exit $POS_RC) -- masking may not have run on it" >&2
   exit 1
 fi
 echo "PASS: ${#REQUEST_CAPTURES[@]} captured outbound request(s): placeholder present, raw value absent"

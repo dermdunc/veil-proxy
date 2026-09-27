@@ -188,7 +188,7 @@ async fn handle_mask(
     let capture = crate::capture::begin();
     #[cfg(feature = "capture")]
     if let Some(slot) = &capture {
-        slot.write_request(&masked_body);
+        slot.write_request(method.as_str(), target, &masked_body);
     }
 
     let selected_headers = daemon.select_headers(&headers);
@@ -287,6 +287,11 @@ async fn handle_pass(
         Ok(body) => body,
         Err(resp) => return resp,
     };
+
+    // Dev-only wire capture (`capture.rs`): metadata only, never the body, which goes upstream
+    // unmasked on this route.
+    #[cfg(feature = "capture")]
+    crate::capture::record_pass(method.as_str(), target, body.len());
 
     let selected_headers = daemon.select_headers(&headers);
     match upstream::forward(
