@@ -889,3 +889,14 @@ displace it for long.
 - [ ] Human (protected path): add a CI step to the test job, e.g.
       `- run: cargo test -p vg-proxy --locked --features capture` and a matching clippy step,
       so the capture feature and `tests/capture.rs` cannot bit-rot unnoticed.
+
+## 2026-09-27 — aarch64 Linux build fix (`vg-vault` `c_char`)
+
+- [x] `real_home_dir()` buffer typed as `libc::c_char`. It now builds on aarch64 Linux (see
+      `docs/decisions.md`).
+- [ ] Human (protected path): add a Linux build+test job to `ci.yml`. CI compiles only on macOS
+      today. Suggested shape:
+      `runs-on: ubuntu-24.04-arm` with `cargo test --workspace --locked`, optionally in a matrix
+      with `ubuntu-latest` for x86_64.
+- [ ] veil-demo: bump its veilgremlin pin to the merge commit, then prove its arm64 image
+      natively.
