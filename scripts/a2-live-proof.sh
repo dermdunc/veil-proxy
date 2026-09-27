@@ -107,7 +107,7 @@ fi
 # carried a body (Pass bodies go upstream unmasked and are never captured, so they could not be
 # checked), and the raw value in no recorded path or query string (those cross the wire unmasked).
 python3 - "$CAPTURE_DIR" "$SYNTHETIC_SECRET" <<'PYEOF'
-import json, os, re, sys
+import json, os, re, sys, urllib.parse
 d, secret = sys.argv[1], sys.argv[2]
 names = os.listdir(d)
 fail = lambda msg: sys.exit(f"FAIL: {msg}")
@@ -131,7 +131,8 @@ for n in names:
     is_pass = re.fullmatch(r"P\d{6,}-pass\.meta\.json", n)
     if is_pass or re.fullmatch(r"\d{6,}-request\.meta\.json", n):
         meta = json.load(open(os.path.join(d, n)))
-        if secret in str(meta.get("path_and_query", "")):
+        # URL-decoded too: an encoded "@" (%40) must not hide the value.
+        if secret in urllib.parse.unquote(str(meta.get("path_and_query", ""))):
             fail(f"the raw synthetic secret is in a recorded path/query string ({n}) -- it crossed the wire unmasked")
         if is_pass and meta.get("body_len", 1) != 0:
             fail(f"Pass-route request {meta.get('path_and_query')} carried a {meta.get('body_len')}-byte body upstream unmasked")

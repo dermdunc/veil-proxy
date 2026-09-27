@@ -6031,3 +6031,8 @@ veilgremlin-side gaps, both fixed on the same branch:
 the raw value appears in any recorded path or query string (Mask or Pass). Each of these was
 exercised offline against crafted dirs. Suite: 560 default / 101 with `capture`. A2 live PASS
 (format 3).
+
+**Cycle-3 addendum (same day).** The final review cycle found no material issue in the Rust
+changes. One small `a2-live-proof.sh` fix: path/query strings are URL-decoded before the
+raw-value check, so an encoded `@` (`%40`) cannot hide the synthetic value. This was
+exercised offline against a crafted capture and passes live.
