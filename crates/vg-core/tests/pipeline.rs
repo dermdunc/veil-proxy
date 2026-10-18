@@ -330,6 +330,15 @@ The user's email address is fixture.author@example.com. Use it only to identify 
             .to_vec(),
         hint: ArtefactHint::default(),
     };
+    // Precondition (DDD cycle 2, Codex): the entropy detector really does emit a Secret
+    // overlapping the email, so this exercises the fragment drop, not just EmailDetector.
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret
+            && input.buf[f.span.start..f.span.end].ends_with(b"example.com.")),
+        "fixture must trigger an entropy Secret over the email and its `.`, got {findings:?}"
+    );
+
     let (pack, _refs, _event, _trace_id) =
         with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
 
@@ -337,6 +346,79 @@ The user's email address is fixture.author@example.com. Use it only to identify 
         pack.text,
         "Haiku 4.5: 'claude-haiku-4-5-20251001'. \
 The user's email address is EMAIL_001. Use it only to identify the user."
+    );
+
+    // DDD cycle 1 finding: the same stray fragment came from any token-byte punctuation
+    // glued to the email, not just `.` -- Markdown bold is common in agent traffic.
+    for (raw, want) in [
+        (
+            "write to fixture.author@example.com! today",
+            "write to EMAIL_001! today",
+        ),
+        (
+            "write to **fixture.author@example.com**. today",
+            "write to **EMAIL_001**. today",
+        ),
+    ] {
+        let input = Input {
+            buf: raw.as_bytes().to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        let (pack, _refs, _event, _trace_id) =
+            with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+        assert_eq!(pack.text, want);
+    }
+}
+
+#[test]
+fn only_punctuation_only_trimmed_secret_fragments_are_dropped() {
+    // DDD cycle 2: pin both edges of the `resolve_overlaps` exception directly.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+    let run = |raw: &[u8]| {
+        let input = Input {
+            buf: raw.to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        let findings = with_real_context(|ctx| scan(&input, ctx));
+        let (pack, _refs, _event, _trace_id) =
+            with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+        (findings, pack.text)
+    };
+
+    // A trimmed fragment carrying a digit is still masked.
+    let (findings, text) = run(b"write to fixture.author@example.com!1 today");
+    assert!(findings.iter().any(|f| f.entity_type == EntityType::Secret));
+    assert_eq!(text, "write to EMAIL_001[REDACTED:SECRET] today");
+
+    // An untrimmed, all-punctuation Secret is masked whole.
+    let (findings, text) = run(b"token !@#$%^&*+=./-_!@#$%^&*+=./-_ end");
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "fixture must trigger an entropy Secret, got {findings:?}"
+    );
+    assert_eq!(text, "token [REDACTED:SECRET] end");
+}
+
+#[test]
+fn a_secret_ending_in_punctuation_is_still_masked_whole() {
+    // DDD cycle 1 (Codex): a first draft trimmed trailing `.` from every entropy span and
+    // so sent a real secret's final byte raw. Only *trimmed* punctuation-only fragments
+    // beside a more specific finding may be dropped; an untrimmed Secret is masked whole.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+    let input = Input {
+        buf: br#"{"value":"zQ3v9Lm2Xp7RwT6uYbN8dKfJhC1sEoAi."}"#.to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert!(
+        pack.text.contains(r#""value":"[REDACTED:SECRET]"}"#),
+        "text: {}",
+        pack.text
     );
 }
 

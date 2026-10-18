@@ -18,6 +18,8 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 
 - [ ] Human: review and merge the over-masking fix PR (closes #90).
 - [ ] Then veil-demo bumps its pin to the merge commit, and XREPO-021 closes in veil-ecosystem.
+- [ ] Follow-up (out of #90's scope): other providers' dated model IDs still over-mask as
+      PHONE (`o1-2024-12-17` → `oPHONE_001`, `gpt-4.1-2025-04-14` → `gpt-4.PHONE_002`).
 
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 

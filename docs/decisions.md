@@ -6063,26 +6063,39 @@ ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See
 
 ## 2026-10-18 — `veil-proxy#90` (XREPO-021): two over-masking false positives in real agent traffic fixed
 
-**Phone.** New `looks_like_date_suffixed_identifier` exclusion in `phone.rs`: a match whose tail is
-an unbroken, calendar-valid 8-digit `YYYYMMDD` run, joined by `-`/`_` to a letter-bearing
-identifier, with at most one digit directly before the joiner and no `+`/parens/space in the
-match. Fixes `claude-haiku-4-5-20251001` → `claude-haiku-4-PHONE_001`, which a real Claude Code
-system prompt sends on every request. **Narrowed twice under review.** A first draft excluded any
-match near a letter-plus-joiner identifier. A fresh-context adversarial review showed that let
-real numbers through (`(415) 555-1234-mobile`, `415-555-1234--Jane`, slug/filename-embedded
-numbers, even `+`-prefixed ones), so the rule was tied to the exact model-ID shape. A confirming
-review then found `kontakt-030-20150612` (a Berlin number in a slug) still excluded, hence the
-single-digit-group condition. Every counterexample is a regression test. Accepted residual:
-`ref-1-20251001`-shaped values (documented in the function).
+**Phone (`phone.rs`, `looks_like_date_suffixed_identifier`).** Fixes
+`claude-haiku-4-5-20251001` → `claude-haiku-4-PHONE_001`, sent on every request by a real
+Claude Code system prompt. The exclusion fires only when: the match has no `+`/parens/space; it
+ends in exactly 8 unbroken digits that are a real calendar date (leap years included); a `-`
+sits directly before them; the run ends the identifier (no alphanumeric or `_` follows; `-` is
+allowed for Bedrock `...-v1:0` IDs); and walking left crosses only single-digit version groups
+before reaching a letter. Any 2+ digit group (area/country code) keeps the number flagged.
+**Accepted residual:** `ref-1-20251001`-shaped values (single-digit group, valid date, glued to a
+word) are not flagged. **Scope:** Anthropic-style suffixes only; `o1-2024-12-17` and
+`gpt-4.1-2025-04-14` still over-mask (next-actions).
 
-**Entropy.** The reported `Secret` span now drops trailing `.` bytes; length/entropy/structured-ID/
-git-SHA checks still run on the untrimmed token, so detection is unchanged. Fixes
-`<email>.` → `EMAIL_001[REDACTED:SECRET]`: the `.` used to survive `resolve_overlaps` as a lone
-Secret fragment. The review caught a first draft that trimmed *before* the `min_length` check,
-which dropped a 19-byte sentence-final password entirely; fixed and pinned by a test.
+**Email fragment (`vg-core` `resolve_overlaps`).** Fixes `<email>.` →
+`EMAIL_001[REDACTED:SECRET]` (and the same with `!`, `**<email>**`): the entropy tokenizer's
+`Secret` covered the email plus glued punctuation, and the punctuation survived trimming as its
+own fragment. A *trimmed* `Secret` fragment with no ASCII letter or digit is now dropped. An
+untrimmed `Secret` is always masked whole, and any fragment with a letter or digit is always
+masked. The entropy detector itself is unchanged. **Accepted residual:** symbol-only runs glued
+to *any* more specific finding (email, phone, IP, IBAN — including a false positive inside a
+real secret), before or after it, now egress raw (e.g. `!#$%^&*<email>`). They carry no letter
+or digit.
 
-**Evidence.** New end-to-end test `agent_system_prompt_shapes_are_not_over_masked`
-(`vg-core/tests/pipeline.rs`) reproduces the exact live garbling against the old code and passes
-with the fix. `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall 15/15, FP 0.0%
-(unchanged). The `noreply@` public-address masking the issue also notes is left as-is: it is
-consistent with policy.
+**Review history (doubt-driven development: 2 single-model rounds, then 2 DDD cycles with a
+fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only).** Each round
+found real false negatives in the draft before it: a broad "near an identifier" phone rule
+leaked `(415) 555-1234-mobile` and slug numbers; an area-code group (`kontakt-030-20150612`), a
+country-code group (`sthlm-46-8-20251001`), an impossible date (`alice-1-20250231`, Codex) and a
+continuing identifier (`tel-1-20251001_ext99`, Codex) each leaked in turn. An earlier
+entropy-side fix (trim trailing `.` from every Secret span) was abandoned after Codex showed it
+sent a real secret's final byte raw (a quoted JSON value ending in `.`) and could emit an empty
+span under a degenerate config. Every counterexample is a regression test.
+
+**Evidence.** `agent_system_prompt_shapes_are_not_over_masked` and
+`only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`), with a
+precondition that the entropy Secret really overlaps the email. Mutation-checked: disabling
+either fix fails a test. `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall
+15/15, FP 0.0% (unchanged).

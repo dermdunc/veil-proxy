@@ -274,12 +274,13 @@ pub fn mask(
             .or_insert(0) += 1;
     }
 
-    // 5. Resolve overlaps: no byte is masked twice, and no detected byte is dropped —
-    //    a losing finding is trimmed to its uncovered fragments, never discarded whole.
+    // 5. Resolve overlaps: no byte is masked twice, and no detected letter or digit is
+    //    dropped — a losing finding is trimmed to its uncovered fragments, never discarded
+    //    whole (only punctuation-only `Secret` fragments are, see `resolve_overlaps`).
     // 6. Classify and intern in FORWARD document order (so vault ordinals read top-to-
     //    bottom: the first email in the buffer is EMAIL_001), collecting replacements;
     //    splices are applied back-to-front afterwards so offsets stay valid.
-    let ordered = resolve_overlaps(findings);
+    let ordered = resolve_overlaps(&input.buf, findings);
 
     let mut mapping_refs: Vec<MappingRef> = Vec::new();
     // display → MappingRef for every placeholder minted (contract v1.2). Deduped in lockstep
@@ -415,9 +416,19 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
 /// finding surviving raw into the masked output. Trimming masks both: the email as
 /// `EMAIL_NNN`, the uncovered head as its own `Secret` fragment.
 ///
+/// **One narrow exception (veil-proxy#90, XREPO-021):** a trimmed `Secret` fragment with no
+/// ASCII letter or digit is dropped rather than masked. The entropy tokenizer counts
+/// `.`/`!`/`*` etc. as token bytes, so `<email>.` or `**<email>**` became one `Secret` whose
+/// leftover punctuation was masked as its own `[REDACTED:SECRET]` beside `EMAIL_001` --
+/// seen live in a real Claude Code system prompt. Only fragments of a finding that
+/// actually lost bytes to a more specific one qualify; an untrimmed `Secret` is always
+/// masked whole, and any fragment carrying a letter or digit is always masked.
+/// **Accepted residual:** punctuation bytes glued to a more specific finding inside a
+/// real secret (`<email>!#$%`) now egress raw; they carry no letter or digit.
+///
 /// Returned findings are sorted in forward document order (ascending span start), which
 /// the caller relies on for top-to-bottom vault ordinal minting.
-fn resolve_overlaps(mut findings: Vec<Finding>) -> Vec<Finding> {
+fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
         specificity(&b.entity_type)
             .cmp(&specificity(&a.entity_type))
@@ -454,8 +465,17 @@ fn resolve_overlaps(mut findings: Vec<Finding>) -> Vec<Finding> {
                 break;
             }
         }
+        let trimmed = fragments != [(finding.span.start, finding.span.end)];
         for (start, end) in fragments {
             debug_assert!(start < end);
+            if trimmed
+                && finding.entity_type == EntityType::Secret
+                && buf
+                    .get(start..end)
+                    .is_some_and(|b| !b.iter().any(u8::is_ascii_alphanumeric))
+            {
+                continue;
+            }
             accepted.push(Finding {
                 span: Span {
                     start,
@@ -727,7 +747,7 @@ pub fn benchmark(corpus: &Corpus, ctx: &Context, policy: &Policy) -> Metrics {
 
     for sample in &corpus.samples {
         let start = Instant::now();
-        let detected = resolve_overlaps(scan(&sample.input, ctx));
+        let detected = resolve_overlaps(&sample.input.buf, scan(&sample.input, ctx));
         latencies_us.push(start.elapsed().as_micros() as u64);
 
         // A value is only *protected* if a detector found it AND the policy masks/redacts

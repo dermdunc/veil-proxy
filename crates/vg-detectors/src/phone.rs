@@ -291,22 +291,27 @@ const MAX_IDENT_WALK: usize = 64;
 /// Excludes the `-YYYYMMDD` date suffix of an identifier such as a model ID: the regex
 /// matches `5-20251001` inside `claude-haiku-4-5-20251001` (9 digits, a hyphen marker),
 /// which a real Claude Code system prompt sends on every request (veil-proxy#90,
-/// XREPO-021). Deliberately tied to that exact shape, not to "near an identifier" (a
-/// broader first draft let `(415) 555-1234-mobile` and slug-embedded numbers through --
-/// fresh-context review finding). All of these must hold:
+/// XREPO-021). Deliberately tied to that exact shape, not to "near an identifier" -- three
+/// review rounds each found real numbers a looser rule let through (`(415) 555-1234-mobile`,
+/// `kontakt-030-20150612`, `sthlm-46-8-20251001`, `alice-1-20250231`), all now regression
+/// tests. All of these must hold:
 ///
 /// 1. the match has no `+`, parens or space -- strong phone markers always win;
-/// 2. it ends in an unbroken run of exactly 8 digits that is a calendar-valid
-///    `YYYYMMDD`, with no further digit after it in `buf`;
-/// 3. that run is joined by `-`/`_` to an `[A-Za-z0-9_-]` run (bounded by
-///    `MAX_IDENT_WALK`) containing an ASCII letter;
-/// 4. at most one digit sits directly before the joiner -- model IDs carry single-digit
-///    version groups (`4-5-`, `4-1-`), while a 2+ digit group is an area-code shape
-///    (`kontakt-030-20150612`, a Berlin number in a slug; confirming-review finding).
+/// 2. it ends in an unbroken run of exactly 8 digits that is a real calendar date
+///    `YYYYMMDD` (leap years included), followed in `buf` by neither an alphanumeric nor
+///    `_` (so the run ends the identifier);
+/// 3. a `-` sits directly before that run (`_` and `.` cannot: the regex's separator
+///    class is `[-. ]`, and a `.` joiner is not the model-ID shape);
+/// 4. walking left from that `-`, only single-digit version groups (`4-`, `5_`) may be
+///    crossed (bounded by `MAX_IDENT_WALK`) before an ASCII letter. Any 2+ digit group is
+///    an area/country-code shape and keeps the number flagged.
 ///
 /// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
-/// date, follow a single-digit group, and are glued by a joiner to a word
-/// (`ref-1-20251001`) is not flagged.
+/// date, and follow only single-digit groups glued to a word (`ref-1-20251001`,
+/// `jane-doe-1-20251001`, `tel-1-20251001-ext`) is not flagged.
+///
+/// **Scope:** Anthropic-style `-YYYYMMDD` suffixes only. Other providers' dated IDs
+/// (`o1-2024-12-17`, `gpt-4.1-2025-04-14`) still over-mask; tracked in next-actions.
 fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> bool {
     let matched = &buf[start..end];
     if matched
@@ -315,7 +320,13 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
     {
         return false;
     }
-    if buf.get(end).is_some_and(u8::is_ascii_digit) {
+    // The date run must end the identifier: a following digit, letter or `_` means the
+    // value continues (`tel-1-20251001_ext99`, Codex cycle-2 finding). `-` is allowed so
+    // Bedrock-style `...-20251001-v1:0` model IDs still qualify.
+    if buf
+        .get(end)
+        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         return false;
     }
     let run_len = matched
@@ -324,7 +335,7 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
         .take_while(|b| b.is_ascii_digit())
         .count();
     let run_start = end - run_len;
-    if run_len != 8 || run_start == 0 || !matches!(buf[run_start - 1], b'-' | b'_') {
+    if run_len != 8 || run_start == 0 || buf[run_start - 1] != b'-' {
         return false;
     }
     let digits = &buf[run_start..end];
@@ -333,27 +344,38 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
             .iter()
             .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
     };
-    let (y, m, d) = (num(0..4), num(4..6), num(6..8));
-    if !((1900..=2099).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)) {
+    if !is_calendar_date(num(0..4), num(4..6), num(6..8)) {
         return false;
     }
-    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let joiner = run_start - 1;
-    let group_digits = buf[..joiner]
-        .iter()
-        .rev()
-        .take(2)
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    if group_digits >= 2 {
+    // `i` indexes the joiner just crossed; step over `<digit><joiner>` units only.
+    let mut i = run_start - 1;
+    let floor = i.saturating_sub(MAX_IDENT_WALK);
+    while i > floor {
+        let prev = buf[i - 1];
+        if prev.is_ascii_alphabetic() {
+            return true;
+        }
+        if prev.is_ascii_digit() && i >= 2 && matches!(buf[i - 2], b'-' | b'_') {
+            i -= 2;
+            continue;
+        }
         return false;
     }
-    let floor = joiner.saturating_sub(MAX_IDENT_WALK);
-    buf[floor..joiner]
-        .iter()
-        .rev()
-        .take_while(|&&b| is_ident_byte(b))
-        .any(u8::is_ascii_alphabetic)
+    false
+}
+
+/// A real Gregorian date in 1900-2099, leap years included (`20250231` is not one --
+/// Codex review finding against a range-only check).
+fn is_calendar_date(y: u32, m: u32, d: u32) -> bool {
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1900..=2099).contains(&y) && (1..=days).contains(&d)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -634,14 +656,15 @@ mod tests {
 
     #[test]
     fn ignores_date_suffixed_identifiers() {
-        // veil-proxy#90: seen live in a real Claude Code system prompt.
+        // veil-proxy#90: seen live in a real Claude Code system prompt. Every case here
+        // reaches `looks_like_date_suffixed_identifier` (the regex match carries a `-`).
+        // (`claude-3-5-sonnet-20241022` never did: its bare 8-digit match has no marker.)
         for buf in [
             &b"Haiku 4.5: 'claude-haiku-4-5-20251001'. When building"[..],
             b"model claude-opus-4-1-20250805 is pinned",
-            b"model_v2_20251001",
-            b"release-20260927",
-            b"build_20251001_rc1",
-            b"on 2025-10-01",
+            b"claude-sonnet-4-20250514",
+            b"model_4-5-20240229",
+            b"anthropic.claude-haiku-4-5-20251001-v1:0",
         ] {
             assert!(
                 PhoneDetector.detect(buf, &[]).is_empty(),
@@ -677,6 +700,13 @@ mod tests {
             // Confirming-review finding: an area-code group before a date-valid tail.
             b"kontakt-030-20150612",
             b"Tel_030-20150612",
+            // DDD cycle 1 (fresh-context + Codex) findings:
+            b"contact sthlm-46-8-20251001 now",
+            b"/contact/alice-1-20250231",
+            b"model-4-5-20250229",
+            // DDD cycle 2 (Codex): the date run must end the identifier.
+            b"{\"phone\":\"tel-1-20251001_ext99\"}",
+            b"tel-1-20251001x",
         ] {
             assert_eq!(
                 PhoneDetector.detect(buf, &[]).len(),
