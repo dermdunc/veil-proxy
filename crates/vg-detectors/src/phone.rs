@@ -304,14 +304,18 @@ const MAX_VERSION_GROUPS: usize = 2;
 ///
 /// 1. the match has no `+`, parens or space -- strong phone markers always win;
 /// 2. it ends in an unbroken run of exactly 8 digits that is a real calendar date
-///    `YYYYMMDD` (leap years included), followed in `buf` by neither an alphanumeric nor
-///    `_` (so the run ends the identifier; `-` is allowed for Bedrock `...-v1:0` IDs);
+///    `YYYYMMDD` (leap years included), followed in `buf` by end of input or one of the
+///    bytes a model ID ends on in text -- whitespace, quotes, backtick, `.,;:)]}>`, or `-`
+///    for Bedrock `...-v1:0` IDs (an allowlist: `/` let `haiku-1-20251001/99` through,
+///    Codex cycle 4);
 /// 3. a `-` sits directly before that run (`_` and `.` cannot: the regex's separator
 ///    class is `[-. ]`, and a `.` joiner is not the model-ID shape);
 /// 4. left of that `-`, at most `MAX_VERSION_GROUPS` single-digit `<digit><-|_>` groups,
-///    then one of `MODEL_FAMILY_WORDS` (case-insensitive) starting at a word boundary.
+///    then one of `MODEL_FAMILY_WORDS` (case-insensitive) starting at a word boundary
+///    (preceded by neither an alphanumeric nor `_`: `phone_haiku-...` does not count).
 ///
-/// The walk is at most 4 + 6 + 1 bytes, so per-match cost is constant.
+/// Beyond one reverse scan of the match itself, at most 12 bytes are inspected
+/// (1 + 2 x 2 + 6 + 1), so per-match cost is constant.
 ///
 /// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
 /// date, and follow at most two single-digit groups glued to one of those four words
@@ -328,12 +332,16 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
     {
         return false;
     }
-    // The date run must end the identifier: a following digit, letter or `_` means the
-    // value continues (`tel-1-20251001_ext99`, Codex cycle-2 finding).
-    if buf
-        .get(end)
-        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    // The date run must end the identifier (`tel-1-20251001_ext99`, Codex cycle 2;
+    // `haiku-1-20251001/99`, Codex cycle 4).
+    let ends_identifier = buf.get(end).is_none_or(|&b| {
+        b.is_ascii_whitespace()
+            || matches!(
+                b,
+                b'\'' | b'"' | b'`' | b'.' | b',' | b';' | b':' | b')' | b']' | b'}' | b'>' | b'-'
+            )
+    });
+    if !ends_identifier {
         return false;
     }
     let run_len = matched
@@ -367,7 +375,10 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
     MODEL_FAMILY_WORDS.iter().any(|word| {
         i >= word.len()
             && buf[i - word.len()..i].eq_ignore_ascii_case(word)
-            && (i == word.len() || !buf[i - word.len() - 1].is_ascii_alphanumeric())
+            && (i == word.len() || {
+                let before = buf[i - word.len() - 1];
+                !(before.is_ascii_alphanumeric() || before == b'_')
+            })
     })
 }
 
@@ -723,6 +734,9 @@ mod tests {
             b"model_4-5-20240229",
             b"claude-haiku-1-4-5-20251001",
             b"ultrahaiku-4-5-20251001",
+            // DDD cycle 4 (Codex): a continuing identifier and an `_`-glued family word.
+            b"Call haiku-1-20251001/99",
+            b"phone_haiku-1-20251001",
         ] {
             assert_eq!(
                 PhoneDetector.detect(buf, &[]).len(),

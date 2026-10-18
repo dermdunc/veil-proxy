@@ -281,7 +281,7 @@ pub fn mask(
     // 6. Classify and intern in FORWARD document order (so vault ordinals read top-to-
     //    bottom: the first email in the buffer is EMAIL_001), collecting replacements;
     //    splices are applied back-to-front afterwards so offsets stay valid.
-    let (ordered, dropped) = resolve_overlaps(&input.buf, findings);
+    let (ordered, fully_dropped) = resolve_overlaps(&input.buf, findings);
 
     let mut mapping_refs: Vec<MappingRef> = Vec::new();
     // display → MappingRef for every placeholder minted (contract v1.2). Deduped in lockstep
@@ -348,10 +348,11 @@ pub fn mask(
         }
     }
 
-    // A dropped punctuation-only Secret fragment (see `resolve_overlaps`) counts as
-    // handled whenever the policy would have replaced it, so detected-vs-handled stays
-    // consistent and downstream consumers never read it as an unmasked Secret.
-    for finding in &dropped {
+    // A Secret whose fragments were all dropped as punctuation-only (see
+    // `resolve_overlaps`) counts as handled once, whenever the policy would have replaced
+    // it, so downstream consumers never read it as an unmasked Secret. A Secret with any
+    // masked fragment is already counted by the loop above.
+    for finding in &fully_dropped {
         if !matches!(
             policy.engine.classify_entity(finding.entity_type.clone()),
             HandlingClass::Pass
@@ -418,8 +419,9 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
         .unwrap_or_default()
 }
 
-/// Resolves overlapping findings so no two accepted findings cover the same bytes — and
-/// no detected byte is ever dropped: the more specific entity type wins over the generic
+/// Resolves overlapping findings so no two accepted findings cover the same bytes — and,
+/// apart from the one narrow exception below, no detected byte is ever dropped: the more
+/// specific entity type wins over the generic
 /// entropy `Secret`, and among equally specific findings the longer span wins (T03's docs
 /// anticipate exactly the `Email`-over-`Secret` case). A losing finding is **trimmed to
 /// its fragments not covered by higher-priority findings**, never discarded whole.
@@ -439,11 +441,15 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
 /// in a real Claude Code system prompt. An untrimmed `Secret` is always masked whole; a
 /// `Secret` trimmed only by another `Secret` keeps every fragment; any fragment holding a
 /// byte that is not ASCII punctuation (letter, digit, whitespace, control, non-ASCII) is
-/// always masked. Dropped fragments are returned separately so the caller can still count
-/// them as handled (otherwise the audit trail would show a detected-but-unhandled Secret).
+/// always masked. The fragment must also sit directly beside a more specific accepted
+/// finding (sharing a boundary with it), not merely belong to a `Secret` that overlapped
+/// one elsewhere (DDD cycle 4). A `Secret` whose fragments were *all* dropped is returned
+/// separately, once, so the caller can count it as handled exactly once (otherwise the
+/// audit trail would show a detected-but-unhandled Secret, or count one Secret twice).
 /// **Accepted residual:** ASCII-punctuation runs glued to *any* more specific finding
 /// (email, phone, IP, IBAN -- including a false positive inside a real secret), before or
-/// after it, now egress raw: `!#$%^&*<email>`, `<email>!#$%`, `$%^&*-<phone>-$%^&*`.
+/// after it or between two of them, now egress raw: `!#$%^&*<email>`, `<email>!#$%`,
+/// `$%^&*-<phone>-$%^&*`.
 ///
 /// Returned findings (both lists) are sorted in forward document order (ascending span
 /// start), which the caller relies on for top-to-bottom vault ordinal minting.
@@ -459,7 +465,7 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
     });
 
     let mut accepted: Vec<Finding> = Vec::new();
-    let mut dropped: Vec<Finding> = Vec::new();
+    let mut fully_dropped: Vec<Finding> = Vec::new();
     for finding in findings {
         // Subtract every already-accepted interval from this finding's span; keep each
         // surviving fragment as a finding of the same type. An exact duplicate (or a
@@ -488,6 +494,7 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
                 break;
             }
         }
+        let (mut kept_any, mut dropped_any) = (false, false);
         for (start, end) in fragments {
             debug_assert!(start < end);
             let fragment = Finding {
@@ -501,19 +508,28 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
             let punctuation_only = buf
                 .get(start..end)
                 .is_some_and(|b| b.iter().all(u8::is_ascii_punctuation));
+            let beside_more_specific = accepted.iter().any(|acc| {
+                specificity(&acc.entity_type) > specificity(&finding.entity_type)
+                    && (acc.span.end == start || acc.span.start == end)
+            });
             if lost_to_more_specific
+                && beside_more_specific
                 && finding.entity_type == EntityType::Secret
                 && punctuation_only
             {
-                dropped.push(fragment);
+                dropped_any = true;
             } else {
+                kept_any = true;
                 accepted.push(fragment);
             }
         }
+        if dropped_any && !kept_any {
+            fully_dropped.push(finding);
+        }
     }
     accepted.sort_by_key(|f| f.span.start);
-    dropped.sort_by_key(|f| f.span.start);
-    (accepted, dropped)
+    fully_dropped.sort_by_key(|f| f.span.start);
+    (accepted, fully_dropped)
 }
 
 /// Priority for overlap resolution. The entropy detector's catch-all `Secret` is the one
@@ -902,7 +918,25 @@ mod tests {
             ],
         );
         assert_eq!(spans(&accepted), vec![(2, 15)]);
-        assert_eq!(spans(&dropped), vec![(0, 2), (15, 17)]);
+        // Both fragments dropped: the raw Secret is reported once, not per fragment.
+        assert_eq!(spans(&dropped), vec![(0, 17)]);
+    }
+
+    #[test]
+    fn a_punctuation_fragment_not_beside_the_specific_finding_is_kept() {
+        // DDD cycle 4: `!!!!` (40..44) touches only another Secret, never the Email, so it
+        // stays masked even though its Secret overlapped the Email elsewhere.
+        let buf = b"a@example.com_ZZZZZZZZZZZZZZZZZZZZZZZZZZ!!!!";
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Email, 0, 13),
+                finding(EntityType::Secret, 0, 40),
+                finding(EntityType::Secret, 10, 44),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13), (13, 40), (40, 44)]);
+        assert!(dropped.is_empty());
     }
 
     #[test]

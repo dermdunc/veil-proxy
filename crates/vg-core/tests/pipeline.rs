@@ -409,6 +409,22 @@ fn only_punctuation_only_trimmed_secret_fragments_are_dropped() {
         pack.stats.counts
     );
 
+    // DDD cycle 4: `**<email>**` drops two fragments of ONE raw Secret -- counted once.
+    let input = Input {
+        buf: b"write to **fixture.author@example.com** today".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert_eq!(pack.text, "write to **EMAIL_001** today");
+    match event {
+        AuditEvent::Scan { counts, .. } => {
+            assert_eq!(counts.0.get(&EntityType::Secret), Some(&1), "{counts:?}");
+        }
+        other => panic!("expected a Scan event, got {other:?}"),
+    }
+    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&1));
+
     // A trimmed fragment carrying a digit is still masked.
     let (findings, text) = run(b"write to fixture.author@example.com!1 today");
     assert!(findings.iter().any(|f| f.entity_type == EntityType::Secret));
