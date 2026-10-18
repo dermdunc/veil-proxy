@@ -477,11 +477,21 @@ impl Detector for EntropyDetector {
             }
             let entropy = shannon_entropy_bits_per_byte(token);
             if entropy >= self.threshold {
+                // Trailing `.` is sentence punctuation: leave it out of the *reported*
+                // span. Without this, `<email>.` came out `EMAIL_001[REDACTED:SECRET]`,
+                // the lone `.` surviving overlap resolution as its own Secret fragment
+                // (veil-proxy#90, seen live). Length/entropy/exclusion checks above still
+                // run on the untrimmed token, so detection itself is unchanged; a secret
+                // that genuinely ends in `.` leaves only those final dots unmasked.
+                let mut end = idx;
+                while end > start && buf[end - 1] == b'.' {
+                    end -= 1;
+                }
                 findings.push(Finding {
                     entity_type: EntityType::Secret,
                     span: Span {
                         start,
-                        end: idx,
+                        end,
                         node_kind: None,
                     },
                     confidence: confidence_for(entropy, self.threshold),
@@ -508,6 +518,31 @@ mod tests {
         let findings = EntropyDetector::default().detect(buf, &[]);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].entity_type, EntityType::Secret);
+    }
+
+    #[test]
+    fn excludes_trailing_sentence_periods_from_the_span() {
+        // veil-proxy#90: the `.` ending a sentence must not be part of the Secret span.
+        let buf = b"the key is zQ3v9Lm2Xp7RwT6uYbN8dKfJhC1sEoAi. Rotate it.";
+        let findings = EntropyDetector::default().detect(buf, &[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            &buf[findings[0].span.start..findings[0].span.end],
+            b"zQ3v9Lm2Xp7RwT6uYbN8dKfJhC1sEoAi"
+        );
+    }
+
+    #[test]
+    fn a_borderline_secret_ending_a_sentence_is_still_flagged() {
+        // Review finding against a first draft that trimmed before the min_length check:
+        // this 19-byte password plus its `.` reached min_length only untrimmed.
+        let buf = b"the password is Xk9#mQ2$vL7!pR4zW8y. ok";
+        let findings = EntropyDetector::default().detect(buf, &[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            &buf[findings[0].span.start..findings[0].span.end],
+            b"Xk9#mQ2$vL7!pR4zW8y"
+        );
     }
 
     #[test]

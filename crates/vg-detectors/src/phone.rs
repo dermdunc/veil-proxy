@@ -283,6 +283,79 @@ fn looks_like_zip_plus4(buf: &[u8], m_start: usize, matched: &[u8]) -> bool {
             || preceded_by_marker_within(buf, m_start, 16, b"postal"))
 }
 
+/// Maximum bytes `looks_like_date_suffixed_identifier` walks left looking for a letter.
+/// Bounds the same O(n^2) risk `MAX_EXPAND` bounds; an identifier whose letters sit
+/// further away than this is not excluded, which fails toward masking, not toward leaking.
+const MAX_IDENT_WALK: usize = 64;
+
+/// Excludes the `-YYYYMMDD` date suffix of an identifier such as a model ID: the regex
+/// matches `5-20251001` inside `claude-haiku-4-5-20251001` (9 digits, a hyphen marker),
+/// which a real Claude Code system prompt sends on every request (veil-proxy#90,
+/// XREPO-021). Deliberately tied to that exact shape, not to "near an identifier" (a
+/// broader first draft let `(415) 555-1234-mobile` and slug-embedded numbers through --
+/// fresh-context review finding). All of these must hold:
+///
+/// 1. the match has no `+`, parens or space -- strong phone markers always win;
+/// 2. it ends in an unbroken run of exactly 8 digits that is a calendar-valid
+///    `YYYYMMDD`, with no further digit after it in `buf`;
+/// 3. that run is joined by `-`/`_` to an `[A-Za-z0-9_-]` run (bounded by
+///    `MAX_IDENT_WALK`) containing an ASCII letter;
+/// 4. at most one digit sits directly before the joiner -- model IDs carry single-digit
+///    version groups (`4-5-`, `4-1-`), while a 2+ digit group is an area-code shape
+///    (`kontakt-030-20150612`, a Berlin number in a slug; confirming-review finding).
+///
+/// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
+/// date, follow a single-digit group, and are glued by a joiner to a word
+/// (`ref-1-20251001`) is not flagged.
+fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> bool {
+    let matched = &buf[start..end];
+    if matched
+        .iter()
+        .any(|b| matches!(b, b'+' | b'(' | b')' | b' '))
+    {
+        return false;
+    }
+    if buf.get(end).is_some_and(u8::is_ascii_digit) {
+        return false;
+    }
+    let run_len = matched
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    let run_start = end - run_len;
+    if run_len != 8 || run_start == 0 || !matches!(buf[run_start - 1], b'-' | b'_') {
+        return false;
+    }
+    let digits = &buf[run_start..end];
+    let num = |r: std::ops::Range<usize>| {
+        digits[r]
+            .iter()
+            .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
+    };
+    let (y, m, d) = (num(0..4), num(4..6), num(6..8));
+    if !((1900..=2099).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)) {
+        return false;
+    }
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let joiner = run_start - 1;
+    let group_digits = buf[..joiner]
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if group_digits >= 2 {
+        return false;
+    }
+    let floor = joiner.saturating_sub(MAX_IDENT_WALK);
+    buf[floor..joiner]
+        .iter()
+        .rev()
+        .take_while(|&&b| is_ident_byte(b))
+        .any(u8::is_ascii_alphabetic)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PhoneDetector;
 
@@ -303,6 +376,7 @@ impl Detector for PhoneDetector {
                     || looks_like_iso_date(matched)
                     || looks_like_zip_plus4(buf, m.start(), matched)
                     || looks_like_isbn(buf, m.start(), m.end())
+                    || looks_like_date_suffixed_identifier(buf, m.start(), m.end())
                 {
                     return None;
                 }
@@ -556,6 +630,61 @@ mod tests {
             1,
             "an unlabelled 5-4 grouped number must still be flagged"
         );
+    }
+
+    #[test]
+    fn ignores_date_suffixed_identifiers() {
+        // veil-proxy#90: seen live in a real Claude Code system prompt.
+        for buf in [
+            &b"Haiku 4.5: 'claude-haiku-4-5-20251001'. When building"[..],
+            b"model claude-opus-4-1-20250805 is pinned",
+            b"model_v2_20251001",
+            b"release-20260927",
+            b"build_20251001_rc1",
+            b"on 2025-10-01",
+        ] {
+            assert!(
+                PhoneDetector.detect(buf, &[]).is_empty(),
+                "expected no phone in {:?}, got {:?}",
+                String::from_utf8_lossy(buf),
+                PhoneDetector.detect(buf, &[])
+            );
+        }
+    }
+
+    #[test]
+    fn still_flags_numbers_next_to_non_identifier_delimiters() {
+        for buf in [
+            &b"+44 20 7946 0958"[..],
+            b"020 7946 0958",
+            b"(020) 7946-0958",
+            b"tel: 415-555-1234",
+            b"PHONE=415-555-1234",
+            b"call +1-415-555-2671, thanks",
+            b"'415-555-1234'",
+            // Review findings against a broader first draft of the exclusion:
+            b"(415) 555-1234-mobile",
+            b"Reach me at 415-555-1234--Jane",
+            b"Call 415-555-1234-ext",
+            b"x-+1 415 555 2671",
+            b"cust-a-+44 20 7946 0958",
+            b"invoice_415-555-1234.pdf",
+            b"/contact/jane-doe-415-555-1234",
+            // A date-valid 8-digit tail is still a phone when phone markers are present
+            // or nothing letter-bearing is joined to it.
+            b"+44-20251001",
+            b"call 1-20251001 now",
+            // Confirming-review finding: an area-code group before a date-valid tail.
+            b"kontakt-030-20150612",
+            b"Tel_030-20150612",
+        ] {
+            assert_eq!(
+                PhoneDetector.detect(buf, &[]).len(),
+                1,
+                "expected one phone in {:?}",
+                String::from_utf8_lossy(buf)
+            );
+        }
     }
 
     #[test]

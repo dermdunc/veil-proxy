@@ -14,6 +14,11 @@ not deliver "invisible governance / PII never leaves the machine" without an egr
 the keychain UX is poor. See the 2026-07-19 T11 sign-off entry in `docs/decisions.md`. The mask/
 demask logic, vault, detectors, pipeline, and tool-path masking are all validated.
 
+## veil-proxy#90 (XREPO-021) — fix on a branch, 2026-10-18
+
+- [ ] Human: review and merge the over-masking fix PR (closes #90).
+- [ ] Then veil-demo bumps its pin to the merge commit, and XREPO-021 closes in veil-ecosystem.
+
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 
 - [x] **M1 — transport + routing skeleton (2026-07-25, merged to main as 8da9561).**

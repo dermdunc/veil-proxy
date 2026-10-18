@@ -316,6 +316,31 @@ fn irreversible_redact_value_is_redacted_and_never_vault_stored() {
 }
 
 #[test]
+fn agent_system_prompt_shapes_are_not_over_masked() {
+    // veil-proxy#90 (XREPO-021), both shapes seen live in a real Claude Code system
+    // prompt: a model ID's `-YYYYMMDD` suffix was masked as PHONE, and a sentence-final
+    // email came out as `EMAIL_001[REDACTED:SECRET]` (the entropy token swallowed the `.`).
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let input = Input {
+        buf: b"Haiku 4.5: 'claude-haiku-4-5-20251001'. \
+The user's email address is fixture.author@example.com. Use it only to identify the user."
+            .to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+
+    assert_eq!(
+        pack.text,
+        "Haiku 4.5: 'claude-haiku-4-5-20251001'. \
+The user's email address is EMAIL_001. Use it only to identify the user."
+    );
+}
+
+#[test]
 fn partially_overlapping_findings_leak_no_detected_bytes() {
     // Doubt-pass High regression: the entropy detector's documented tokenizer residual
     // (`@`/`.`/`-` are token bytes) merges a secret with an adjacent email into ONE

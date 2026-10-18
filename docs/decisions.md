@@ -6060,3 +6060,29 @@ workspace.
 
 **Follow-up (human, protected path).** Add a Linux compile job to `.github/workflows/ci.yml`,
 ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See next-actions.
+
+## 2026-10-18 — `veil-proxy#90` (XREPO-021): two over-masking false positives in real agent traffic fixed
+
+**Phone.** New `looks_like_date_suffixed_identifier` exclusion in `phone.rs`: a match whose tail is
+an unbroken, calendar-valid 8-digit `YYYYMMDD` run, joined by `-`/`_` to a letter-bearing
+identifier, with at most one digit directly before the joiner and no `+`/parens/space in the
+match. Fixes `claude-haiku-4-5-20251001` → `claude-haiku-4-PHONE_001`, which a real Claude Code
+system prompt sends on every request. **Narrowed twice under review.** A first draft excluded any
+match near a letter-plus-joiner identifier. A fresh-context adversarial review showed that let
+real numbers through (`(415) 555-1234-mobile`, `415-555-1234--Jane`, slug/filename-embedded
+numbers, even `+`-prefixed ones), so the rule was tied to the exact model-ID shape. A confirming
+review then found `kontakt-030-20150612` (a Berlin number in a slug) still excluded, hence the
+single-digit-group condition. Every counterexample is a regression test. Accepted residual:
+`ref-1-20251001`-shaped values (documented in the function).
+
+**Entropy.** The reported `Secret` span now drops trailing `.` bytes; length/entropy/structured-ID/
+git-SHA checks still run on the untrimmed token, so detection is unchanged. Fixes
+`<email>.` → `EMAIL_001[REDACTED:SECRET]`: the `.` used to survive `resolve_overlaps` as a lone
+Secret fragment. The review caught a first draft that trimmed *before* the `min_length` check,
+which dropped a 19-byte sentence-final password entirely; fixed and pinned by a test.
+
+**Evidence.** New end-to-end test `agent_system_prompt_shapes_are_not_over_masked`
+(`vg-core/tests/pipeline.rs`) reproduces the exact live garbling against the old code and passes
+with the fix. `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall 15/15, FP 0.0%
+(unchanged). The `noreply@` public-address masking the issue also notes is left as-is: it is
+consistent with policy.
