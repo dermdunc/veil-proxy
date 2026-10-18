@@ -6068,34 +6068,49 @@ ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See
 Claude Code system prompt. The exclusion fires only when: the match has no `+`/parens/space; it
 ends in exactly 8 unbroken digits that are a real calendar date (leap years included); a `-`
 sits directly before them; the run ends the identifier (no alphanumeric or `_` follows; `-` is
-allowed for Bedrock `...-v1:0` IDs); and walking left crosses only single-digit version groups
-before reaching a letter. Any 2+ digit group (area/country code) keeps the number flagged.
-**Accepted residual:** `ref-1-20251001`-shaped values (single-digit group, valid date, glued to a
-word) are not flagged. **Scope:** Anthropic-style suffixes only; `o1-2024-12-17` and
-`gpt-4.1-2025-04-14` still over-mask (next-actions).
+allowed for Bedrock `...-v1:0` IDs); and left of that `-` there are at most two single-digit
+version groups, then one of the model-family words `claude`/`opus`/`sonnet`/`haiku`
+(case-insensitive, at a word boundary). A positive allowlist, not "any word": earlier drafts
+that accepted any letter-bearing identifier let phone labels (`Tel_8-20251001`) and slugs leak.
+Per-match cost is constant (at most 11 bytes walked). **Accepted residual:** a real number whose
+last 8 digits form a valid date and follow at most two single-digit groups glued to one of those
+four words (`haiku-1-20251001`) is not flagged. **Scope:** Claude model IDs only; other
+providers' dated IDs (`o1-2024-12-17`, `gpt-4.1-2025-04-14`, `gpt-4.5-20251001`) and glued
+variants (`claude-v4-20251001`, `sonnet4-5-20251001`) still over-mask (fails toward masking;
+next-actions).
 
 **Email fragment (`vg-core` `resolve_overlaps`).** Fixes `<email>.` →
 `EMAIL_001[REDACTED:SECRET]` (and the same with `!`, `**<email>**`): the entropy tokenizer's
 `Secret` covered the email plus glued punctuation, and the punctuation survived trimming as its
-own fragment. A *trimmed* `Secret` fragment with no ASCII letter or digit is now dropped. An
-untrimmed `Secret` is always masked whole, and any fragment with a letter or digit is always
-masked. The entropy detector itself is unchanged. **Accepted residual:** symbol-only runs glued
-to *any* more specific finding (email, phone, IP, IBAN — including a false positive inside a
-real secret), before or after it, now egress raw (e.g. `!#$%^&*<email>`). They carry no letter
-or digit.
+own fragment. A `Secret` fragment is now dropped only when (a) the `Secret` lost bytes to a
+*more specific* (non-`Secret`) finding and (b) every byte of the fragment is ASCII punctuation.
+An untrimmed `Secret` is always masked whole; a `Secret` trimmed only by another `Secret` keeps
+every fragment; a fragment with any letter, digit, whitespace, control or non-ASCII byte is
+always masked. The entropy detector itself is unchanged. **Audit consistency:** a dropped
+fragment still counts as a handled `Secret` (whenever policy would have replaced it), so
+`MaskStats` handled counts match the `Scan` event's detected counts and downstream consumers
+(veil-observatory) never read it as an unmasked secret. **Accepted residual:** ASCII-punctuation
+runs glued to *any* more specific finding (email, phone, IP, IBAN — including a false positive
+inside a real secret), before or after it, now egress raw (`!#$%^&*<email>`, `<email>!#$%`,
+`$%^&*-<phone>-$%^&*`).
 
-**Review history (doubt-driven development: 2 single-model rounds, then 2 DDD cycles with a
-fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only).** Each round
-found real false negatives in the draft before it: a broad "near an identifier" phone rule
-leaked `(415) 555-1234-mobile` and slug numbers; an area-code group (`kontakt-030-20150612`), a
-country-code group (`sthlm-46-8-20251001`), an impossible date (`alice-1-20250231`, Codex) and a
-continuing identifier (`tel-1-20251001_ext99`, Codex) each leaked in turn. An earlier
-entropy-side fix (trim trailing `.` from every Secret span) was abandoned after Codex showed it
-sent a real secret's final byte raw (a quoted JSON value ending in `.`) and could emit an empty
-span under a degenerate config. Every counterexample is a regression test.
+**Review history (doubt-driven development: 2 single-model rounds, then 3 DDD cycles, each with a
+fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only; a 4th,
+human-authorized cycle reviews this state).** Each round found
+real false negatives in the draft before it: a broad "near an identifier" phone rule leaked
+`(415) 555-1234-mobile` and slug numbers; then an area-code group (`kontakt-030-20150612`), a
+country-code group (`sthlm-46-8-20251001`), an impossible date (`alice-1-20250231`), a
+continuing identifier (`tel-1-20251001_ext99`), phone labels (`Tel_8-20251001`) and a
+multi-group number (`tel-9-1-9-8-20251231`, a hyphenated `+91` mobile) each leaked in turn. An
+earlier entropy-side fix (trim trailing `.` from every Secret span) was abandoned after Codex
+showed it sent a real secret's final byte raw (a quoted JSON value ending in `.`). Cycle 3 also
+found the fragment drop applied to Secret-vs-Secret trims and to non-ASCII bytes, and that it
+left a detected-but-unhandled Secret in the audit counts; all fixed. Every counterexample is a
+regression test. The human chose the model-family allowlist and counting dropped fragments as
+handled after cycle 3.
 
 **Evidence.** `agent_system_prompt_shapes_are_not_over_masked` and
-`only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`), with a
-precondition that the entropy Secret really overlaps the email. Mutation-checked: disabling
-either fix fails a test. `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall
-15/15, FP 0.0% (unchanged).
+`only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`, with a
+precondition that the entropy Secret really overlaps the email), three `resolve_overlaps` unit
+tests in `api.rs`, and the phone tests. Mutation-checked (each new guard reverted in turn fails
+a test). `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall 15/15, FP 0.0%.

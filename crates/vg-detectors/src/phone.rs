@@ -283,35 +283,43 @@ fn looks_like_zip_plus4(buf: &[u8], m_start: usize, matched: &[u8]) -> bool {
             || preceded_by_marker_within(buf, m_start, 16, b"postal"))
 }
 
-/// Maximum bytes `looks_like_date_suffixed_identifier` walks left looking for a letter.
-/// Bounds the same O(n^2) risk `MAX_EXPAND` bounds; an identifier whose letters sit
-/// further away than this is not excluded, which fails toward masking, not toward leaking.
-const MAX_IDENT_WALK: usize = 64;
+/// Model-family words a `-YYYYMMDD`-suffixed model ID can carry directly before its
+/// version groups (`claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`). A positive
+/// allowlist rather than "any word": DDD cycle 3 showed that "a letter is reached" let
+/// phone labels qualify (`Tel_8-20251001`, `phone-1-19990101`).
+const MODEL_FAMILY_WORDS: [&[u8]; 4] = [b"claude", b"opus", b"sonnet", b"haiku"];
 
-/// Excludes the `-YYYYMMDD` date suffix of an identifier such as a model ID: the regex
-/// matches `5-20251001` inside `claude-haiku-4-5-20251001` (9 digits, a hyphen marker),
-/// which a real Claude Code system prompt sends on every request (veil-proxy#90,
-/// XREPO-021). Deliberately tied to that exact shape, not to "near an identifier" -- three
-/// review rounds each found real numbers a looser rule let through (`(415) 555-1234-mobile`,
-/// `kontakt-030-20150612`, `sthlm-46-8-20251001`, `alice-1-20250231`), all now regression
-/// tests. All of these must hold:
+/// Most single-digit version groups a model ID carries between its family word and the
+/// date (`haiku-4-5-`). More is a phone shape: `tel-9-1-9-8-20251231` is a hyphenated
+/// `+91 9820251231` (Codex, DDD cycle 3).
+const MAX_VERSION_GROUPS: usize = 2;
+
+/// Excludes the `-YYYYMMDD` date suffix of a Claude model ID: the regex matches
+/// `5-20251001` inside `claude-haiku-4-5-20251001` (9 digits, a hyphen marker), which a
+/// real Claude Code system prompt sends on every request (veil-proxy#90, XREPO-021).
+/// Deliberately tied to that exact shape -- each review round found real numbers a looser
+/// rule let through (`(415) 555-1234-mobile`, `kontakt-030-20150612`,
+/// `sthlm-46-8-20251001`, `alice-1-20250231`, `tel-1-20251001_ext99`, `Tel_8-20251001`,
+/// `tel-9-1-9-8-20251231`), all now regression tests. All of these must hold:
 ///
 /// 1. the match has no `+`, parens or space -- strong phone markers always win;
 /// 2. it ends in an unbroken run of exactly 8 digits that is a real calendar date
 ///    `YYYYMMDD` (leap years included), followed in `buf` by neither an alphanumeric nor
-///    `_` (so the run ends the identifier);
+///    `_` (so the run ends the identifier; `-` is allowed for Bedrock `...-v1:0` IDs);
 /// 3. a `-` sits directly before that run (`_` and `.` cannot: the regex's separator
 ///    class is `[-. ]`, and a `.` joiner is not the model-ID shape);
-/// 4. walking left from that `-`, only single-digit version groups (`4-`, `5_`) may be
-///    crossed (bounded by `MAX_IDENT_WALK`) before an ASCII letter. Any 2+ digit group is
-///    an area/country-code shape and keeps the number flagged.
+/// 4. left of that `-`, at most `MAX_VERSION_GROUPS` single-digit `<digit><-|_>` groups,
+///    then one of `MODEL_FAMILY_WORDS` (case-insensitive) starting at a word boundary.
+///
+/// The walk is at most 4 + 6 + 1 bytes, so per-match cost is constant.
 ///
 /// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
-/// date, and follow only single-digit groups glued to a word (`ref-1-20251001`,
-/// `jane-doe-1-20251001`, `tel-1-20251001-ext`) is not flagged.
+/// date, and follow at most two single-digit groups glued to one of those four words
+/// (`haiku-1-20251001`) is not flagged.
 ///
-/// **Scope:** Anthropic-style `-YYYYMMDD` suffixes only. Other providers' dated IDs
-/// (`o1-2024-12-17`, `gpt-4.1-2025-04-14`) still over-mask; tracked in next-actions.
+/// **Scope:** Claude model IDs only. Other providers' dated IDs (`o1-2024-12-17`,
+/// `gpt-4.1-2025-04-14`, `gpt-4.5-20251001`) and glued variants (`claude-v4-20251001`,
+/// `sonnet4-5-20251001`) still over-mask -- fails toward masking; tracked in next-actions.
 fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> bool {
     let matched = &buf[start..end];
     if matched
@@ -321,8 +329,7 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
         return false;
     }
     // The date run must end the identifier: a following digit, letter or `_` means the
-    // value continues (`tel-1-20251001_ext99`, Codex cycle-2 finding). `-` is allowed so
-    // Bedrock-style `...-20251001-v1:0` model IDs still qualify.
+    // value continues (`tel-1-20251001_ext99`, Codex cycle-2 finding).
     if buf
         .get(end)
         .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
@@ -347,21 +354,21 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
     if !is_calendar_date(num(0..4), num(4..6), num(6..8)) {
         return false;
     }
-    // `i` indexes the joiner just crossed; step over `<digit><joiner>` units only.
+    // `i` indexes the joiner just crossed; step over at most MAX_VERSION_GROUPS
+    // `<digit><joiner>` units, then require a model-family word ending right there.
     let mut i = run_start - 1;
-    let floor = i.saturating_sub(MAX_IDENT_WALK);
-    while i > floor {
-        let prev = buf[i - 1];
-        if prev.is_ascii_alphabetic() {
-            return true;
-        }
-        if prev.is_ascii_digit() && i >= 2 && matches!(buf[i - 2], b'-' | b'_') {
+    for _ in 0..MAX_VERSION_GROUPS {
+        if i >= 2 && buf[i - 1].is_ascii_digit() && matches!(buf[i - 2], b'-' | b'_') {
             i -= 2;
-            continue;
+        } else {
+            break;
         }
-        return false;
     }
-    false
+    MODEL_FAMILY_WORDS.iter().any(|word| {
+        i >= word.len()
+            && buf[i - word.len()..i].eq_ignore_ascii_case(word)
+            && (i == word.len() || !buf[i - word.len() - 1].is_ascii_alphanumeric())
+    })
 }
 
 /// A real Gregorian date in 1900-2099, leap years included (`20250231` is not one --
@@ -663,7 +670,7 @@ mod tests {
             &b"Haiku 4.5: 'claude-haiku-4-5-20251001'. When building"[..],
             b"model claude-opus-4-1-20250805 is pinned",
             b"claude-sonnet-4-20250514",
-            b"model_4-5-20240229",
+            b"CLAUDE-HAIKU-4-5-20240229",
             b"anthropic.claude-haiku-4-5-20251001-v1:0",
         ] {
             assert!(
@@ -707,6 +714,15 @@ mod tests {
             // DDD cycle 2 (Codex): the date run must end the identifier.
             b"{\"phone\":\"tel-1-20251001_ext99\"}",
             b"tel-1-20251001x",
+            // DDD cycle 3 (fresh-context + Codex): labels and multi-group phone shapes.
+            b"{\"phone\":\"tel-9-1-9-8-20251231\"}",
+            b"Tel_8-20251001",
+            b"sthlm-8-20251001",
+            b"tw-2-20251001",
+            b"phone-1-19990101",
+            b"model_4-5-20240229",
+            b"claude-haiku-1-4-5-20251001",
+            b"ultrahaiku-4-5-20251001",
         ] {
             assert_eq!(
                 PhoneDetector.detect(buf, &[]).len(),
