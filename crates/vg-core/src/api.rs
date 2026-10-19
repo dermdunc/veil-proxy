@@ -275,13 +275,13 @@ pub fn mask(
     }
 
     // 5. Resolve overlaps: no byte is masked twice, and a losing finding is trimmed to its
-    //    uncovered fragments, never discarded whole. One narrow exception: an
-    //    ASCII-punctuation-only `Secret` fragment beside a more specific finding is
-    //    dropped (and still counted as handled), see `resolve_overlaps`.
+    //    uncovered fragments, never discarded whole. One narrow exception: a short
+    //    ASCII-punctuation-only `Secret` fragment beside a more specific finding it lost
+    //    to is dropped (and still counted as handled), see `resolve_overlaps`.
     // 6. Classify and intern in FORWARD document order (so vault ordinals read top-to-
     //    bottom: the first email in the buffer is EMAIL_001), collecting replacements;
     //    splices are applied back-to-front afterwards so offsets stay valid.
-    let (ordered, fully_dropped) = resolve_overlaps(&input.buf, findings);
+    let (ordered, absorbed) = resolve_overlaps(&input.buf, findings);
 
     let mut mapping_refs: Vec<MappingRef> = Vec::new();
     // display → MappingRef for every placeholder minted (contract v1.2). Deduped in lockstep
@@ -348,15 +348,25 @@ pub fn mask(
         }
     }
 
-    // A Secret whose fragments were all dropped as punctuation-only (see
-    // `resolve_overlaps`) counts as handled once, whenever the policy would have replaced
-    // it, so downstream consumers never read it as an unmasked Secret. A Secret with any
-    // masked fragment is already counted by the loop above.
-    for finding in &fully_dropped {
-        if !matches!(
-            policy.engine.classify_entity(finding.entity_type.clone()),
+    // A Secret absorbed by more specific findings (covered by them, or its leftover
+    // punctuation dropped beside them; see `resolve_overlaps`) counts as handled once, so
+    // downstream consumers never read it as an unmasked Secret. Only when its bytes really
+    // were replaced: neither its own class nor any specific finding over it is `Pass`
+    // (DDD cycle 5). A Secret with any masked fragment is already counted above.
+    let is_pass = |ty: &EntityType| {
+        matches!(
+            policy.engine.classify_entity(ty.clone()),
             HandlingClass::Pass
-        ) {
+        )
+    };
+    for finding in &absorbed {
+        let covered_by_pass = ordered.iter().any(|f| {
+            f.entity_type != EntityType::Secret
+                && f.span.start < finding.span.end
+                && finding.span.start < f.span.end
+                && is_pass(&f.entity_type)
+        });
+        if !is_pass(&finding.entity_type) && !covered_by_pass {
             *handled_counts
                 .entry(finding.entity_type.clone())
                 .or_insert(0) += 1;
@@ -433,23 +443,24 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
 /// finding surviving raw into the masked output. Trimming masks both: the email as
 /// `EMAIL_NNN`, the uncovered head as its own `Secret` fragment.
 ///
-/// **One narrow exception (veil-proxy#90, XREPO-021):** a `Secret` fragment made only of
-/// ASCII punctuation is dropped rather than masked, when the `Secret` lost bytes to a
-/// *more specific* (non-`Secret`) finding. The entropy tokenizer counts `.`/`!`/`*` etc.
+/// **One narrow exception (veil-proxy#90, XREPO-021):** a `Secret` fragment of at most
+/// `MAX_DROPPED_PUNCTUATION` bytes, made only of ASCII punctuation, is dropped rather than
+/// masked, when the `Secret` lost bytes to a *more specific* (non-`Secret`) finding. The entropy tokenizer counts `.`/`!`/`*` etc.
 /// as token bytes, so `<email>.` or `**<email>**` became one `Secret` whose leftover
 /// punctuation was masked as its own `[REDACTED:SECRET]` beside `EMAIL_001` -- seen live
 /// in a real Claude Code system prompt. An untrimmed `Secret` is always masked whole; a
 /// `Secret` trimmed only by another `Secret` keeps every fragment; any fragment holding a
 /// byte that is not ASCII punctuation (letter, digit, whitespace, control, non-ASCII) is
-/// always masked. The fragment must also sit directly beside a more specific accepted
-/// finding (sharing a boundary with it), not merely belong to a `Secret` that overlapped
-/// one elsewhere (DDD cycle 4). A `Secret` whose fragments were *all* dropped is returned
+/// always masked. The fragment must also share a boundary with one of the specific
+/// findings this `Secret` lost bytes to, not merely with any specific finding (DDD cycles
+/// 4 and 5). A `Secret` with no kept fragment after losing to specific findings -- every
+/// fragment dropped, or none left because they covered it exactly -- is returned
 /// separately, once, so the caller can count it as handled exactly once (otherwise the
 /// audit trail would show a detected-but-unhandled Secret, or count one Secret twice).
-/// **Accepted residual:** ASCII-punctuation runs glued to *any* more specific finding
-/// (email, phone, IP, IBAN -- including a false positive inside a real secret), before or
-/// after it or between two of them, now egress raw: `!#$%^&*<email>`, `<email>!#$%`,
-/// `$%^&*-<phone>-$%^&*`.
+/// **Accepted residual:** up to 3 ASCII-punctuation bytes glued to *any* more specific
+/// finding (email, phone, IP, IBAN -- including a false positive inside a real secret),
+/// before or after it, now egress raw: `!#$<email>`, `<email>!!$` (a password shaped like
+/// `Tr0ub4dor&3xK@horse.battery!!$` loses its last 3 bytes); longer runs stay masked.
 ///
 /// Returned findings (both lists) are sorted in forward document order (ascending span
 /// start), which the caller relies on for top-to-bottom vault ordinal minting.
@@ -465,22 +476,26 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
     });
 
     let mut accepted: Vec<Finding> = Vec::new();
-    let mut fully_dropped: Vec<Finding> = Vec::new();
+    let mut absorbed: Vec<Finding> = Vec::new();
     for finding in findings {
         // Subtract every already-accepted interval from this finding's span; keep each
         // surviving fragment as a finding of the same type. An exact duplicate (or a
         // fully-covered lower-priority finding) yields no fragments and drops out — that
         // is the "never double-mask" half of the contract.
         let mut fragments = vec![(finding.span.start, finding.span.end)];
-        let mut lost_to_more_specific = false;
-        for acc in &accepted {
+        // Indices into `accepted` of the more specific findings this one lost bytes to.
+        let mut winners: Vec<usize> = Vec::new();
+        for (idx, acc) in accepted.iter().enumerate() {
             let mut next = Vec::new();
             for (start, end) in fragments {
                 if acc.span.start >= end || acc.span.end <= start {
                     next.push((start, end)); // no overlap with this accepted span
                 } else {
-                    lost_to_more_specific |=
-                        specificity(&acc.entity_type) > specificity(&finding.entity_type);
+                    if specificity(&acc.entity_type) > specificity(&finding.entity_type)
+                        && !winners.contains(&idx)
+                    {
+                        winners.push(idx);
+                    }
                     if start < acc.span.start {
                         next.push((start, acc.span.start)); // fragment left of the winner
                     }
@@ -494,7 +509,7 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
                 break;
             }
         }
-        let (mut kept_any, mut dropped_any) = (false, false);
+        let mut kept_any = false;
         for (start, end) in fragments {
             debug_assert!(start < end);
             let fragment = Finding {
@@ -505,32 +520,37 @@ fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Ve
                 },
                 ..finding.clone()
             };
-            let punctuation_only = buf
-                .get(start..end)
-                .is_some_and(|b| b.iter().all(u8::is_ascii_punctuation));
-            let beside_more_specific = accepted.iter().any(|acc| {
-                specificity(&acc.entity_type) > specificity(&finding.entity_type)
-                    && (acc.span.end == start || acc.span.start == end)
+            let punctuation_only = end - start <= MAX_DROPPED_PUNCTUATION
+                && buf
+                    .get(start..end)
+                    .is_some_and(|b| b.iter().all(u8::is_ascii_punctuation));
+            // Beside a finding this Secret actually lost bytes to, not any specific one.
+            let beside_winner = winners.iter().any(|&w| {
+                let acc = &accepted[w];
+                acc.span.end == start || acc.span.start == end
             });
-            if lost_to_more_specific
-                && beside_more_specific
-                && finding.entity_type == EntityType::Secret
-                && punctuation_only
-            {
-                dropped_any = true;
+            if beside_winner && finding.entity_type == EntityType::Secret && punctuation_only {
             } else {
                 kept_any = true;
                 accepted.push(fragment);
             }
         }
-        if dropped_any && !kept_any {
-            fully_dropped.push(finding);
+        // Covered entirely by, or dropped beside, more specific findings: every detected
+        // byte was handled by those, so the caller counts this Secret once (DDD cycle 5,
+        // Codex: an exactly-covered Secret previously went uncounted).
+        if !winners.is_empty() && !kept_any && finding.entity_type == EntityType::Secret {
+            absorbed.push(finding);
         }
     }
     accepted.sort_by_key(|f| f.span.start);
-    fully_dropped.sort_by_key(|f| f.span.start);
-    (accepted, fully_dropped)
+    absorbed.sort_by_key(|f| f.span.start);
+    (accepted, absorbed)
 }
+
+/// Longest punctuation-only `Secret` fragment `resolve_overlaps` may drop: covers the
+/// observed `.`, `!`, `**` and `**.` shapes while bounding how many bytes of a real secret
+/// that merely looks like `x@y.z!!` can egress raw (DDD cycle 5).
+const MAX_DROPPED_PUNCTUATION: usize = 3;
 
 /// Priority for overlap resolution. The entropy detector's catch-all `Secret` is the one
 /// generic type — any concretely-typed finding (`Email`, `Iban`, `Password`, …) is more
@@ -980,6 +1000,58 @@ mod tests {
         );
         assert_eq!(spans(&accepted), vec![(0, 2), (2, buf.len())]);
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_secret_covered_exactly_by_a_specific_finding_is_absorbed() {
+        // DDD cycle 5 (Codex): an exactly-covered Secret yields no fragments; it must
+        // still be reported so the caller counts it as handled.
+        let buf = b"a@example.com";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, 13),
+                finding(EntityType::Email, 0, 13),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13)]);
+        assert_eq!(spans(&absorbed), vec![(0, 13)]);
+    }
+
+    #[test]
+    fn a_punctuation_fragment_longer_than_the_cap_is_kept() {
+        // DDD cycle 5: bounds how much of a real `x@y.z!!!!`-shaped secret can egress.
+        let buf = b"a@example.com!!!!";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, 17),
+                finding(EntityType::Email, 0, 13),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13), (13, 17)]);
+        assert!(absorbed.is_empty());
+    }
+
+    #[test]
+    fn a_punctuation_fragment_beside_a_finding_it_never_lost_to_is_kept() {
+        // DDD cycle 5: B's `!!!!` (40..44) touches only the IP, which B never overlapped;
+        // B lost bytes to the Email elsewhere, which must not qualify the fragment.
+        let buf = b"a@example.com_ZZZZZZZZZZZZZZZZZZZZZZZZZZ!!!10.0.0.1";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Email, 0, 13),
+                finding(EntityType::Secret, 0, 40),
+                finding(EntityType::Secret, 10, 43),
+                finding(EntityType::InternalIp, 43, 51),
+            ],
+        );
+        assert_eq!(
+            spans(&accepted),
+            vec![(0, 13), (13, 40), (40, 43), (43, 51)]
+        );
+        assert!(absorbed.is_empty());
     }
 
     #[test]

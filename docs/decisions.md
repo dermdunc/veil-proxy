@@ -6067,38 +6067,48 @@ ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See
 `claude-haiku-4-5-20251001` → `claude-haiku-4-PHONE_001`, sent on every request by a real
 Claude Code system prompt. The exclusion fires only when: the match has no `+`/parens/space; it
 ends in exactly 8 unbroken digits that are a real calendar date (leap years included); a `-`
-sits directly before them; the run ends the identifier (end of input, whitespace, a quote or
-backtick, `.,;:)]}>`, or `-` for Bedrock `...-v1:0` IDs -- an allowlist); and left of that `-`
-there are at most two single-digit version groups, then one of the model-family words
-`claude`/`opus`/`sonnet`/`haiku` (case-insensitive, preceded by neither an alphanumeric nor `_`). A positive allowlist, not "any word": earlier drafts
-that accepted any letter-bearing identifier let phone labels (`Tel_8-20251001`) and slugs leak.
-Per-match cost is constant (one reverse scan of the match, then at most 12 bytes). **Accepted residual:** a real number whose
+sits directly before them; the run ends the identifier (an allowlist, `ends_model_id`: end of
+input, whitespace, ASCII or typographic closing quotes, backtick, `.,;:)]}>[*!?&|\`, or `-`
+only as a Bedrock `-v<digit>` suffix); and left of that `-` there are at most two single-digit
+version groups, then one of the model-family words `claude`/`opus`/`sonnet`/`haiku`
+(case-insensitive, preceded by neither an ASCII alphanumeric, `_`, nor any non-ASCII byte). A
+positive allowlist, not "any word": earlier drafts that accepted any letter-bearing identifier
+let phone labels (`Tel_8-20251001`) and slugs leak. Per-match cost is constant (one reverse
+scan of the match, then at most 14 bytes). **Accepted residual:** a real number whose
 last 8 digits form a valid date and follow at most two single-digit groups glued to one of those
 four words (`haiku-1-20251001`) is not flagged. **Scope:** Claude model IDs only; other
 providers' dated IDs (`o1-2024-12-17`, `gpt-4.1-2025-04-14`, `gpt-4.5-20251001`) and glued
 variants (`claude-v4-20251001`, `sonnet4-5-20251001`) still over-mask (fails toward masking;
-next-actions).
+next-actions), as does a Claude ID followed by `/` or `_` (`models/claude-haiku-4-5-20251001/invoke`,
+`_claude-haiku-4-5-20251001_`), because those bytes continue real numbers (`/99`, `_ext99`).
 
 **Email fragment (`vg-core` `resolve_overlaps`).** Fixes `<email>.` →
 `EMAIL_001[REDACTED:SECRET]` (and the same with `!`, `**<email>**`): the entropy tokenizer's
 `Secret` covered the email plus glued punctuation, and the punctuation survived trimming as its
 own fragment. A `Secret` fragment is now dropped only when (a) the `Secret` lost bytes to a
-*more specific* (non-`Secret`) finding, (b) the fragment shares a boundary with such a finding,
-and (c) every byte of the fragment is ASCII punctuation.
+*more specific* (non-`Secret`) finding, (b) the fragment shares a boundary with one of the
+findings it lost bytes to, (c) every byte of the fragment is ASCII punctuation, and (d) the
+fragment is at most 3 bytes (`MAX_DROPPED_PUNCTUATION`; covers `.`, `!`, `**`, `**.`).
 An untrimmed `Secret` is always masked whole; a `Secret` trimmed only by another `Secret` keeps
 every fragment; a fragment with any letter, digit, whitespace, control or non-ASCII byte is
-always masked. The entropy detector itself is unchanged. **Audit consistency:** a `Secret` whose
-fragments were all dropped still counts as handled, exactly once (whenever policy would have
-replaced it), so downstream consumers (veil-observatory) never read it as an unmasked secret and
-`**<email>**` (two dropped fragments of one raw Secret) counts 1, not 2. A `Secret` with any
-masked fragment is counted per masked fragment, as before this change. **Accepted residual:** ASCII-punctuation
-runs glued to *any* more specific finding (email, phone, IP, IBAN — including a false positive
-inside a real secret), before or after it or between two of them, now egress raw (`!#$%^&*<email>`, `<email>!#$%`,
-`$%^&*-<phone>-$%^&*`).
+always masked. The entropy detector itself is unchanged. **Audit consistency:** a `Secret` left
+with no kept fragment after losing to more specific findings -- every fragment dropped, or
+covered by them exactly -- counts as handled exactly once, so downstream consumers
+(veil-observatory) never read it as an unmasked secret and `**<email>**` (two dropped
+fragments of one raw Secret) counts 1, not 2. It is not counted when its own class or any
+specific finding over it is `Pass` (its bytes were not replaced). **Behaviour change beyond
+#90:** the entropy detector also flags many whole email addresses; those exactly-covered Secrets
+previously went uncounted in `MaskStats` while the Scan event counted them detected, so
+`MaskStats` Secret counts now rise to match the Scan event on email-bearing traffic. A `Secret`
+with any masked fragment is counted per masked fragment, as before this change. **Accepted
+residual:** up to 3 ASCII-punctuation bytes glued to a more specific finding the Secret lost to
+(email, phone, IP, IBAN -- including a false positive inside a real secret), before or after it,
+now egress raw (`!#$<email>`, `<email>!!$`; a password shaped like
+`Tr0ub4dor&3xK@horse.battery!!$` sends its last 3 bytes raw). Longer runs stay masked.
 
-**Review history (doubt-driven development: 2 single-model rounds, then 4 DDD cycles, each with a
-fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only; the 4th was
-human-authorized past the skill's 3-cycle bound).** Each round found
+**Review history (doubt-driven development: 2 single-model rounds, then 5 DDD cycles, each with a
+fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only; the 4th and 5th
+were human-authorized past the skill's 3-cycle bound).** Each round found
 real false negatives in the draft before it: a broad "near an identifier" phone rule leaked
 `(415) 555-1234-mobile` and slug numbers; then an area-code group (`kontakt-030-20150612`), a
 country-code group (`sthlm-46-8-20251001`), an impossible date (`alice-1-20250231`), a
@@ -6110,12 +6120,18 @@ earlier entropy-side fix (trim trailing `.` from every Secret span) was abandone
 showed it sent a real secret's final byte raw (a quoted JSON value ending in `.`). Cycle 3 also
 found the fragment drop applied to Secret-vs-Secret trims and to non-ASCII bytes, and that it
 left a detected-but-unhandled Secret in the audit counts; cycle 4 found the drop keyed per
-finding rather than per fragment, and dropped fragments counted twice; all fixed. Every counterexample is a
+finding rather than per fragment, and dropped fragments counted twice; cycle 5 found a
+non-Bedrock `-` suffix (`haiku-1-20251001-mobile`) and a non-ASCII-glued word
+(`caféhaiku-1-20251001`) leaking, model IDs still over-masked beside curly quotes, `[1m]`,
+markdown and escaped JSON, an exactly-covered Secret uncounted, adjacency to a finding the
+Secret never lost to, an unbounded punctuation drop, and "handled" claimed under a `Pass`
+winner; all fixed. Every counterexample is a
 regression test. The human chose the model-family allowlist and counting dropped fragments as
 handled after cycle 3.
 
 **Evidence.** `agent_system_prompt_shapes_are_not_over_masked` and
 `only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`, with a
-precondition that the entropy Secret really overlaps the email), four `resolve_overlaps` unit
+precondition that the entropy Secret really overlaps the email),
+`a_secret_absorbed_by_a_pass_finding_is_not_counted_as_handled`, seven `resolve_overlaps` unit
 tests in `api.rs`, and the phone tests. Mutation-checked (each new guard reverted in turn fails
 a test). `vg bench --no-hook`: every gate PASS, secret recall 5/5, PII recall 15/15, FP 0.0%.

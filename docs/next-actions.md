@@ -20,7 +20,11 @@ demask logic, vault, detectors, pipeline, and tool-path masking are all validate
 - [ ] Then veil-demo bumps its pin to the merge commit, and XREPO-021 closes in veil-ecosystem.
 - [ ] Follow-up (out of #90's scope): other dated model IDs still over-mask as PHONE
       (`o1-2024-12-17` → `oPHONE_001`, `gpt-4.1-2025-04-14` → `gpt-4.PHONE_002`,
-      `gpt-4.5-20251001`, `claude-v4-20251001`, `sonnet4-5-20251001`).
+      `gpt-4.5-20251001`, `claude-v4-20251001`, `sonnet4-5-20251001`), and Claude IDs followed
+      by `/` or `_` (`models/claude-haiku-4-5-20251001/invoke`).
+- [ ] veil-observatory: `MaskStats` Secret counts now include Secrets absorbed by an Email/IP
+      etc. (they matched the Scan event's detected count only after this fix); expect higher
+      handled-Secret numbers on email-bearing traffic.
 
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 

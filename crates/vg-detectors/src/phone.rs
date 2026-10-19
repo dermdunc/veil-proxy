@@ -304,18 +304,18 @@ const MAX_VERSION_GROUPS: usize = 2;
 ///
 /// 1. the match has no `+`, parens or space -- strong phone markers always win;
 /// 2. it ends in an unbroken run of exactly 8 digits that is a real calendar date
-///    `YYYYMMDD` (leap years included), followed in `buf` by end of input or one of the
-///    bytes a model ID ends on in text -- whitespace, quotes, backtick, `.,;:)]}>`, or `-`
-///    for Bedrock `...-v1:0` IDs (an allowlist: `/` let `haiku-1-20251001/99` through,
-///    Codex cycle 4);
+///    `YYYYMMDD` (leap years included), followed in `buf` by end of input or a byte a
+///    model ID ends on in text (see `ends_model_id`; `-` only as a Bedrock `-v<digit>`
+///    suffix);
 /// 3. a `-` sits directly before that run (`_` and `.` cannot: the regex's separator
 ///    class is `[-. ]`, and a `.` joiner is not the model-ID shape);
 /// 4. left of that `-`, at most `MAX_VERSION_GROUPS` single-digit `<digit><-|_>` groups,
 ///    then one of `MODEL_FAMILY_WORDS` (case-insensitive) starting at a word boundary
-///    (preceded by neither an alphanumeric nor `_`: `phone_haiku-...` does not count).
+///    (preceded by neither an ASCII alphanumeric, `_`, nor any non-ASCII byte:
+///    `phone_haiku-...` and `caféhaiku-...` do not count).
 ///
-/// Beyond one reverse scan of the match itself, at most 12 bytes are inspected
-/// (1 + 2 x 2 + 6 + 1), so per-match cost is constant.
+/// Beyond one reverse scan of the match itself, at most 14 bytes are inspected
+/// (3 + 2 x 2 + 6 + 1), so per-match cost is constant.
 ///
 /// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
 /// date, and follow at most two single-digit groups glued to one of those four words
@@ -324,6 +324,8 @@ const MAX_VERSION_GROUPS: usize = 2;
 /// **Scope:** Claude model IDs only. Other providers' dated IDs (`o1-2024-12-17`,
 /// `gpt-4.1-2025-04-14`, `gpt-4.5-20251001`) and glued variants (`claude-v4-20251001`,
 /// `sonnet4-5-20251001`) still over-mask -- fails toward masking; tracked in next-actions.
+/// So does a Claude ID followed by `/` or `_` (`models/claude-haiku-4-5-20251001/invoke`,
+/// `_claude-haiku-4-5-20251001_`): those bytes continue real numbers (`/99`, `_ext99`).
 fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> bool {
     let matched = &buf[start..end];
     if matched
@@ -333,15 +335,8 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
         return false;
     }
     // The date run must end the identifier (`tel-1-20251001_ext99`, Codex cycle 2;
-    // `haiku-1-20251001/99`, Codex cycle 4).
-    let ends_identifier = buf.get(end).is_none_or(|&b| {
-        b.is_ascii_whitespace()
-            || matches!(
-                b,
-                b'\'' | b'"' | b'`' | b'.' | b',' | b';' | b':' | b')' | b']' | b'}' | b'>' | b'-'
-            )
-    });
-    if !ends_identifier {
+    // `haiku-1-20251001/99`, Codex cycle 4; `haiku-1-20251001-mobile`, Codex cycle 5).
+    if !ends_model_id(buf, end) {
         return false;
     }
     let run_len = matched
@@ -376,10 +371,52 @@ fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> 
         i >= word.len()
             && buf[i - word.len()..i].eq_ignore_ascii_case(word)
             && (i == word.len() || {
+                // Any non-ASCII byte is identifier-forming too: `caféhaiku-1-20251001`
+                // is not a word boundary (Codex cycle 5).
                 let before = buf[i - word.len() - 1];
-                !(before.is_ascii_alphanumeric() || before == b'_')
+                !(before.is_ascii_alphanumeric() || before == b'_' || !before.is_ascii())
             })
     })
+}
+
+/// Whether the date run ending at `end` also ends the identifier: end of input, or a byte a
+/// model ID ends on in text -- an allowlist, because each continuation that was let through
+/// leaked a real number (`/99`, `_ext99`, `-mobile`). `-` counts only as the start of a
+/// Bedrock version suffix (`-v1:0`). Accepts typographic closing quotes (`’`, `”`) and the
+/// bytes that end a model ID in markdown, prose, escaped JSON, query strings and Claude
+/// Code's `[1m]` context suffix (DDD cycle 5). Reads at most 3 bytes.
+fn ends_model_id(buf: &[u8], end: usize) -> bool {
+    let rest = &buf[end.min(buf.len())..];
+    match rest {
+        [] => true,
+        [b'-', b'v' | b'V', d, ..] => d.is_ascii_digit(),
+        // U+2019 RIGHT SINGLE QUOTATION MARK, U+201D RIGHT DOUBLE QUOTATION MARK.
+        [0xE2, 0x80, 0x99 | 0x9D, ..] => true,
+        [b, ..] => {
+            b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'\''
+                        | b'"'
+                        | b'`'
+                        | b'.'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b')'
+                        | b']'
+                        | b'}'
+                        | b'>'
+                        | b'['
+                        | b'*'
+                        | b'!'
+                        | b'?'
+                        | b'&'
+                        | b'|'
+                        | b'\\'
+                )
+        }
+    }
 }
 
 /// A real Gregorian date in 1900-2099, leap years included (`20250231` is not one --
@@ -683,6 +720,16 @@ mod tests {
             b"claude-sonnet-4-20250514",
             b"CLAUDE-HAIKU-4-5-20240229",
             b"anthropic.claude-haiku-4-5-20251001-v1:0",
+            // DDD cycle 5: delimiters seen around model IDs in real agent traffic.
+            "Use claude-haiku-4-5-20251001\u{2019} for this".as_bytes(),
+            "the \u{201c}claude-haiku-4-5-20251001\u{201d} model".as_bytes(),
+            b"claude-sonnet-4-5-20250929[1m]",
+            b"{\\\"model\\\":\\\"claude-haiku-4-5-20251001\\\"}",
+            b"**claude-haiku-4-5-20251001**",
+            b"?model=claude-haiku-4-5-20251001&x=1",
+            b"use claude-haiku-4-5-20251001!",
+            b"is it claude-haiku-4-5-20251001?",
+            b"| claude-haiku-4-5-20251001|",
         ] {
             assert!(
                 PhoneDetector.detect(buf, &[]).is_empty(),
@@ -737,6 +784,10 @@ mod tests {
             // DDD cycle 4 (Codex): a continuing identifier and an `_`-glued family word.
             b"Call haiku-1-20251001/99",
             b"phone_haiku-1-20251001",
+            // DDD cycle 5 (Codex): a non-Bedrock `-` suffix and a non-ASCII-glued word.
+            b"contact/haiku-1-20251001-mobile",
+            b"haiku-1-20251001-v",
+            "contacts/caf\u{e9}haiku-1-20251001".as_bytes(),
         ] {
             assert_eq!(
                 PhoneDetector.detect(buf, &[]).len(),

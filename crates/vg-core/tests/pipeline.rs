@@ -174,7 +174,10 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
     // Stats reflect what was handled; nothing was artefact-blocked.
     assert_eq!(pack.stats.counts.0.get(&EntityType::Email), Some(&3));
     assert_eq!(pack.stats.counts.0.get(&EntityType::Iban), Some(&1));
-    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&1));
+    // The entropy detector also flags two of the email addresses whole; those Secrets are
+    // absorbed by their Email findings and counted as handled once each (DDD cycle 5), so
+    // handled matches what the Scan event reports detected.
+    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&3));
     assert_eq!(pack.stats.blocked_artefacts, 0);
 
     // Reversible masks produced mapping refs; the returned Scan event carries the same
@@ -183,6 +186,10 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
     match event {
         AuditEvent::Scan { counts, .. } => {
             assert_eq!(counts.0.get(&EntityType::Email), Some(&3));
+            assert_eq!(
+                counts.0.get(&EntityType::Secret),
+                pack.stats.counts.0.get(&EntityType::Secret)
+            );
         }
         other => panic!("expected AuditEvent::Scan, got {other:?}"),
     }
@@ -602,6 +609,60 @@ fn scan_event_counts_raw_detections_not_overlap_fragments() {
         }
         other => panic!("expected a Scan event, got {other:?}"),
     }
+}
+
+/// A `Hostname` finding (a `pass` class in the fixture policy) with a `Secret` that only
+/// adds trailing `!!`: the Secret is absorbed, but none of its bytes are replaced.
+struct PassBait;
+
+impl Detector for PassBait {
+    fn id(&self) -> DetectorId {
+        DetectorId("pass-bait".to_string())
+    }
+    fn detect(&self, _buf: &[u8], _spans: &[Span]) -> Vec<Finding> {
+        let f = |entity_type, start, end| Finding {
+            entity_type,
+            span: Span {
+                start,
+                end,
+                node_kind: None,
+            },
+            confidence: 0.9,
+            detector: self.id(),
+        };
+        vec![f(EntityType::Secret, 0, 19), f(EntityType::Hostname, 0, 17)]
+    }
+    fn entity_types(&self) -> &[EntityType] {
+        &[EntityType::Secret, EntityType::Hostname]
+    }
+}
+
+#[test]
+fn a_secret_absorbed_by_a_pass_finding_is_not_counted_as_handled() {
+    // DDD cycle 5: the absorbed-Secret count must not claim "handled" when the specific
+    // finding that absorbed it was passed through raw.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let input = Input {
+        buf: b"build.example.org!! rest".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let bait = PassBait;
+    let detectors: Vec<&dyn Detector> = vec![&bait];
+    let ctx = Context {
+        parsers: &[],
+        detectors: &detectors,
+    };
+    let (pack, _refs, _event, _trace_id) = mask(&input, &ctx, &policy, &ns).expect("mask succeeds");
+    assert_eq!(pack.text, "build.example.org!! rest");
+    assert_eq!(
+        pack.stats.counts.0.get(&EntityType::Secret),
+        None,
+        "{:?}",
+        pack.stats.counts
+    );
 }
 
 #[test]
