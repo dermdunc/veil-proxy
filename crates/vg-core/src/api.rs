@@ -17,7 +17,7 @@
 //! sanctioned fix per the contract-change protocol (`agent-factory-plan.md` §6) is an
 //! explicit parameter, not smuggling detectors into `Policy` or pre-computing findings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -441,10 +441,11 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
 ///    kept, so the scrub can never hide a byte outside the constant's own bytes.
 /// 2. Only when an occurrence exists, every detector also runs over a short window of the
 ///    `scrub_copy` copy around it (`SCRUB_WINDOW` bytes either side,
-///    overlapping windows merged), and a finding from that pass is **added** when it
-///    overlaps no occurrence, does not touch a window edge cut out of the middle of the
-///    buffer (a truncated token), and is not already fully covered by a same-type finding
-///    from step 1 (so audit counts are not inflated). This only ever adds masking: it is
+///    overlapping windows merged), and a finding from that pass is **added** only when it
+///    starts at most `MAX_GLUE` bytes after an occurrence ends (the one place the ID's
+///    digits can merge into a neighbour), overlaps no occurrence, does not touch a window
+///    edge cut out of the middle of the buffer (a truncated token), and is not an exact
+///    duplicate of a step-1 finding (so audit counts are not inflated). This only ever adds masking: it is
 ///    what finds `555-1234` in `<id> 555-1234`, where on the original the ID's digits join
 ///    the number into one 16-digit candidate the phone detector rejects whole.
 ///
@@ -459,9 +460,25 @@ fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
     if occurrences.is_empty() {
         return findings;
     }
-    let inside = |s: &Span| occurrences.iter().any(|&(a, b)| a <= s.start && s.end <= b);
-    let overlaps = |s: &Span| occurrences.iter().any(|&(a, b)| s.start < b && a < s.end);
+    // `occurrences` is ascending and non-overlapping, so each query is a binary search
+    // (Codex: linear scans made a request dense with IDs and findings quadratic).
+    let inside = |s: &Span| {
+        let i = occurrences.partition_point(|&(a, _)| a <= s.start);
+        i > 0 && s.end <= occurrences[i - 1].1
+    };
+    let overlaps = |s: &Span| {
+        let i = occurrences.partition_point(|&(a, _)| a < s.end);
+        i > 0 && occurrences[i - 1].1 > s.start
+    };
+    let glued_after = |s: &Span| {
+        let i = occurrences.partition_point(|&(_, b)| b <= s.start);
+        i > 0 && s.start - occurrences[i - 1].1 <= MAX_GLUE
+    };
     findings.retain(|f| !inside(&f.span));
+    let seen: HashSet<(EntityType, usize, usize)> = findings
+        .iter()
+        .map(|f| (f.entity_type.clone(), f.span.start, f.span.end))
+        .collect();
 
     let scrubbed = scrub_copy(buf, &occurrences);
     let mut windows: Vec<(usize, usize)> = Vec::new();
@@ -481,12 +498,8 @@ fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
                     (f.span.start == 0 && lo > 0) || (lo + f.span.end == hi && hi < buf.len());
                 f.span.start += lo;
                 f.span.end += lo;
-                let already = findings.iter().any(|o| {
-                    o.entity_type == f.entity_type
-                        && o.span.start <= f.span.start
-                        && f.span.end <= o.span.end
-                });
-                if !cut_edge && !already && !overlaps(&f.span) {
+                let already = seen.contains(&(f.entity_type.clone(), f.span.start, f.span.end));
+                if glued_after(&f.span) && !cut_edge && !already && !overlaps(&f.span) {
                     added.push(f);
                 }
             }
@@ -547,6 +560,13 @@ const PROTECTED_LITERAL_PREFIX: &[u8] = b"claude-";
 /// occurrence: well over the longest phone candidate the regex can build (about 31
 /// bytes), which is the neighbour the window pass exists to find.
 const SCRUB_WINDOW: usize = 64;
+
+/// Most bytes between an occurrence's end and the start of a window-pass finding it may
+/// add (one or two separator bytes: `<id> 555-1234`, `<id>-555-1234`, `<id>, 555-1234`).
+/// A finding anywhere else in the window was already judged on the original with full
+/// context, and the slice can hide context a detector looks at (Codex: a `commit` word
+/// outside the window turned a git SHA into a `Secret`), so it is never added.
+const MAX_GLUE: usize = 2;
 
 /// The three-byte UTF-8 encodings of U+2018/U+2019/U+201C/U+201D (`‘ ’ “ ”`): the only
 /// non-ASCII bytes that bound a protected literal. Seen around model IDs in real agent

@@ -6075,9 +6075,10 @@ entirely inside an occurrence is removed; every other finding `main` makes is ke
 outside the constant's own bytes can be hidden, whatever a detector does. **(2)** Only when an
 occurrence exists, every detector also runs over a 64-byte-each-side window of a same-length
 copy in which the occurrence's digits are replaced by letters (`claude-haiku-E-F-CACFBAAB`);
-a window finding is *added* when it overlaps no occurrence, does not touch a window edge cut
-from the middle of the buffer, and is not already covered by a same-type finding (no
-inflated audit counts). Step 2 only adds masking: it finds `555-1234` in `<id> 555-1234` and
+a window finding is *added* only when it starts at most 2 bytes after an occurrence ends (the
+one place the ID's digits can merge into a neighbour), overlaps no occurrence, does not touch a
+window edge cut from the middle of the buffer, and is not an exact duplicate of an original
+finding (no inflated audit counts). Step 2 only adds masking: it finds `555-1234` in `<id> 555-1234` and
 `<id>-555-1234`, which on the original form one 16-digit candidate the 7-15 digit filter
 rejects whole, so `555-1234` egressed raw before (confirmed with the real detector). Masking
 interns and splices from the original; parser spans come from the original too. **Bounded:**
@@ -6097,7 +6098,9 @@ upstream model is the adversary on the response path and can ask the wrapped cli
 files); nothing is fetched, configurable or case-folded. **Cost:** one pass over the buffer,
 trying the list only where `claude-` starts (so a run of `c` bytes costs one short compare per
 byte, Codex), plus detectors over ≤ 2 × 64 bytes + the ID per occurrence, with overlapping
-windows merged so no byte is scanned twice by the window pass. **Accepted residuals (all fail toward masking):** any dated ID not byte-identical to a
+windows merged so no byte is scanned twice by the window pass; occurrence queries are binary
+searches and duplicate checks a hash lookup (Codex: linear scans made `a@b.co <id> ` × 10,000,
+330 KB, take 173 ms in a release build; now 15 ms, linear). **Accepted residuals (all fail toward masking):** any dated ID not byte-identical to a
 listed one over-masks until added -- new Claude models (next-actions), uppercase
 `CLAUDE-HAIKU-4-5-20251001`, other providers' (`o1-2024-12-17`, `gpt-4.1-2025-04-14`,
 `gpt-4.5-20251001`); IDs glued through an identifier byte (`_<id>_`, `<id>_ext99`); a non-ASCII
@@ -6165,7 +6168,11 @@ cycles stays as a detector regression test (`still_flags_numbers_next_to_non_ide
 the "not a phone" cases moved to `vg-core`'s pipeline tests, minus the uppercase one. Fable
 (cross-model) proposed and implemented the scrub; an independent Codex adversarial review then
 found the single-copy design's entropy leak (Critical), the matching false positive (High) and
-a `c`-byte scan cost (Medium), consolidated into the two-step design above.
+a `c`-byte scan cost (Medium), consolidated into the two-step design above. A second Codex
+pass on that consolidation found the window pass adding findings away from the ID whose
+detector context lay outside the slice (`commit <sha>` redacted as a Secret, High) and
+quadratic cost on ID-dense input (High); both fixed by the 2-byte glue rule and indexed
+lookups.
 
 **Evidence.** `agent_system_prompt_shapes_are_not_over_masked` (exact expected output
 unchanged), `listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_agent_traffic`,
@@ -6173,13 +6180,13 @@ unchanged), `listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_age
 (also resolves `EMAIL_001` from the vault to prove the original bytes were interned),
 `unlisted_or_glued_model_id_shapes_fail_toward_masking`,
 `the_scrub_never_changes_a_finding_outside_the_model_id` (both Codex entropy cases),
-`the_window_pass_adds_no_duplicate_or_truncated_findings` and
+`the_window_pass_adds_no_duplicate_or_truncated_findings` (incl. the `commit <sha>` case) and
 `only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`, with a
 precondition that the entropy Secret really overlaps the email),
 `a_secret_absorbed_by_a_pass_finding_is_not_counted_as_handled`, four scrub and seven
 `resolve_overlaps` unit tests in `api.rs`, and the phone tests. Mutation-checked (each new guard
 -- bounded-left, bounded-right, the scrub on `scan`, the scrub on `mask`, splicing from the
-original, detecting on the original, the overlap/edge/duplicate filters on window findings,
+original, detecting on the original, the glue/overlap/edge/duplicate filters on window findings,
 removing only inside-occurrence findings, the window pass itself -- reverted in turn fails a
 test). `vg bench --no-hook`: every gate PASS, secret recall
 5/5, PII recall 15/15, FP 0.0%.

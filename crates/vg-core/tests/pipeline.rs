@@ -426,6 +426,19 @@ fn the_scrub_never_changes_a_finding_outside_the_model_id() {
         !findings.iter().any(|f| f.entity_type == EntityType::Secret),
         "{findings:?}"
     );
+
+    // The same token glued right after a first ID: the window finding starts within the
+    // glue distance of one occurrence but covers the next, so it is still discarded.
+    let raw = "claude-haiku-4-5-20251001 claude-haiku-4-5-20251001=2025100120251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
 }
 
 #[test]
@@ -447,6 +460,17 @@ fn the_window_pass_adds_no_duplicate_or_truncated_findings() {
         }
         other => panic!("expected a Scan event, got {other:?}"),
     }
+
+    // A finding the window pass makes away from the ID is never added: the slice can hide
+    // context a detector reads (Codex: `commit` outside the window made this SHA a Secret).
+    let raw = "xxxxxxxxx commit 0123456789abcdef0123456789abcdef01234567 \
+               xxxxxxxxxxxxxxxxxxxxx claude-haiku-4-5-20251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(findings.is_empty(), "{findings:?}");
 
     // A long low-entropy token the window cuts in half: its high-entropy head alone must
     // not become a Secret the original never found.
