@@ -389,6 +389,81 @@ fn mask_text(policy: &Policy, ns: &Namespace, raw: &str) -> String {
 }
 
 #[test]
+fn the_scrub_never_changes_a_finding_outside_the_model_id() {
+    // Codex review of the first scrub design, which fed the rewritten copy to every
+    // detector: the entropy detector scores the whole glued token, and the digit fill
+    // changed that token's entropy in both directions.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    // Fill letters collided with the secret's, pulling the token below the threshold: the
+    // secret egressed raw. Detection on the original keeps the whole-token Secret.
+    let raw = "claude-haiku-4-5-20251001=EEAEBBAAAAEBCBFAAABF";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret
+            && f.span.start == 0
+            && f.span.end == raw.len()),
+        "{findings:?}"
+    );
+    let text = mask_text(&policy, &ns, raw);
+    assert!(!text.contains("EEAEBBAAAAEBCBFAAABF"), "{text}");
+
+    // The fill raised a below-threshold token over it, garbling an unrelated value. The
+    // window pass discards any finding overlapping the ID.
+    let raw = "claude-haiku-4-5-20251001=2025100120251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn the_window_pass_adds_no_duplicate_or_truncated_findings() {
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    // An email beside the ID is found on both passes; the Scan event counts it once.
+    let input = Input {
+        buf: b"claude-haiku-4-5-20251001 fixture.author@example.com".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (_pack, _refs, event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    match event {
+        AuditEvent::Scan { counts, .. } => {
+            assert_eq!(counts.0.get(&EntityType::Email), Some(&1), "{counts:?}");
+        }
+        other => panic!("expected a Scan event, got {other:?}"),
+    }
+
+    // A long low-entropy token the window cuts in half: its high-entropy head alone must
+    // not become a Secret the original never found.
+    let head = "q7Z9wK2pX4mR8vT1yB6nF3hJ5sD0gLcE7uA2iO9eW4rQ1tY6zN8xV3bM5kH0jG2fP";
+    let raw = format!("claude-haiku-4-5-20251001 {head}{}", "a".repeat(400));
+    let input = Input {
+        buf: raw.clone().into_bytes(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_agent_traffic() {
     // veil-proxy#90 (XREPO-021): the phone detector's regex matches the `5-20251001` tail
     // of a dated Claude model ID. `vg_core::PROTECTED_LITERALS` scrubs bounded occurrences

@@ -160,9 +160,8 @@ pub struct Metrics {
 /// quoted value; single-quoted flow scalars, see `docs/decisions.md`) would become
 /// missed-secret bugs if detection were span-gated.
 ///
-/// Detectors run over the [`scrub_protected_literals`] view of the buffer (a same-length
-/// copy with the digits of bounded Claude model IDs replaced by letters), so returned
-/// spans are valid for `input.buf`; see [`PROTECTED_LITERALS`].
+/// Findings lying entirely inside a bounded Claude model ID ([`PROTECTED_LITERALS`]) are
+/// removed, and a scrubbed window around each ID may add findings; see `detect`.
 pub fn scan(input: &Input, ctx: &Context) -> Vec<Finding> {
     let spans = parser_spans(input, ctx);
     detect(&input.buf, &spans, ctx)
@@ -427,23 +426,73 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
         .unwrap_or_default()
 }
 
-/// Runs every detector over the full buffer and returns their findings. The one shared
+/// Runs every detector over the buffer and returns their findings. The one shared
 /// detection path for [`scan`] and [`mask`] (the benchmark scores `scan` and the proxy
-/// ships `mask`, so the two must never disagree on what is found): the detectors see the
-/// [`scrub_protected_literals`] copy of `buf` when there is one, and the raw `buf`
-/// otherwise. The copy has exactly the same length, so every returned span is valid for
-/// the caller's original bytes -- which is what `mask` interns and splices from, never the
-/// copy. `spans` come from the parsers over the *original* buffer (see `parser_spans`):
-/// they describe the artefact's real structure, the scrub preserves every offset by
-/// construction, and running a parser over scrubbed content would only make a node's
-/// copied text (`NodeKind::Field`) lie about the artefact for no gain.
+/// ships `mask`, so the two must never disagree on what is found). Every span is valid for
+/// the caller's original bytes, which is what `mask` interns and splices from.
+///
+/// Protected literals ([`PROTECTED_LITERALS`]) are handled in two steps whose safety does
+/// not depend on what any detector does with scrubbed bytes (Codex review of the first
+/// scrub design: rewriting the ID's digits for *every* detector changed the entropy of a
+/// whole token glued to it, so `<id>=<secret>` could drop below the threshold and leak):
+///
+/// 1. Every detector runs on the **original** buffer, and only a finding lying entirely
+///    inside a bounded protected occurrence is removed. Every other finding `main` made is
+///    kept, so the scrub can never hide a byte outside the constant's own bytes.
+/// 2. Only when an occurrence exists, every detector also runs over a short window of the
+///    `scrub_copy` copy around it (`SCRUB_WINDOW` bytes either side,
+///    overlapping windows merged), and a finding from that pass is **added** when it
+///    overlaps no occurrence, does not touch a window edge cut out of the middle of the
+///    buffer (a truncated token), and is not already fully covered by a same-type finding
+///    from step 1 (so audit counts are not inflated). This only ever adds masking: it is
+///    what finds `555-1234` in `<id> 555-1234`, where on the original the ID's digits join
+///    the number into one 16-digit candidate the phone detector rejects whole.
+///
+/// `spans` come from the parsers over the *original* buffer (see `parser_spans`); the
+/// window pass runs without parser spans, which can only make it find more, not less.
 fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
-    let scrubbed = scrub_protected_literals(buf);
-    let view: &[u8] = scrubbed.as_deref().unwrap_or(buf);
     let mut findings = Vec::new();
     for detector in ctx.detectors {
-        findings.extend(detector.detect(view, spans));
+        findings.extend(detector.detect(buf, spans));
     }
+    let occurrences = protected_occurrences(buf);
+    if occurrences.is_empty() {
+        return findings;
+    }
+    let inside = |s: &Span| occurrences.iter().any(|&(a, b)| a <= s.start && s.end <= b);
+    let overlaps = |s: &Span| occurrences.iter().any(|&(a, b)| s.start < b && a < s.end);
+    findings.retain(|f| !inside(&f.span));
+
+    let scrubbed = scrub_copy(buf, &occurrences);
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in &occurrences {
+        let lo = start.saturating_sub(SCRUB_WINDOW);
+        let hi = (end + SCRUB_WINDOW).min(buf.len());
+        match windows.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => windows.push((lo, hi)),
+        }
+    }
+    let mut added = Vec::new();
+    for (lo, hi) in windows {
+        for detector in ctx.detectors {
+            for mut f in detector.detect(&scrubbed[lo..hi], &[]) {
+                let cut_edge =
+                    (f.span.start == 0 && lo > 0) || (lo + f.span.end == hi && hi < buf.len());
+                f.span.start += lo;
+                f.span.end += lo;
+                let already = findings.iter().any(|o| {
+                    o.entity_type == f.entity_type
+                        && o.span.start <= f.span.start
+                        && f.span.end <= o.span.end
+                });
+                if !cut_edge && !already && !overlaps(&f.span) {
+                    added.push(f);
+                }
+            }
+        }
+    }
+    findings.extend(added);
     findings
 }
 
@@ -455,8 +504,8 @@ fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
 /// leaked a real number (`kontakt-030-20150612`, `tel-1-20251001_ext99`, ...), and a
 /// listed ID glued to a real number (`claude-haiku-4-5-20251001 555-1234`) made one
 /// 16-digit candidate the digit-count filter rejected whole, sending `555-1234` raw. So
-/// the fix lives here, before detection, as an exact match on the whole ID (see
-/// [`scrub_protected_literals`]).
+/// the fix lives in `vg-core`'s shared detection path, as an exact match on the whole ID
+/// (see `detect`).
 ///
 /// **A code constant, deliberately not policy.** A repo- or session-layer list would be an
 /// exfiltration primitive: whoever can write that layer (the upstream model is the
@@ -490,6 +539,15 @@ pub const PROTECTED_LITERALS: &[&[u8]] = &[
 /// buffer plus at most `PROTECTED_LITERALS.len()` short prefix compares per `c`.
 const PROTECTED_LITERAL_FIRST_BYTE: u8 = b'c';
 
+/// The prefix every [`PROTECTED_LITERALS`] entry shares (unit-tested), checked once before
+/// the list is tried.
+const PROTECTED_LITERAL_PREFIX: &[u8] = b"claude-";
+
+/// Bytes of scrubbed context the window pass in `detect` gives each side of an
+/// occurrence: well over the longest phone candidate the regex can build (about 31
+/// bytes), which is the neighbour the window pass exists to find.
+const SCRUB_WINDOW: usize = 64;
+
 /// The three-byte UTF-8 encodings of U+2018/U+2019/U+201C/U+201D (`‘ ’ “ ”`): the only
 /// non-ASCII bytes that bound a protected literal. Seen around model IDs in real agent
 /// traffic (DDD cycle 5 on the shape rules this scrub replaced).
@@ -508,16 +566,11 @@ const TYPOGRAPHIC_QUOTES: [&[u8]; 4] = [
 ///
 /// **What is overwritten.** Only the literal's ASCII digits, each replaced by the uppercase
 /// letter `A` + digit (`claude-haiku-4-5-20251001` → `claude-haiku-E-F-CACFBAAB`). Letters
-/// are what no digit-based detector (phone, IP, IBAN, sort code) can match, so no finding
-/// can start inside the occurrence on the strength of its digits -- the only reason the ID
-/// was ever a finding. Everything else is kept, deliberately: the entropy detector scores
-/// whole tokens and treats a `-`-delimited word/number run as a structured identifier, so
-/// leaving the structure intact and swapping digits for distinct letters keeps its view of
-/// the occurrence -- and of any longer token the occurrence is glued into -- the same as
-/// on the original. A constant fill (`xxxxxxxxxxxxxxxxxxxxxxxxxx`) would instead be a
-/// 26-byte zero-entropy run, able to pull a token that merges the ID with a real secret
-/// (`<id>=<secret>`, `/<id>/<secret>`) below the entropy threshold: a new leak. Uppercase
-/// so the fill never collides with the literal's own lowercase letters.
+/// are what no digit-based detector (phone, IP, IBAN, sort code) can match, so no
+/// candidate in the copy can borrow the ID's digits. The copy is only ever used by the
+/// window pass in `detect`, which can add findings but never remove one, so what the fill
+/// does to a glued token's entropy cannot cause a leak (Codex: as the sole detector input
+/// it could, in both directions).
 ///
 /// **Bounded.** The byte before the occurrence and the byte after it (when present) are
 /// both non-identifier-forming: not an ASCII alphanumeric, not `_`, and not a non-ASCII
@@ -528,13 +581,11 @@ const TYPOGRAPHIC_QUOTES: [&[u8]; 4] = [
 /// (fail-safe). Why `-` and `.` bound even though each continues a phone candidate
 /// (`5-20251001-5551234`): Bedrock writes `anthropic.<id>-v1:0`, and what the detectors
 /// then see for the neighbour (`-5551234`) is exactly what they see for that neighbour
-/// anywhere else in the text. That is the scrub's invariant: **it never changes how any
-/// byte outside the occurrence is judged, except by removing the constant's own digits
-/// from candidate spans** -- the ID carries no information, so a finding that needed those
-/// digits to qualify (for digit count, or for a marker) was a finding about the constant,
-/// not about its neighbour. `<id>-555-1234` therefore masks `555-1234` (it egressed raw
-/// before: one 16-digit candidate, rejected whole), and `<id>-5551234` leaves `5551234`
-/// as the bare 7-digit run the phone detector declines everywhere. Non-ASCII bytes are
+/// anywhere else in the text. A finding made on the original that extends past the
+/// occurrence is always kept (`detect` step 1). The window pass is what finds `555-1234`
+/// in `<id>-555-1234` (one 16-digit candidate on the original, rejected whole, so it
+/// egressed raw before); `<id>-5551234` stays unchanged, as `ref-5551234` does, because
+/// the phone detector declines a bare 7-digit run everywhere. Non-ASCII bytes are
 /// identifier-forming for the same reason `phone.rs`'s word-boundary checks treat them so
 /// (the last byte of `é` is not a word boundary); the four quotes are the exception
 /// because they are the one non-ASCII neighbour real agent traffic puts beside a model ID,
@@ -543,11 +594,22 @@ const TYPOGRAPHIC_QUOTES: [&[u8]; 4] = [
 /// Cost: one pass over `buf`; at each `PROTECTED_LITERAL_FIRST_BYTE` at most
 /// `PROTECTED_LITERALS.len()` prefix compares, each failing within a few bytes on
 /// non-matching text; the copy is made lazily on the first occurrence.
+#[cfg(test)]
 fn scrub_protected_literals(buf: &[u8]) -> Option<Vec<u8>> {
-    let mut copy: Option<Vec<u8>> = None;
+    let occurrences = protected_occurrences(buf);
+    (!occurrences.is_empty()).then(|| scrub_copy(buf, &occurrences))
+}
+
+/// The `[start, end)` byte ranges of every bounded protected-literal occurrence in `buf`,
+/// in ascending, non-overlapping order. One pass; the literal list is only tried where
+/// the shared `PROTECTED_LITERAL_PREFIX` matches, so adversarial input (a run of `c`
+/// bytes, Codex review) costs one short compare per byte rather than one per literal.
+fn protected_occurrences(buf: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] != PROTECTED_LITERAL_FIRST_BYTE {
+        if buf[i] != PROTECTED_LITERAL_FIRST_BYTE || !buf[i..].starts_with(PROTECTED_LITERAL_PREFIX)
+        {
             i += 1;
             continue;
         }
@@ -558,15 +620,23 @@ fn scrub_protected_literals(buf: &[u8]) -> Option<Vec<u8>> {
             .map(|lit| i + lit.len());
         match hit {
             Some(end) if bounded_left(buf, i) && bounded_right(buf, end) => {
-                let copy = copy.get_or_insert_with(|| buf.to_vec());
-                for b in &mut copy[i..end] {
-                    if b.is_ascii_digit() {
-                        *b = b'A' + (*b - b'0');
-                    }
-                }
+                out.push((i, end));
                 i = end;
             }
             _ => i += 1,
+        }
+    }
+    out
+}
+
+/// `buf` with the ASCII digits of each occurrence overwritten (`A` + digit); same length.
+fn scrub_copy(buf: &[u8], occurrences: &[(usize, usize)]) -> Vec<u8> {
+    let mut copy = buf.to_vec();
+    for &(start, end) in occurrences {
+        for b in &mut copy[start..end] {
+            if b.is_ascii_digit() {
+                *b = b'A' + (*b - b'0');
+            }
         }
     }
     copy
@@ -1269,6 +1339,7 @@ mod tests {
         // Both are what `scrub_protected_literals` relies on for its single-pass search.
         for (i, lit) in PROTECTED_LITERALS.iter().enumerate() {
             assert_eq!(lit[0], PROTECTED_LITERAL_FIRST_BYTE, "{lit:?}");
+            assert!(lit.starts_with(PROTECTED_LITERAL_PREFIX), "{lit:?}");
             assert!(lit.is_ascii(), "{lit:?}");
             for (j, other) in PROTECTED_LITERALS.iter().enumerate() {
                 assert!(
