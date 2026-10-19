@@ -16,7 +16,7 @@ use vg_audit::JsonlAuditSink;
 use vg_core::conformance::assert_masked_pack_excludes_raw_values;
 use vg_core::{
     mask, scan, ArtefactHint, AuditEvent, Context, Detector, DetectorId, EntityType, Finding,
-    Input, Namespace, Parser, Policy, PolicyEngine, PolicyLayers, RepoId, Span,
+    Input, Namespace, Parser, Placeholder, Policy, PolicyEngine, PolicyLayers, RepoId, Span,
 };
 use vg_detectors::all_detectors;
 use vg_parsers::all_parsers;
@@ -374,6 +374,200 @@ The user's email address is EMAIL_001. Use it only to identify the user."
         let (pack, _refs, _event, _trace_id) =
             with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
         assert_eq!(pack.text, want);
+    }
+}
+
+/// Masks `raw` through the real pipeline and returns the pack text.
+fn mask_text(policy: &Policy, ns: &Namespace, raw: &str) -> String {
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, policy, ns)).expect("mask succeeds");
+    pack.text
+}
+
+#[test]
+fn listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_agent_traffic() {
+    // veil-proxy#90 (XREPO-021): the phone detector's regex matches the `5-20251001` tail
+    // of a dated Claude model ID. `vg_core::PROTECTED_LITERALS` scrubs bounded occurrences
+    // before detection (`scan` and `mask` alike), so none of these shapes -- all seen around
+    // model IDs in real agent traffic, or the documented Bedrock/Vertex forms -- changes.
+    // (These cases lived in `phone.rs` while the fix was a detector-side shape rule; the
+    // detector itself now flags `5-20251001` unconditionally, by design.)
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let phones_in = |raw: &str| -> Vec<Finding> {
+        let input = Input {
+            buf: raw.as_bytes().to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        with_real_context(|ctx| scan(&input, ctx))
+            .into_iter()
+            .filter(|f| f.entity_type == EntityType::Phone)
+            .collect()
+    };
+    for raw in [
+        "Haiku 4.5: 'claude-haiku-4-5-20251001'. When building",
+        "model claude-opus-4-1-20250805 is pinned",
+        "claude-sonnet-4-20250514",
+        "models/claude-haiku-4-5-20251001/invoke",
+        "Use claude-haiku-4-5-20251001\u{2019} for this",
+        "the \u{201c}claude-haiku-4-5-20251001\u{201d} model",
+        "claude-sonnet-4-5-20250929[1m]",
+        "{\\\"model\\\":\\\"claude-haiku-4-5-20251001\\\"}",
+        "is it claude-haiku-4-5-20251001?",
+        "| claude-haiku-4-5-20251001|",
+    ] {
+        assert_eq!(mask_text(&policy, &ns, raw), raw, "garbled: {raw:?}");
+    }
+    // Shapes the ENTROPY detector (unchanged by #90, on main too) redacts whole as a
+    // `Secret` -- `anthropic.<id>-v1` has a mixed `v1` segment, so it is not a structured
+    // identifier and its 4.25 bits/byte clears the 3.5 threshold; `**<id>**`, `<id>!` and
+    // `model=<id>&x=1` likewise. A pre-existing residual tracked in next-actions, not a
+    // phone finding: the scrub is neutral on them, pinned here as "no PHONE" only.
+    for raw in [
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "**claude-haiku-4-5-20251001**",
+        "?model=claude-haiku-4-5-20251001&x=1",
+        "use claude-haiku-4-5-20251001!",
+    ] {
+        let phones = phones_in(raw);
+        assert!(
+            phones.is_empty(),
+            "scan found a phone in {raw:?}: {phones:?}"
+        );
+        let text = mask_text(&policy, &ns, raw);
+        assert!(!text.contains("PHONE_"), "{raw:?} => {text:?}");
+    }
+    // Every listed literal, standalone and inside the real system-prompt sentence shape.
+    for lit in vg_core::PROTECTED_LITERALS {
+        let id = std::str::from_utf8(lit).expect("literals are ASCII");
+        for raw in [id.to_string(), format!("Model: '{id}'. When building")] {
+            assert_eq!(mask_text(&policy, &ns, &raw), raw, "garbled: {raw:?}");
+            let phones = phones_in(&raw);
+            assert!(
+                phones.is_empty(),
+                "scan found a phone in {raw:?}: {phones:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_number_beside_a_listed_model_id_is_still_masked_and_the_id_is_spliced_from_the_original() {
+    // Before the scrub, `<id> 555-1234` (space or `-` joined) was one 16-digit phone
+    // candidate the 7-15 digit filter rejected whole, so `555-1234` egressed raw.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    for (raw, want) in [
+        (
+            "claude-haiku-4-5-20251001 555-1234",
+            "claude-haiku-4-5-20251001 PHONE_001",
+        ),
+        (
+            "claude-haiku-4-5-20251001-555-1234",
+            "claude-haiku-4-5-20251001-PHONE_001",
+        ),
+        (
+            "call 415-555-1234 about claude-haiku-4-5-20251001.",
+            "call PHONE_002 about claude-haiku-4-5-20251001.",
+        ),
+        // `-` bounds the occurrence, so the neighbour is judged exactly as it is anywhere
+        // else: a bare 7-digit run is not a phone to this detector, with or without the ID.
+        ("ref-5551234", "ref-5551234"),
+        (
+            "claude-haiku-4-5-20251001-5551234",
+            "claude-haiku-4-5-20251001-5551234",
+        ),
+        ("ref-555-1234", "ref-PHONE_001"),
+    ] {
+        assert_eq!(mask_text(&policy, &ns, raw), want, "input {raw:?}");
+    }
+    // A straddle through an identifier-forming byte is not a bounded occurrence, so the
+    // detector still sees `5-20251001` (and the entropy detector the whole token): fails
+    // toward masking, nothing of the digits egresses.
+    let text = mask_text(&policy, &ns, "claude-haiku-4-5-20251001_ext99");
+    assert!(
+        text.contains("PHONE_") && !text.contains("20251001"),
+        "straddle must stay masked, got {text:?}"
+    );
+
+    // `scan` (what the benchmark scores) agrees with `mask` on where the number is.
+    let input = Input {
+        buf: b"claude-haiku-4-5-20251001-555-1234".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let phones: Vec<(usize, usize)> = with_real_context(|ctx| scan(&input, ctx))
+        .into_iter()
+        .filter(|f| f.entity_type == EntityType::Phone)
+        .map(|f| (f.span.start, f.span.end))
+        .collect();
+    assert_eq!(
+        phones,
+        vec![(26, 34)],
+        "expected exactly `555-1234` flagged"
+    );
+
+    // A finding that extends across the scrubbed bytes is still produced (from the
+    // scrubbed copy) and the value interned is the ORIGINAL bytes, not the copy's.
+    let raw = "mail claude-haiku-4-5-20251001@example.com now";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert_eq!(pack.text, "mail EMAIL_001 now");
+    let binding = pack
+        .bindings
+        .iter()
+        .find(|b| b.display == "EMAIL_001")
+        .expect("EMAIL_001 is bound");
+    let resolved = policy
+        .vault
+        .resolve(
+            &Placeholder {
+                display: binding.display.clone(),
+                mapping_ref: binding.mapping_ref,
+            },
+            &ns,
+        )
+        .expect("resolve EMAIL_001");
+    assert_eq!(
+        resolved.expose_secret(),
+        "claude-haiku-4-5-20251001@example.com",
+        "the vault must hold the original bytes, never the scrubbed copy's"
+    );
+}
+
+#[test]
+fn unlisted_or_glued_model_id_shapes_fail_toward_masking() {
+    // Documented residuals of the exact-literal scrub: anything not byte-identical to a
+    // listed ID, or not bounded, is still a phone to the detector. Pinned so a future
+    // "helpful" case-fold or fuzzy match is a deliberate decision, not drift.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    for raw in [
+        "CLAUDE-HAIKU-4-5-20251001",
+        "claude-haiku-4-5-20991231",
+        "xclaude-haiku-4-5-20251001",
+        "_claude-haiku-4-5-20251001_",
+        "caf\u{e9}claude-haiku-4-5-20251001",
+        "gpt-4.5-20251001",
+    ] {
+        assert!(
+            mask_text(&policy, &ns, raw).contains("PHONE_"),
+            "expected {raw:?} to over-mask (fail-safe)"
+        );
     }
 }
 

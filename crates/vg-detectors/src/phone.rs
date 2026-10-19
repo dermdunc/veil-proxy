@@ -25,6 +25,14 @@
 //! not arbitrary grouped numbers, per the Codex-reconciled decision in
 //! `docs/decisions.md` to fix detector-local false positives now rather than wait for
 //! Task T10's formal precision measurement.
+//!
+//! **Not handled here (veil-proxy#90, XREPO-021):** the `-YYYYMMDD` tail of a dated Claude
+//! model ID (`5-20251001` in `claude-haiku-4-5-20251001`) is flagged, by design. Five
+//! review cycles of shape rules in this file each leaked a real number
+//! (`kontakt-030-20150612`, `tel-1-20251001_ext99`, `phone_haiku-1-20251001`, ...; see
+//! `still_flags_numbers_next_to_non_identifier_delimiters`), so the fix moved to
+//! `vg_core::PROTECTED_LITERALS`: an exact-literal scrub applied to the buffer the
+//! detectors see, before any detector runs.
 
 use std::sync::OnceLock;
 
@@ -283,156 +291,6 @@ fn looks_like_zip_plus4(buf: &[u8], m_start: usize, matched: &[u8]) -> bool {
             || preceded_by_marker_within(buf, m_start, 16, b"postal"))
 }
 
-/// Model-family words a `-YYYYMMDD`-suffixed model ID can carry directly before its
-/// version groups (`claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`). A positive
-/// allowlist rather than "any word": DDD cycle 3 showed that "a letter is reached" let
-/// phone labels qualify (`Tel_8-20251001`, `phone-1-19990101`).
-const MODEL_FAMILY_WORDS: [&[u8]; 4] = [b"claude", b"opus", b"sonnet", b"haiku"];
-
-/// Most single-digit version groups a model ID carries between its family word and the
-/// date (`haiku-4-5-`). More is a phone shape: `tel-9-1-9-8-20251231` is a hyphenated
-/// `+91 9820251231` (Codex, DDD cycle 3).
-const MAX_VERSION_GROUPS: usize = 2;
-
-/// Excludes the `-YYYYMMDD` date suffix of a Claude model ID: the regex matches
-/// `5-20251001` inside `claude-haiku-4-5-20251001` (9 digits, a hyphen marker), which a
-/// real Claude Code system prompt sends on every request (veil-proxy#90, XREPO-021).
-/// Deliberately tied to that exact shape -- each review round found real numbers a looser
-/// rule let through (`(415) 555-1234-mobile`, `kontakt-030-20150612`,
-/// `sthlm-46-8-20251001`, `alice-1-20250231`, `tel-1-20251001_ext99`, `Tel_8-20251001`,
-/// `tel-9-1-9-8-20251231`), all now regression tests. All of these must hold:
-///
-/// 1. the match has no `+`, parens or space -- strong phone markers always win;
-/// 2. it ends in an unbroken run of exactly 8 digits that is a real calendar date
-///    `YYYYMMDD` (leap years included), followed in `buf` by end of input or a byte a
-///    model ID ends on in text (see `ends_model_id`; `-` only as a Bedrock `-v<digit>`
-///    suffix);
-/// 3. a `-` sits directly before that run (`_` and `.` cannot: the regex's separator
-///    class is `[-. ]`, and a `.` joiner is not the model-ID shape);
-/// 4. left of that `-`, at most `MAX_VERSION_GROUPS` single-digit `<digit><-|_>` groups,
-///    then one of `MODEL_FAMILY_WORDS` (case-insensitive) starting at a word boundary
-///    (preceded by neither an ASCII alphanumeric, `_`, nor any non-ASCII byte:
-///    `phone_haiku-...` and `caféhaiku-...` do not count).
-///
-/// Beyond one reverse scan of the match itself, at most 14 bytes are inspected
-/// (3 + 2 x 2 + 6 + 1), so per-match cost is constant.
-///
-/// **Accepted residual:** a real number whose last 8 digits are unseparated, form a valid
-/// date, and follow at most two single-digit groups glued to one of those four words
-/// (`haiku-1-20251001`) is not flagged.
-///
-/// **Scope:** Claude model IDs only. Other providers' dated IDs (`o1-2024-12-17`,
-/// `gpt-4.1-2025-04-14`, `gpt-4.5-20251001`) and glued variants (`claude-v4-20251001`,
-/// `sonnet4-5-20251001`) still over-mask -- fails toward masking; tracked in next-actions.
-/// So does a Claude ID followed by `/` or `_` (`models/claude-haiku-4-5-20251001/invoke`,
-/// `_claude-haiku-4-5-20251001_`): those bytes continue real numbers (`/99`, `_ext99`).
-fn looks_like_date_suffixed_identifier(buf: &[u8], start: usize, end: usize) -> bool {
-    let matched = &buf[start..end];
-    if matched
-        .iter()
-        .any(|b| matches!(b, b'+' | b'(' | b')' | b' '))
-    {
-        return false;
-    }
-    // The date run must end the identifier (`tel-1-20251001_ext99`, Codex cycle 2;
-    // `haiku-1-20251001/99`, Codex cycle 4; `haiku-1-20251001-mobile`, Codex cycle 5).
-    if !ends_model_id(buf, end) {
-        return false;
-    }
-    let run_len = matched
-        .iter()
-        .rev()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    let run_start = end - run_len;
-    if run_len != 8 || run_start == 0 || buf[run_start - 1] != b'-' {
-        return false;
-    }
-    let digits = &buf[run_start..end];
-    let num = |r: std::ops::Range<usize>| {
-        digits[r]
-            .iter()
-            .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
-    };
-    if !is_calendar_date(num(0..4), num(4..6), num(6..8)) {
-        return false;
-    }
-    // `i` indexes the joiner just crossed; step over at most MAX_VERSION_GROUPS
-    // `<digit><joiner>` units, then require a model-family word ending right there.
-    let mut i = run_start - 1;
-    for _ in 0..MAX_VERSION_GROUPS {
-        if i >= 2 && buf[i - 1].is_ascii_digit() && matches!(buf[i - 2], b'-' | b'_') {
-            i -= 2;
-        } else {
-            break;
-        }
-    }
-    MODEL_FAMILY_WORDS.iter().any(|word| {
-        i >= word.len()
-            && buf[i - word.len()..i].eq_ignore_ascii_case(word)
-            && (i == word.len() || {
-                // Any non-ASCII byte is identifier-forming too: `caféhaiku-1-20251001`
-                // is not a word boundary (Codex cycle 5).
-                let before = buf[i - word.len() - 1];
-                !(before.is_ascii_alphanumeric() || before == b'_' || !before.is_ascii())
-            })
-    })
-}
-
-/// Whether the date run ending at `end` also ends the identifier: end of input, or a byte a
-/// model ID ends on in text -- an allowlist, because each continuation that was let through
-/// leaked a real number (`/99`, `_ext99`, `-mobile`). `-` counts only as the start of a
-/// Bedrock version suffix (`-v1:0`). Accepts typographic closing quotes (`’`, `”`) and the
-/// bytes that end a model ID in markdown, prose, escaped JSON, query strings and Claude
-/// Code's `[1m]` context suffix (DDD cycle 5). Reads at most 3 bytes.
-fn ends_model_id(buf: &[u8], end: usize) -> bool {
-    let rest = &buf[end.min(buf.len())..];
-    match rest {
-        [] => true,
-        [b'-', b'v' | b'V', d, ..] => d.is_ascii_digit(),
-        // U+2019 RIGHT SINGLE QUOTATION MARK, U+201D RIGHT DOUBLE QUOTATION MARK.
-        [0xE2, 0x80, 0x99 | 0x9D, ..] => true,
-        [b, ..] => {
-            b.is_ascii_whitespace()
-                || matches!(
-                    b,
-                    b'\''
-                        | b'"'
-                        | b'`'
-                        | b'.'
-                        | b','
-                        | b';'
-                        | b':'
-                        | b')'
-                        | b']'
-                        | b'}'
-                        | b'>'
-                        | b'['
-                        | b'*'
-                        | b'!'
-                        | b'?'
-                        | b'&'
-                        | b'|'
-                        | b'\\'
-                )
-        }
-    }
-}
-
-/// A real Gregorian date in 1900-2099, leap years included (`20250231` is not one --
-/// Codex review finding against a range-only check).
-fn is_calendar_date(y: u32, m: u32, d: u32) -> bool {
-    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-    let days = match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1900..=2099).contains(&y) && (1..=days).contains(&d)
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PhoneDetector;
 
@@ -453,7 +311,6 @@ impl Detector for PhoneDetector {
                     || looks_like_iso_date(matched)
                     || looks_like_zip_plus4(buf, m.start(), matched)
                     || looks_like_isbn(buf, m.start(), m.end())
-                    || looks_like_date_suffixed_identifier(buf, m.start(), m.end())
                 {
                     return None;
                 }
@@ -710,38 +567,11 @@ mod tests {
     }
 
     #[test]
-    fn ignores_date_suffixed_identifiers() {
-        // veil-proxy#90: seen live in a real Claude Code system prompt. Every case here
-        // reaches `looks_like_date_suffixed_identifier` (the regex match carries a `-`).
-        // (`claude-3-5-sonnet-20241022` never did: its bare 8-digit match has no marker.)
-        for buf in [
-            &b"Haiku 4.5: 'claude-haiku-4-5-20251001'. When building"[..],
-            b"model claude-opus-4-1-20250805 is pinned",
-            b"claude-sonnet-4-20250514",
-            b"CLAUDE-HAIKU-4-5-20240229",
-            b"anthropic.claude-haiku-4-5-20251001-v1:0",
-            // DDD cycle 5: delimiters seen around model IDs in real agent traffic.
-            "Use claude-haiku-4-5-20251001\u{2019} for this".as_bytes(),
-            "the \u{201c}claude-haiku-4-5-20251001\u{201d} model".as_bytes(),
-            b"claude-sonnet-4-5-20250929[1m]",
-            b"{\\\"model\\\":\\\"claude-haiku-4-5-20251001\\\"}",
-            b"**claude-haiku-4-5-20251001**",
-            b"?model=claude-haiku-4-5-20251001&x=1",
-            b"use claude-haiku-4-5-20251001!",
-            b"is it claude-haiku-4-5-20251001?",
-            b"| claude-haiku-4-5-20251001|",
-        ] {
-            assert!(
-                PhoneDetector.detect(buf, &[]).is_empty(),
-                "expected no phone in {:?}, got {:?}",
-                String::from_utf8_lossy(buf),
-                PhoneDetector.detect(buf, &[])
-            );
-        }
-    }
-
-    #[test]
     fn still_flags_numbers_next_to_non_identifier_delimiters() {
+        // veil-proxy#90 regression suite: every case is a real number some draft of a
+        // detector-side "date-suffixed identifier" exclusion let through during review.
+        // That exclusion is gone (model IDs are scrubbed in `vg-core` before detection,
+        // see the module doc); these stay to keep any future shape rule honest.
         for buf in [
             &b"+44 20 7946 0958"[..],
             b"020 7946 0958",

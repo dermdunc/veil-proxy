@@ -159,13 +159,13 @@ pub struct Metrics {
 /// whole buffer — the two documented YAML under-spanning reproducers (a `#` inside a
 /// quoted value; single-quoted flow scalars, see `docs/decisions.md`) would become
 /// missed-secret bugs if detection were span-gated.
+///
+/// Detectors run over the [`scrub_protected_literals`] view of the buffer (a same-length
+/// copy with the digits of bounded Claude model IDs replaced by letters), so returned
+/// spans are valid for `input.buf`; see [`PROTECTED_LITERALS`].
 pub fn scan(input: &Input, ctx: &Context) -> Vec<Finding> {
     let spans = parser_spans(input, ctx);
-    let mut findings = Vec::new();
-    for detector in ctx.detectors {
-        findings.extend(detector.detect(&input.buf, &spans));
-    }
-    findings
+    detect(&input.buf, &spans, ctx)
 }
 
 /// Detects, classifies, and masks `input` per `policy`: classifies the artefact (blocking
@@ -238,13 +238,11 @@ pub fn mask(
     //    `Pass` means "send after entity masking", never "skip detection" (T06 review,
     //    hard requirement: skipping here would make `Pass` fail open).
     // 3-4. Parse for enrichment spans, then detect: every detector over the FULL buffer
-    //    (spans are enrichment only, never a gate — T08 review).
+    //    (spans are enrichment only, never a gate — T08 review), via the same `detect`
+    //    `scan` uses, so the protected-literal scrub applies identically on both paths.
     let spans = parser_spans(input, ctx);
     let detect_start = Instant::now();
-    let mut findings = Vec::new();
-    for detector in ctx.detectors {
-        findings.extend(detector.detect(&input.buf, &spans));
-    }
+    let mut findings = detect(&input.buf, &spans, ctx);
     let latency_us = detect_start.elapsed().as_micros() as u64;
 
     // Runtime span guard (doubt-pass finding): `Context` accepts any `&dyn Detector`, and
@@ -427,6 +425,174 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
         .find(|p| p.can_parse(&input.hint))
         .map(|p| p.parse(&input.buf).spans)
         .unwrap_or_default()
+}
+
+/// Runs every detector over the full buffer and returns their findings. The one shared
+/// detection path for [`scan`] and [`mask`] (the benchmark scores `scan` and the proxy
+/// ships `mask`, so the two must never disagree on what is found): the detectors see the
+/// [`scrub_protected_literals`] copy of `buf` when there is one, and the raw `buf`
+/// otherwise. The copy has exactly the same length, so every returned span is valid for
+/// the caller's original bytes -- which is what `mask` interns and splices from, never the
+/// copy. `spans` come from the parsers over the *original* buffer (see `parser_spans`):
+/// they describe the artefact's real structure, the scrub preserves every offset by
+/// construction, and running a parser over scrubbed content would only make a node's
+/// copied text (`NodeKind::Field`) lie about the artefact for no gain.
+fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
+    let scrubbed = scrub_protected_literals(buf);
+    let view: &[u8] = scrubbed.as_deref().unwrap_or(buf);
+    let mut findings = Vec::new();
+    for detector in ctx.detectors {
+        findings.extend(detector.detect(view, spans));
+    }
+    findings
+}
+
+/// Byte-exact literals the detectors must never be shown as digits: the dated Claude API
+/// model IDs (veil-proxy#90, XREPO-021). A real Claude Code system prompt sends
+/// `claude-haiku-4-5-20251001` on every request, and the phone detector's regex matches
+/// its `5-20251001` tail (9 digits, a hyphen marker) -- the detector cannot tell that
+/// apart from a number by shape: five review cycles of shape rules in `phone.rs` each
+/// leaked a real number (`kontakt-030-20150612`, `tel-1-20251001_ext99`, ...), and a
+/// listed ID glued to a real number (`claude-haiku-4-5-20251001 555-1234`) made one
+/// 16-digit candidate the digit-count filter rejected whole, sending `555-1234` raw. So
+/// the fix lives here, before detection, as an exact match on the whole ID (see
+/// [`scrub_protected_literals`]).
+///
+/// **A code constant, deliberately not policy.** A repo- or session-layer list would be an
+/// exfiltration primitive: whoever can write that layer (the upstream model is the
+/// adversary on the response path, and it can ask the wrapped client to edit files) could
+/// list a real value and have detection look away from it. Nothing here is fetched,
+/// configurable, or case-folded. Matching is exact, case-sensitive bytes: `CLAUDE-HAIKU-
+/// 4-5-20251001` is not a Claude API model ID and still over-masks (fails toward masking).
+/// **A new dated model over-masks until it is added here** (`docs/next-actions.md`), as do
+/// other providers' dated IDs (`o1-2024-12-17`, `gpt-4.5-20251001`).
+///
+/// Every entry starts with [`PROTECTED_LITERAL_FIRST_BYTE`] and none is a prefix of
+/// another (both unit-tested), which is what lets the scrub's search stay a single pass.
+pub const PROTECTED_LITERALS: &[&[u8]] = &[
+    b"claude-3-haiku-20240307",
+    b"claude-3-opus-20240229",
+    b"claude-3-sonnet-20240229",
+    b"claude-3-5-sonnet-20240620",
+    b"claude-3-5-sonnet-20241022",
+    b"claude-3-5-haiku-20241022",
+    b"claude-3-7-sonnet-20250219",
+    b"claude-sonnet-4-20250514",
+    b"claude-opus-4-20250514",
+    b"claude-opus-4-1-20250805",
+    b"claude-sonnet-4-5-20250929",
+    b"claude-haiku-4-5-20251001",
+    b"claude-opus-4-5-20251101",
+];
+
+/// The byte every [`PROTECTED_LITERALS`] entry starts with: the scrub only tries the
+/// literal list at positions holding it, so the per-request cost is one pass over the
+/// buffer plus at most `PROTECTED_LITERALS.len()` short prefix compares per `c`.
+const PROTECTED_LITERAL_FIRST_BYTE: u8 = b'c';
+
+/// The three-byte UTF-8 encodings of U+2018/U+2019/U+201C/U+201D (`‘ ’ “ ”`): the only
+/// non-ASCII bytes that bound a protected literal. Seen around model IDs in real agent
+/// traffic (DDD cycle 5 on the shape rules this scrub replaced).
+const TYPOGRAPHIC_QUOTES: [&[u8]; 4] = [
+    b"\xE2\x80\x98",
+    b"\xE2\x80\x99",
+    b"\xE2\x80\x9C",
+    b"\xE2\x80\x9D",
+];
+
+/// Returns a copy of `buf` in which every *bounded* occurrence of a [`PROTECTED_LITERALS`]
+/// entry has had its digits overwritten, or `None` when `buf` holds no such occurrence
+/// (the common case: no copy, no cost beyond the single scan). The copy is the same
+/// length as `buf`, byte-for-byte identical outside the occurrences, so detector offsets
+/// found on it address the same bytes of the original.
+///
+/// **What is overwritten.** Only the literal's ASCII digits, each replaced by the uppercase
+/// letter `A` + digit (`claude-haiku-4-5-20251001` → `claude-haiku-E-F-CACFBAAB`). Letters
+/// are what no digit-based detector (phone, IP, IBAN, sort code) can match, so no finding
+/// can start inside the occurrence on the strength of its digits -- the only reason the ID
+/// was ever a finding. Everything else is kept, deliberately: the entropy detector scores
+/// whole tokens and treats a `-`-delimited word/number run as a structured identifier, so
+/// leaving the structure intact and swapping digits for distinct letters keeps its view of
+/// the occurrence -- and of any longer token the occurrence is glued into -- the same as
+/// on the original. A constant fill (`xxxxxxxxxxxxxxxxxxxxxxxxxx`) would instead be a
+/// 26-byte zero-entropy run, able to pull a token that merges the ID with a real secret
+/// (`<id>=<secret>`, `/<id>/<secret>`) below the entropy threshold: a new leak. Uppercase
+/// so the fill never collides with the literal's own lowercase letters.
+///
+/// **Bounded.** The byte before the occurrence and the byte after it (when present) are
+/// both non-identifier-forming: not an ASCII alphanumeric, not `_`, and not a non-ASCII
+/// byte -- except that the four typographic quotes (`TYPOGRAPHIC_QUOTES`) count as bounds.
+/// So `-`, `.`, `/`, `\`, `@`, `[`, `*`, `=`, `?`, `&`, `|` and every ASCII quote or
+/// bracket bound an occurrence; `claude-haiku-4-5-20251001_ext99`, `…20251001x`,
+/// `…202510019`, `xclaude-…` and `caféclaude-…` are not occurrences and still over-mask
+/// (fail-safe). Why `-` and `.` bound even though each continues a phone candidate
+/// (`5-20251001-5551234`): Bedrock writes `anthropic.<id>-v1:0`, and what the detectors
+/// then see for the neighbour (`-5551234`) is exactly what they see for that neighbour
+/// anywhere else in the text. That is the scrub's invariant: **it never changes how any
+/// byte outside the occurrence is judged, except by removing the constant's own digits
+/// from candidate spans** -- the ID carries no information, so a finding that needed those
+/// digits to qualify (for digit count, or for a marker) was a finding about the constant,
+/// not about its neighbour. `<id>-555-1234` therefore masks `555-1234` (it egressed raw
+/// before: one 16-digit candidate, rejected whole), and `<id>-5551234` leaves `5551234`
+/// as the bare 7-digit run the phone detector declines everywhere. Non-ASCII bytes are
+/// identifier-forming for the same reason `phone.rs`'s word-boundary checks treat them so
+/// (the last byte of `é` is not a word boundary); the four quotes are the exception
+/// because they are the one non-ASCII neighbour real agent traffic puts beside a model ID,
+/// and a quote glyph is never part of a value the ID could be hiding.
+///
+/// Cost: one pass over `buf`; at each `PROTECTED_LITERAL_FIRST_BYTE` at most
+/// `PROTECTED_LITERALS.len()` prefix compares, each failing within a few bytes on
+/// non-matching text; the copy is made lazily on the first occurrence.
+fn scrub_protected_literals(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut copy: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != PROTECTED_LITERAL_FIRST_BYTE {
+            i += 1;
+            continue;
+        }
+        // No entry is a prefix of another (unit-tested), so at most one can match here.
+        let hit = PROTECTED_LITERALS
+            .iter()
+            .find(|lit| buf[i..].starts_with(lit))
+            .map(|lit| i + lit.len());
+        match hit {
+            Some(end) if bounded_left(buf, i) && bounded_right(buf, end) => {
+                let copy = copy.get_or_insert_with(|| buf.to_vec());
+                for b in &mut copy[i..end] {
+                    if b.is_ascii_digit() {
+                        *b = b'A' + (*b - b'0');
+                    }
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    copy
+}
+
+/// Identifier-forming: a byte that continues a word/identifier rather than ending it.
+/// ASCII alphanumerics, `_`, and every non-ASCII byte (a multi-byte character is never
+/// a boundary, with the typographic-quote exception handled by the callers).
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
+}
+
+/// Whether a protected literal starting at `start` is bounded on the left: start of
+/// input, a non-identifier ASCII byte, or a typographic quote ending right there.
+fn bounded_left(buf: &[u8], start: usize) -> bool {
+    start == 0
+        || !is_identifier_byte(buf[start - 1])
+        || TYPOGRAPHIC_QUOTES.iter().any(|q| buf[..start].ends_with(q))
+}
+
+/// Whether a protected literal ending at `end` is bounded on the right: end of input, a
+/// non-identifier ASCII byte, or a typographic quote starting right there.
+fn bounded_right(buf: &[u8], end: usize) -> bool {
+    end == buf.len()
+        || !is_identifier_byte(buf[end])
+        || TYPOGRAPHIC_QUOTES.iter().any(|q| buf[end..].starts_with(q))
 }
 
 /// Resolves overlapping findings so no two accepted findings cover the same bytes — and,
@@ -1096,5 +1262,99 @@ mod tests {
             redaction_marker(&EntityType::Password),
             "[REDACTED:PASSWORD]"
         );
+    }
+
+    #[test]
+    fn protected_literals_share_a_first_byte_and_none_is_a_prefix_of_another() {
+        // Both are what `scrub_protected_literals` relies on for its single-pass search.
+        for (i, lit) in PROTECTED_LITERALS.iter().enumerate() {
+            assert_eq!(lit[0], PROTECTED_LITERAL_FIRST_BYTE, "{lit:?}");
+            assert!(lit.is_ascii(), "{lit:?}");
+            for (j, other) in PROTECTED_LITERALS.iter().enumerate() {
+                assert!(
+                    i == j || !other.starts_with(lit),
+                    "{lit:?} is a prefix of {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_replaces_only_the_digits_of_a_bounded_occurrence_and_keeps_length() {
+        let raw = b"Haiku 4.5: 'claude-haiku-4-5-20251001'. Use it";
+        let scrubbed = scrub_protected_literals(raw).expect("one occurrence");
+        assert_eq!(scrubbed.len(), raw.len());
+        assert_eq!(
+            &scrubbed[..],
+            &b"Haiku 4.5: 'claude-haiku-E-F-CACFBAAB'. Use it"[..]
+        );
+        assert!(
+            scrubbed.iter().all(u8::is_ascii),
+            "fill must stay ASCII letters"
+        );
+
+        // Two occurrences, different literals, nothing else touched.
+        let raw = b"claude-opus-4-5-20251101 and claude-3-5-sonnet-20241022 at 415-555-1234";
+        assert_eq!(
+            scrub_protected_literals(raw).as_deref(),
+            Some(&b"claude-opus-E-F-CACFBBAB and claude-D-F-sonnet-CACEBACC at 415-555-1234"[..])
+        );
+    }
+
+    #[test]
+    fn scrub_returns_none_when_no_bounded_literal_is_present() {
+        for raw in [
+            &b""[..],
+            b"call 415-555-1234 now",
+            b"claude-haiku-4-5-2025100",   // truncated
+            b"CLAUDE-HAIKU-4-5-20251001",  // case-sensitive
+            b"claude-haiku-4-5-20251001x", // continued by a letter
+            b"claude-haiku-4-5-202510019", // continued by a digit
+            b"claude-haiku-4-5-20251001_ext99",
+            b"xclaude-haiku-4-5-20251001",
+            b"_claude-haiku-4-5-20251001",
+            "caf\u{e9}claude-haiku-4-5-20251001".as_bytes(),
+            "claude-haiku-4-5-20251001\u{e9}".as_bytes(),
+            "claude-haiku-4-5-20251001\u{a0}".as_bytes(), // NBSP: non-ASCII, not a quote
+        ] {
+            assert_eq!(
+                scrub_protected_literals(raw),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_treats_every_ascii_non_identifier_byte_and_typographic_quotes_as_bounds() {
+        let id = "claude-haiku-4-5-20251001";
+        let mut shapes: Vec<String> = vec![
+            id.to_string(),
+            format!("anthropic.{id}-v1:0"),
+            format!("models/{id}/invoke"),
+            format!("{id}[1m]"),
+            format!("\\\"{id}\\\""),
+            format!("**{id}**"),
+            format!("?model={id}&x=1"),
+            format!("{id}@example.com"),
+            format!("{id}-555-1234"),
+            format!("{id}-5551234"),
+            format!("\u{2018}{id}\u{2019}"),
+            format!("\u{201c}{id}\u{201d}"),
+        ];
+        for b in 0u8..=127 {
+            if !is_identifier_byte(b) {
+                let b = b as char;
+                shapes.push(format!("{b}{id}{b}"));
+            }
+        }
+        for raw in shapes {
+            let scrubbed = scrub_protected_literals(raw.as_bytes()).unwrap_or_else(|| {
+                panic!("expected a bounded occurrence in {raw:?}");
+            });
+            let expected = raw.replace(id, "claude-haiku-E-F-CACFBAAB");
+            assert_eq!(scrubbed, expected.into_bytes(), "{raw:?}");
+        }
     }
 }
