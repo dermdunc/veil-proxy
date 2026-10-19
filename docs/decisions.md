@@ -6060,3 +6060,133 @@ workspace.
 
 **Follow-up (human, protected path).** Add a Linux compile job to `.github/workflows/ci.yml`,
 ideally on `ubuntu-24.04-arm`, so non-macOS `c_char` differences are caught. See next-actions.
+
+## 2026-10-18 — `veil-proxy#90` (XREPO-021): two over-masking false positives in real agent traffic fixed
+
+**Phone (`vg-core` `PROTECTED_LITERALS` + `scrub_protected_literals`, `api.rs`).** Fixes
+`claude-haiku-4-5-20251001` → `claude-haiku-4-PHONE_001`, sent on every request by a real
+Claude Code system prompt. The phone detector is unchanged from `main` and still flags the ID's
+`5-20251001` tail (9 digits, a hyphen marker) unconditionally -- by design, see the review
+history below. Instead `vg-core`'s one shared detection path (`detect`, behind both `scan`, which
+the benchmark scores, and `mask`) finds every *bounded*, byte-exact occurrence of a listed dated
+Claude API model ID (13 IDs, `claude-3-haiku-20240307` … `claude-opus-4-5-20251101`) and works
+in two steps. **(1)** Every detector runs on the original buffer, and only a finding lying
+entirely inside an occurrence is removed; every other finding `main` makes is kept, so nothing
+outside the constant's own bytes can be hidden, whatever a detector does. **(2)** Only when an
+occurrence exists, every detector also runs over a 64-byte-each-side window of a same-length
+copy in which the occurrence's digits are replaced by letters (`claude-haiku-E-F-CACFBAAB`);
+a window finding is *added* only when it starts at most 2 bytes after an occurrence ends (the
+one place the ID's digits can merge into a neighbour), overlaps no occurrence, does not touch a
+window edge cut from the middle of the buffer, and is not an exact duplicate of an original
+finding (no inflated audit counts). Step 2 only adds masking: it finds `555-1234` in `<id> 555-1234` and
+`<id>-555-1234`, which on the original form one 16-digit candidate the 7-15 digit filter
+rejects whole, so `555-1234` egressed raw before (confirmed with the real detector). Masking
+interns and splices from the original; parser spans come from the original too. **Bounded:**
+the byte before and the byte after the occurrence are not identifier-forming -- not ASCII
+alphanumeric, not `_`, not a non-ASCII byte -- with the four typographic quotes
+U+2018/2019/201C/201D accepted as bounds. So `-`, `.`, `/`, `\`, `*`, `[`, `@`, `=`, `&`, `?`,
+`!`, `|` and every ASCII quote or bracket bound an occurrence (Bedrock `anthropic.<id>-v1:0`,
+`models/<id>/invoke`, `<id>[1m]`, escaped JSON, `**<id>**`), while `<id>_ext99`, `x<id>`,
+`_<id>_` and `café<id>` are not occurrences and still over-mask. `<id>-5551234` stays
+unchanged, as `ref-5551234` does: the detector declines a bare 7-digit run everywhere. **Why
+two steps, not one scrubbed copy for every detector:** that was the first implementation, and
+Codex showed it broke the entropy detector both ways, because the digit fill changed the
+entropy of a whole token glued to the ID: `<id>=EEAEBBAAAAEBCBFAAABF` fell below 3.5 bits/byte
+and sent the secret raw, while `<id>=2025100120251001` rose above it and was redacted. **A code
+constant, not policy:** a repo- or session-layer list would be an exfiltration primitive (the
+upstream model is the adversary on the response path and can ask the wrapped client to edit
+files); nothing is fetched, configurable or case-folded. **Cost:** one pass over the buffer,
+trying the list only where `claude-` starts (so a run of `c` bytes costs one short compare per
+byte, Codex), plus detectors over ≤ 2 × 64 bytes + the ID per occurrence, with overlapping
+windows merged so no byte is scanned twice by the window pass; occurrence queries are binary
+searches and duplicate checks a hash lookup (Codex: linear scans made `a@b.co <id> ` × 10,000,
+330 KB, take 173 ms in a release build; now 15 ms, linear). **Accepted residuals (all fail toward masking):** any dated ID not byte-identical to a
+listed one over-masks until added -- new Claude models (next-actions), uppercase
+`CLAUDE-HAIKU-4-5-20251001`, other providers' (`o1-2024-12-17`, `gpt-4.1-2025-04-14`,
+`gpt-4.5-20251001`); IDs glued through an identifier byte (`_<id>_`, `<id>_ext99`); a non-ASCII
+neighbour other than the four quotes (NBSP, `«»`). **Still open on `main`, not fixed here:** the
+general >15-digit greedy-run rejection leaks for *unlisted* prefixes -- `x-20251001 555-1234`
+is one candidate, rejected whole, and `555-1234` egresses raw (next-actions). **Pre-existing,
+found while testing end-to-end:** the entropy detector (untouched on this branch and on `main`)
+redacts whole tokens such as `anthropic.<id>-v1` (the `v1` segment defeats the structured-
+identifier exclusion; 4.25 bits/byte), `**<id>**`, `use <id>!` and `?model=<id>&x=1` as
+`[REDACTED:SECRET]`; the earlier phone-only unit tests never exercised those shapes through
+`mask`. Not a #90 regression; tracked in next-actions.
+
+**Email fragment (`vg-core` `resolve_overlaps`).** Fixes `<email>.` →
+`EMAIL_001[REDACTED:SECRET]` (and the same with `!`, `**<email>**`): the entropy tokenizer's
+`Secret` covered the email plus glued punctuation, and the punctuation survived trimming as its
+own fragment. A `Secret` fragment is now dropped only when (a) the `Secret` lost bytes to a
+*more specific* (non-`Secret`) finding, (b) the fragment shares a boundary with one of the
+findings it lost bytes to, (c) every byte of the fragment is ASCII punctuation, and (d) the
+fragment is at most 3 bytes (`MAX_DROPPED_PUNCTUATION`; covers `.`, `!`, `**`, `**.`).
+An untrimmed `Secret` is always masked whole; a `Secret` trimmed only by another `Secret` keeps
+every fragment; a fragment with any letter, digit, whitespace, control or non-ASCII byte is
+always masked. The entropy detector itself is unchanged. **Audit consistency:** a `Secret` left
+with no kept fragment after losing to more specific findings -- every fragment dropped, or
+covered by them exactly -- counts as handled exactly once, so downstream consumers
+(veil-observatory) never read it as an unmasked secret and `**<email>**` (two dropped
+fragments of one raw Secret) counts 1, not 2. It is not counted when its own class or any
+specific finding over it is `Pass` (its bytes were not replaced). **Behaviour change beyond
+#90:** the entropy detector also flags many whole email addresses; those exactly-covered Secrets
+previously went uncounted in `MaskStats` while the Scan event counted them detected, so
+`MaskStats` Secret counts now rise to match the Scan event on email-bearing traffic. A `Secret`
+with any masked fragment is counted per masked fragment, as before this change. **Accepted
+residual:** up to 3 ASCII-punctuation bytes glued to a more specific finding the Secret lost to
+(email, phone, IP, IBAN -- including a false positive inside a real secret), before or after it,
+now egress raw (`!#$<email>`, `<email>!!$`; a password shaped like
+`Tr0ub4dor&3xK@horse.battery!!$` sends its last 3 bytes raw). Longer runs stay masked.
+
+**Review history (doubt-driven development: 2 single-model rounds, then 5 DDD cycles, each with a
+fresh-context Claude reviewer and Codex cross-model, ARTIFACT + CONTRACT only; the 4th and 5th
+were human-authorized past the skill's 3-cycle bound).** Each round found
+real false negatives in the draft before it: a broad "near an identifier" phone rule leaked
+`(415) 555-1234-mobile` and slug numbers; then an area-code group (`kontakt-030-20150612`), a
+country-code group (`sthlm-46-8-20251001`), an impossible date (`alice-1-20250231`), a
+continuing identifier (`tel-1-20251001_ext99`), phone labels (`Tel_8-20251001`) and a
+multi-group number (`tel-9-1-9-8-20251231`, a hyphenated `+91` mobile), a slash-continued
+value (`haiku-1-20251001/99`) and an `_`-glued family word (`phone_haiku-1-20251001`) each
+leaked in turn. An
+earlier entropy-side fix (trim trailing `.` from every Secret span) was abandoned after Codex
+showed it sent a real secret's final byte raw (a quoted JSON value ending in `.`). Cycle 3 also
+found the fragment drop applied to Secret-vs-Secret trims and to non-ASCII bytes, and that it
+left a detected-but-unhandled Secret in the audit counts; cycle 4 found the drop keyed per
+finding rather than per fragment, and dropped fragments counted twice; cycle 5 found a
+non-Bedrock `-` suffix (`haiku-1-20251001-mobile`) and a non-ASCII-glued word
+(`caféhaiku-1-20251001`) leaking, model IDs still over-masked beside curly quotes, `[1m]`,
+markdown and escaped JSON, an exactly-covered Secret uncounted, adjacency to a finding the
+Secret never lost to, an unbounded punctuation drop, and "handled" claimed under a `Pass`
+winner; all fixed. Every counterexample is a
+regression test. The human chose the model-family allowlist and counting dropped fragments as
+handled after cycle 3. **After cycle 5 the human replaced the detector-side shape rules**
+(`looks_like_date_suffixed_identifier`, `ends_model_id`, `MODEL_FAMILY_WORDS`,
+`MAX_VERSION_GROUPS`, `is_calendar_date`) **with the exact-literal scrub above:** five cycles had
+each found a leak in a shape rule, and a listed ID glued to a real number (`<id> 555-1234`)
+leaked through the digit-count filter whatever the rule said -- a shape rule decides per match,
+after the regex has already merged the ID into the number. Every phone counterexample from those
+cycles stays as a detector regression test (`still_flags_numbers_next_to_non_identifier_delimiters`);
+the "not a phone" cases moved to `vg-core`'s pipeline tests, minus the uppercase one. Fable
+(cross-model) proposed and implemented the scrub; an independent Codex adversarial review then
+found the single-copy design's entropy leak (Critical), the matching false positive (High) and
+a `c`-byte scan cost (Medium), consolidated into the two-step design above. A second Codex
+pass on that consolidation found the window pass adding findings away from the ID whose
+detector context lay outside the slice (`commit <sha>` redacted as a Secret, High) and
+quadratic cost on ID-dense input (High); both fixed by the 2-byte glue rule and indexed
+lookups.
+
+**Evidence.** `agent_system_prompt_shapes_are_not_over_masked` (exact expected output
+unchanged), `listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_agent_traffic`,
+`a_number_beside_a_listed_model_id_is_still_masked_and_the_id_is_spliced_from_the_original`
+(also resolves `EMAIL_001` from the vault to prove the original bytes were interned),
+`unlisted_or_glued_model_id_shapes_fail_toward_masking`,
+`the_scrub_never_changes_a_finding_outside_the_model_id` (both Codex entropy cases),
+`the_window_pass_adds_no_duplicate_or_truncated_findings` (incl. the `commit <sha>` case) and
+`only_punctuation_only_trimmed_secret_fragments_are_dropped` (`vg-core/tests/pipeline.rs`, with a
+precondition that the entropy Secret really overlaps the email),
+`a_secret_absorbed_by_a_pass_finding_is_not_counted_as_handled`, four scrub and seven
+`resolve_overlaps` unit tests in `api.rs`, and the phone tests. Mutation-checked (each new guard
+-- bounded-left, bounded-right, the scrub on `scan`, the scrub on `mask`, splicing from the
+original, detecting on the original, the glue/overlap/edge/duplicate filters on window findings,
+removing only inside-occurrence findings, the window pass itself -- reverted in turn fails a
+test). `vg bench --no-hook`: every gate PASS, secret recall
+5/5, PII recall 15/15, FP 0.0%.

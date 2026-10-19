@@ -16,7 +16,7 @@ use vg_audit::JsonlAuditSink;
 use vg_core::conformance::assert_masked_pack_excludes_raw_values;
 use vg_core::{
     mask, scan, ArtefactHint, AuditEvent, Context, Detector, DetectorId, EntityType, Finding,
-    Input, Namespace, Parser, Policy, PolicyEngine, PolicyLayers, RepoId, Span,
+    Input, Namespace, Parser, Placeholder, Policy, PolicyEngine, PolicyLayers, RepoId, Span,
 };
 use vg_detectors::all_detectors;
 use vg_parsers::all_parsers;
@@ -174,7 +174,10 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
     // Stats reflect what was handled; nothing was artefact-blocked.
     assert_eq!(pack.stats.counts.0.get(&EntityType::Email), Some(&3));
     assert_eq!(pack.stats.counts.0.get(&EntityType::Iban), Some(&1));
-    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&1));
+    // The entropy detector also flags two of the email addresses whole; those Secrets are
+    // absorbed by their Email findings and counted as handled once each (DDD cycle 5), so
+    // handled matches what the Scan event reports detected.
+    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&3));
     assert_eq!(pack.stats.blocked_artefacts, 0);
 
     // Reversible masks produced mapping refs; the returned Scan event carries the same
@@ -183,6 +186,10 @@ fn mask_end_to_end_stabilises_placeholders_and_excludes_raw_values() {
     match event {
         AuditEvent::Scan { counts, .. } => {
             assert_eq!(counts.0.get(&EntityType::Email), Some(&3));
+            assert_eq!(
+                counts.0.get(&EntityType::Secret),
+                pack.stats.counts.0.get(&EntityType::Secret)
+            );
         }
         other => panic!("expected AuditEvent::Scan, got {other:?}"),
     }
@@ -313,6 +320,444 @@ fn irreversible_redact_value_is_redacted_and_never_vault_stored() {
     // against the durable store — mapping_count stays 0.
     assert!(mapping_refs.is_empty());
     assert_eq!(persisted_mapping_count(&db_path), 0);
+}
+
+#[test]
+fn agent_system_prompt_shapes_are_not_over_masked() {
+    // veil-proxy#90 (XREPO-021), both shapes seen live in a real Claude Code system
+    // prompt: a model ID's `-YYYYMMDD` suffix was masked as PHONE, and a sentence-final
+    // email came out as `EMAIL_001[REDACTED:SECRET]` (the entropy token swallowed the `.`).
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let input = Input {
+        buf: b"Haiku 4.5: 'claude-haiku-4-5-20251001'. \
+The user's email address is fixture.author@example.com. Use it only to identify the user."
+            .to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    // Precondition (DDD cycle 2, Codex): the entropy detector really does emit a Secret
+    // overlapping the email, so this exercises the fragment drop, not just EmailDetector.
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret
+            && input.buf[f.span.start..f.span.end].ends_with(b"example.com.")),
+        "fixture must trigger an entropy Secret over the email and its `.`, got {findings:?}"
+    );
+
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+
+    assert_eq!(
+        pack.text,
+        "Haiku 4.5: 'claude-haiku-4-5-20251001'. \
+The user's email address is EMAIL_001. Use it only to identify the user."
+    );
+
+    // DDD cycle 1 finding: the same stray fragment came from any token-byte punctuation
+    // glued to the email, not just `.` -- Markdown bold is common in agent traffic.
+    for (raw, want) in [
+        (
+            "write to fixture.author@example.com! today",
+            "write to EMAIL_001! today",
+        ),
+        (
+            "write to **fixture.author@example.com**. today",
+            "write to **EMAIL_001**. today",
+        ),
+    ] {
+        let input = Input {
+            buf: raw.as_bytes().to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        let (pack, _refs, _event, _trace_id) =
+            with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+        assert_eq!(pack.text, want);
+    }
+}
+
+/// Masks `raw` through the real pipeline and returns the pack text.
+fn mask_text(policy: &Policy, ns: &Namespace, raw: &str) -> String {
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, policy, ns)).expect("mask succeeds");
+    pack.text
+}
+
+#[test]
+fn the_scrub_never_changes_a_finding_outside_the_model_id() {
+    // Codex review of the first scrub design, which fed the rewritten copy to every
+    // detector: the entropy detector scores the whole glued token, and the digit fill
+    // changed that token's entropy in both directions.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    // Fill letters collided with the secret's, pulling the token below the threshold: the
+    // secret egressed raw. Detection on the original keeps the whole-token Secret.
+    let raw = "claude-haiku-4-5-20251001=EEAEBBAAAAEBCBFAAABF";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret
+            && f.span.start == 0
+            && f.span.end == raw.len()),
+        "{findings:?}"
+    );
+    let text = mask_text(&policy, &ns, raw);
+    assert!(!text.contains("EEAEBBAAAAEBCBFAAABF"), "{text}");
+
+    // The fill raised a below-threshold token over it, garbling an unrelated value. The
+    // window pass discards any finding overlapping the ID.
+    let raw = "claude-haiku-4-5-20251001=2025100120251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
+
+    // The same token glued right after a first ID: the window finding starts within the
+    // glue distance of one occurrence but covers the next, so it is still discarded.
+    let raw = "claude-haiku-4-5-20251001 claude-haiku-4-5-20251001=2025100120251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn the_window_pass_adds_no_duplicate_or_truncated_findings() {
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    // An email beside the ID is found on both passes; the Scan event counts it once.
+    let input = Input {
+        buf: b"claude-haiku-4-5-20251001 fixture.author@example.com".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (_pack, _refs, event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    match event {
+        AuditEvent::Scan { counts, .. } => {
+            assert_eq!(counts.0.get(&EntityType::Email), Some(&1), "{counts:?}");
+        }
+        other => panic!("expected a Scan event, got {other:?}"),
+    }
+
+    // A finding the window pass makes away from the ID is never added: the slice can hide
+    // context a detector reads (Codex: `commit` outside the window made this SHA a Secret).
+    let raw = "xxxxxxxxx commit 0123456789abcdef0123456789abcdef01234567 \
+               xxxxxxxxxxxxxxxxxxxxx claude-haiku-4-5-20251001";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(findings.is_empty(), "{findings:?}");
+
+    // A long low-entropy token the window cuts in half: its high-entropy head alone must
+    // not become a Secret the original never found.
+    let head = "q7Z9wK2pX4mR8vT1yB6nF3hJ5sD0gLcE7uA2iO9eW4rQ1tY6zN8xV3bM5kH0jG2fP";
+    let raw = format!("claude-haiku-4-5-20251001 {head}{}", "a".repeat(400));
+    let input = Input {
+        buf: raw.clone().into_bytes(),
+        hint: ArtefactHint::default(),
+    };
+    let findings = with_real_context(|ctx| scan(&input, ctx));
+    assert!(
+        !findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn listed_model_ids_are_not_garbled_in_any_delimiter_shape_seen_in_agent_traffic() {
+    // veil-proxy#90 (XREPO-021): the phone detector's regex matches the `5-20251001` tail
+    // of a dated Claude model ID. `vg_core::PROTECTED_LITERALS` scrubs bounded occurrences
+    // before detection (`scan` and `mask` alike), so none of these shapes -- all seen around
+    // model IDs in real agent traffic, or the documented Bedrock/Vertex forms -- changes.
+    // (These cases lived in `phone.rs` while the fix was a detector-side shape rule; the
+    // detector itself now flags `5-20251001` unconditionally, by design.)
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let phones_in = |raw: &str| -> Vec<Finding> {
+        let input = Input {
+            buf: raw.as_bytes().to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        with_real_context(|ctx| scan(&input, ctx))
+            .into_iter()
+            .filter(|f| f.entity_type == EntityType::Phone)
+            .collect()
+    };
+    for raw in [
+        "Haiku 4.5: 'claude-haiku-4-5-20251001'. When building",
+        "model claude-opus-4-1-20250805 is pinned",
+        "claude-sonnet-4-20250514",
+        "models/claude-haiku-4-5-20251001/invoke",
+        "Use claude-haiku-4-5-20251001\u{2019} for this",
+        "the \u{201c}claude-haiku-4-5-20251001\u{201d} model",
+        "claude-sonnet-4-5-20250929[1m]",
+        "{\\\"model\\\":\\\"claude-haiku-4-5-20251001\\\"}",
+        "is it claude-haiku-4-5-20251001?",
+        "| claude-haiku-4-5-20251001|",
+    ] {
+        assert_eq!(mask_text(&policy, &ns, raw), raw, "garbled: {raw:?}");
+    }
+    // Shapes the ENTROPY detector (unchanged by #90, on main too) redacts whole as a
+    // `Secret` -- `anthropic.<id>-v1` has a mixed `v1` segment, so it is not a structured
+    // identifier and its 4.25 bits/byte clears the 3.5 threshold; `**<id>**`, `<id>!` and
+    // `model=<id>&x=1` likewise. A pre-existing residual tracked in next-actions, not a
+    // phone finding: the scrub is neutral on them, pinned here as "no PHONE" only.
+    for raw in [
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "**claude-haiku-4-5-20251001**",
+        "?model=claude-haiku-4-5-20251001&x=1",
+        "use claude-haiku-4-5-20251001!",
+    ] {
+        let phones = phones_in(raw);
+        assert!(
+            phones.is_empty(),
+            "scan found a phone in {raw:?}: {phones:?}"
+        );
+        let text = mask_text(&policy, &ns, raw);
+        assert!(!text.contains("PHONE_"), "{raw:?} => {text:?}");
+    }
+    // Every listed literal, standalone and inside the real system-prompt sentence shape.
+    for lit in vg_core::PROTECTED_LITERALS {
+        let id = std::str::from_utf8(lit).expect("literals are ASCII");
+        for raw in [id.to_string(), format!("Model: '{id}'. When building")] {
+            assert_eq!(mask_text(&policy, &ns, &raw), raw, "garbled: {raw:?}");
+            let phones = phones_in(&raw);
+            assert!(
+                phones.is_empty(),
+                "scan found a phone in {raw:?}: {phones:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_number_beside_a_listed_model_id_is_still_masked_and_the_id_is_spliced_from_the_original() {
+    // Before the scrub, `<id> 555-1234` (space or `-` joined) was one 16-digit phone
+    // candidate the 7-15 digit filter rejected whole, so `555-1234` egressed raw.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    for (raw, want) in [
+        (
+            "claude-haiku-4-5-20251001 555-1234",
+            "claude-haiku-4-5-20251001 PHONE_001",
+        ),
+        (
+            "claude-haiku-4-5-20251001-555-1234",
+            "claude-haiku-4-5-20251001-PHONE_001",
+        ),
+        (
+            "call 415-555-1234 about claude-haiku-4-5-20251001.",
+            "call PHONE_002 about claude-haiku-4-5-20251001.",
+        ),
+        // `-` bounds the occurrence, so the neighbour is judged exactly as it is anywhere
+        // else: a bare 7-digit run is not a phone to this detector, with or without the ID.
+        ("ref-5551234", "ref-5551234"),
+        (
+            "claude-haiku-4-5-20251001-5551234",
+            "claude-haiku-4-5-20251001-5551234",
+        ),
+        ("ref-555-1234", "ref-PHONE_001"),
+    ] {
+        assert_eq!(mask_text(&policy, &ns, raw), want, "input {raw:?}");
+    }
+    // A straddle through an identifier-forming byte is not a bounded occurrence, so the
+    // detector still sees `5-20251001` (and the entropy detector the whole token): fails
+    // toward masking, nothing of the digits egresses.
+    let text = mask_text(&policy, &ns, "claude-haiku-4-5-20251001_ext99");
+    assert!(
+        text.contains("PHONE_") && !text.contains("20251001"),
+        "straddle must stay masked, got {text:?}"
+    );
+
+    // `scan` (what the benchmark scores) agrees with `mask` on where the number is.
+    let input = Input {
+        buf: b"claude-haiku-4-5-20251001-555-1234".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let phones: Vec<(usize, usize)> = with_real_context(|ctx| scan(&input, ctx))
+        .into_iter()
+        .filter(|f| f.entity_type == EntityType::Phone)
+        .map(|f| (f.span.start, f.span.end))
+        .collect();
+    assert_eq!(
+        phones,
+        vec![(26, 34)],
+        "expected exactly `555-1234` flagged"
+    );
+
+    // A finding that extends across the scrubbed bytes is still produced (from the
+    // scrubbed copy) and the value interned is the ORIGINAL bytes, not the copy's.
+    let raw = "mail claude-haiku-4-5-20251001@example.com now";
+    let input = Input {
+        buf: raw.as_bytes().to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert_eq!(pack.text, "mail EMAIL_001 now");
+    let binding = pack
+        .bindings
+        .iter()
+        .find(|b| b.display == "EMAIL_001")
+        .expect("EMAIL_001 is bound");
+    let resolved = policy
+        .vault
+        .resolve(
+            &Placeholder {
+                display: binding.display.clone(),
+                mapping_ref: binding.mapping_ref,
+            },
+            &ns,
+        )
+        .expect("resolve EMAIL_001");
+    assert_eq!(
+        resolved.expose_secret(),
+        "claude-haiku-4-5-20251001@example.com",
+        "the vault must hold the original bytes, never the scrubbed copy's"
+    );
+}
+
+#[test]
+fn unlisted_or_glued_model_id_shapes_fail_toward_masking() {
+    // Documented residuals of the exact-literal scrub: anything not byte-identical to a
+    // listed ID, or not bounded, is still a phone to the detector. Pinned so a future
+    // "helpful" case-fold or fuzzy match is a deliberate decision, not drift.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    for raw in [
+        "CLAUDE-HAIKU-4-5-20251001",
+        "claude-haiku-4-5-20991231",
+        "xclaude-haiku-4-5-20251001",
+        "_claude-haiku-4-5-20251001_",
+        "caf\u{e9}claude-haiku-4-5-20251001",
+        "gpt-4.5-20251001",
+    ] {
+        assert!(
+            mask_text(&policy, &ns, raw).contains("PHONE_"),
+            "expected {raw:?} to over-mask (fail-safe)"
+        );
+    }
+}
+
+#[test]
+fn only_punctuation_only_trimmed_secret_fragments_are_dropped() {
+    // DDD cycle 2: pin both edges of the `resolve_overlaps` exception directly.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+    let run = |raw: &[u8]| {
+        let input = Input {
+            buf: raw.to_vec(),
+            hint: ArtefactHint::default(),
+        };
+        let findings = with_real_context(|ctx| scan(&input, ctx));
+        let (pack, _refs, _event, _trace_id) =
+            with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+        (findings, pack.text)
+    };
+
+    // E(i), DDD cycle 3: the dropped `.` fragment still counts as a handled Secret, so the
+    // audit trail's detected-vs-handled never reads as an unmasked secret.
+    let input = Input {
+        buf: b"write to fixture.author@example.com. today".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert_eq!(pack.text, "write to EMAIL_001. today");
+    match event {
+        AuditEvent::Scan { counts, .. } => {
+            assert_eq!(counts.0.get(&EntityType::Secret), Some(&1), "{counts:?}");
+        }
+        other => panic!("expected a Scan event, got {other:?}"),
+    }
+    assert_eq!(
+        pack.stats.counts.0.get(&EntityType::Secret),
+        Some(&1),
+        "{:?}",
+        pack.stats.counts
+    );
+
+    // DDD cycle 4: `**<email>**` drops two fragments of ONE raw Secret -- counted once.
+    let input = Input {
+        buf: b"write to **fixture.author@example.com** today".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert_eq!(pack.text, "write to **EMAIL_001** today");
+    match event {
+        AuditEvent::Scan { counts, .. } => {
+            assert_eq!(counts.0.get(&EntityType::Secret), Some(&1), "{counts:?}");
+        }
+        other => panic!("expected a Scan event, got {other:?}"),
+    }
+    assert_eq!(pack.stats.counts.0.get(&EntityType::Secret), Some(&1));
+
+    // A trimmed fragment carrying a digit is still masked.
+    let (findings, text) = run(b"write to fixture.author@example.com!1 today");
+    assert!(findings.iter().any(|f| f.entity_type == EntityType::Secret));
+    assert_eq!(text, "write to EMAIL_001[REDACTED:SECRET] today");
+
+    // An untrimmed, all-punctuation Secret is masked whole.
+    let (findings, text) = run(b"token !@#$%^&*+=./-_!@#$%^&*+=./-_ end");
+    assert!(
+        findings.iter().any(|f| f.entity_type == EntityType::Secret),
+        "fixture must trigger an entropy Secret, got {findings:?}"
+    );
+    assert_eq!(text, "token [REDACTED:SECRET] end");
+}
+
+#[test]
+fn a_secret_ending_in_punctuation_is_still_masked_whole() {
+    // DDD cycle 1 (Codex): a first draft trimmed trailing `.` from every entropy span and
+    // so sent a real secret's final byte raw. Only *trimmed* punctuation-only fragments
+    // beside a more specific finding may be dropped; an untrimmed Secret is masked whole.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+    let input = Input {
+        buf: br#"{"value":"zQ3v9Lm2Xp7RwT6uYbN8dKfJhC1sEoAi."}"#.to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let (pack, _refs, _event, _trace_id) =
+        with_real_context(|ctx| mask(&input, ctx, &policy, &ns)).expect("mask succeeds");
+    assert!(
+        pack.text.contains(r#""value":"[REDACTED:SECRET]"}"#),
+        "text: {}",
+        pack.text
+    );
 }
 
 #[test]
@@ -457,6 +902,60 @@ fn scan_event_counts_raw_detections_not_overlap_fragments() {
         }
         other => panic!("expected a Scan event, got {other:?}"),
     }
+}
+
+/// A `Hostname` finding (a `pass` class in the fixture policy) with a `Secret` that only
+/// adds trailing `!!`: the Secret is absorbed, but none of its bytes are replaced.
+struct PassBait;
+
+impl Detector for PassBait {
+    fn id(&self) -> DetectorId {
+        DetectorId("pass-bait".to_string())
+    }
+    fn detect(&self, _buf: &[u8], _spans: &[Span]) -> Vec<Finding> {
+        let f = |entity_type, start, end| Finding {
+            entity_type,
+            span: Span {
+                start,
+                end,
+                node_kind: None,
+            },
+            confidence: 0.9,
+            detector: self.id(),
+        };
+        vec![f(EntityType::Secret, 0, 19), f(EntityType::Hostname, 0, 17)]
+    }
+    fn entity_types(&self) -> &[EntityType] {
+        &[EntityType::Secret, EntityType::Hostname]
+    }
+}
+
+#[test]
+fn a_secret_absorbed_by_a_pass_finding_is_not_counted_as_handled() {
+    // DDD cycle 5: the absorbed-Secret count must not claim "handled" when the specific
+    // finding that absorbed it was passed through raw.
+    let dir = TempDir::new().expect("temp dir");
+    let (policy, _db_path, _audit_path) = build_policy(dir.path());
+    let ns = repo_ns();
+
+    let input = Input {
+        buf: b"build.example.org!! rest".to_vec(),
+        hint: ArtefactHint::default(),
+    };
+    let bait = PassBait;
+    let detectors: Vec<&dyn Detector> = vec![&bait];
+    let ctx = Context {
+        parsers: &[],
+        detectors: &detectors,
+    };
+    let (pack, _refs, _event, _trace_id) = mask(&input, &ctx, &policy, &ns).expect("mask succeeds");
+    assert_eq!(pack.text, "build.example.org!! rest");
+    assert_eq!(
+        pack.stats.counts.0.get(&EntityType::Secret),
+        None,
+        "{:?}",
+        pack.stats.counts
+    );
 }
 
 #[test]

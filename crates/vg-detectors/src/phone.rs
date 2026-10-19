@@ -25,6 +25,14 @@
 //! not arbitrary grouped numbers, per the Codex-reconciled decision in
 //! `docs/decisions.md` to fix detector-local false positives now rather than wait for
 //! Task T10's formal precision measurement.
+//!
+//! **Not handled here (veil-proxy#90, XREPO-021):** the `-YYYYMMDD` tail of a dated Claude
+//! model ID (`5-20251001` in `claude-haiku-4-5-20251001`) is flagged, by design. Five
+//! review cycles of shape rules in this file each leaked a real number
+//! (`kontakt-030-20150612`, `tel-1-20251001_ext99`, `phone_haiku-1-20251001`, ...; see
+//! `still_flags_numbers_next_to_non_identifier_delimiters`), so the fix moved to
+//! `vg_core::PROTECTED_LITERALS`: an exact-literal scrub applied to the buffer the
+//! detectors see, before any detector runs.
 
 use std::sync::OnceLock;
 
@@ -556,6 +564,68 @@ mod tests {
             1,
             "an unlabelled 5-4 grouped number must still be flagged"
         );
+    }
+
+    #[test]
+    fn still_flags_numbers_next_to_non_identifier_delimiters() {
+        // veil-proxy#90 regression suite: every case is a real number some draft of a
+        // detector-side "date-suffixed identifier" exclusion let through during review.
+        // That exclusion is gone (model IDs are scrubbed in `vg-core` before detection,
+        // see the module doc); these stay to keep any future shape rule honest.
+        for buf in [
+            &b"+44 20 7946 0958"[..],
+            b"020 7946 0958",
+            b"(020) 7946-0958",
+            b"tel: 415-555-1234",
+            b"PHONE=415-555-1234",
+            b"call +1-415-555-2671, thanks",
+            b"'415-555-1234'",
+            // Review findings against a broader first draft of the exclusion:
+            b"(415) 555-1234-mobile",
+            b"Reach me at 415-555-1234--Jane",
+            b"Call 415-555-1234-ext",
+            b"x-+1 415 555 2671",
+            b"cust-a-+44 20 7946 0958",
+            b"invoice_415-555-1234.pdf",
+            b"/contact/jane-doe-415-555-1234",
+            // A date-valid 8-digit tail is still a phone when phone markers are present
+            // or nothing letter-bearing is joined to it.
+            b"+44-20251001",
+            b"call 1-20251001 now",
+            // Confirming-review finding: an area-code group before a date-valid tail.
+            b"kontakt-030-20150612",
+            b"Tel_030-20150612",
+            // DDD cycle 1 (fresh-context + Codex) findings:
+            b"contact sthlm-46-8-20251001 now",
+            b"/contact/alice-1-20250231",
+            b"model-4-5-20250229",
+            // DDD cycle 2 (Codex): the date run must end the identifier.
+            b"{\"phone\":\"tel-1-20251001_ext99\"}",
+            b"tel-1-20251001x",
+            // DDD cycle 3 (fresh-context + Codex): labels and multi-group phone shapes.
+            b"{\"phone\":\"tel-9-1-9-8-20251231\"}",
+            b"Tel_8-20251001",
+            b"sthlm-8-20251001",
+            b"tw-2-20251001",
+            b"phone-1-19990101",
+            b"model_4-5-20240229",
+            b"claude-haiku-1-4-5-20251001",
+            b"ultrahaiku-4-5-20251001",
+            // DDD cycle 4 (Codex): a continuing identifier and an `_`-glued family word.
+            b"Call haiku-1-20251001/99",
+            b"phone_haiku-1-20251001",
+            // DDD cycle 5 (Codex): a non-Bedrock `-` suffix and a non-ASCII-glued word.
+            b"contact/haiku-1-20251001-mobile",
+            b"haiku-1-20251001-v",
+            "contacts/caf\u{e9}haiku-1-20251001".as_bytes(),
+        ] {
+            assert_eq!(
+                PhoneDetector.detect(buf, &[]).len(),
+                1,
+                "expected one phone in {:?}",
+                String::from_utf8_lossy(buf)
+            );
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub mod telemetry;
 
 pub use api::{
     benchmark, mask, rehydrate, scan, spans_overlap, Actor, Context, Corpus, CorpusSample,
-    Destination, DestinationId, Input, Metrics, Policy,
+    Destination, DestinationId, Input, Metrics, Policy, PROTECTED_LITERALS,
 };
 pub use audit::{variant_name as audit_event_variant_name, AuditEvent};
 pub use error::{AuditError, MaskError, PolicyError, RehydrateDenied, VaultError};

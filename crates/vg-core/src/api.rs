@@ -17,7 +17,7 @@
 //! sanctioned fix per the contract-change protocol (`agent-factory-plan.md` §6) is an
 //! explicit parameter, not smuggling detectors into `Policy` or pre-computing findings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -159,13 +159,12 @@ pub struct Metrics {
 /// whole buffer — the two documented YAML under-spanning reproducers (a `#` inside a
 /// quoted value; single-quoted flow scalars, see `docs/decisions.md`) would become
 /// missed-secret bugs if detection were span-gated.
+///
+/// Findings lying entirely inside a bounded Claude model ID ([`PROTECTED_LITERALS`]) are
+/// removed, and a scrubbed window around each ID may add findings; see `detect`.
 pub fn scan(input: &Input, ctx: &Context) -> Vec<Finding> {
     let spans = parser_spans(input, ctx);
-    let mut findings = Vec::new();
-    for detector in ctx.detectors {
-        findings.extend(detector.detect(&input.buf, &spans));
-    }
-    findings
+    detect(&input.buf, &spans, ctx)
 }
 
 /// Detects, classifies, and masks `input` per `policy`: classifies the artefact (blocking
@@ -238,13 +237,11 @@ pub fn mask(
     //    `Pass` means "send after entity masking", never "skip detection" (T06 review,
     //    hard requirement: skipping here would make `Pass` fail open).
     // 3-4. Parse for enrichment spans, then detect: every detector over the FULL buffer
-    //    (spans are enrichment only, never a gate — T08 review).
+    //    (spans are enrichment only, never a gate — T08 review), via the same `detect`
+    //    `scan` uses, so the protected-literal scrub applies identically on both paths.
     let spans = parser_spans(input, ctx);
     let detect_start = Instant::now();
-    let mut findings = Vec::new();
-    for detector in ctx.detectors {
-        findings.extend(detector.detect(&input.buf, &spans));
-    }
+    let mut findings = detect(&input.buf, &spans, ctx);
     let latency_us = detect_start.elapsed().as_micros() as u64;
 
     // Runtime span guard (doubt-pass finding): `Context` accepts any `&dyn Detector`, and
@@ -274,12 +271,14 @@ pub fn mask(
             .or_insert(0) += 1;
     }
 
-    // 5. Resolve overlaps: no byte is masked twice, and no detected byte is dropped —
-    //    a losing finding is trimmed to its uncovered fragments, never discarded whole.
+    // 5. Resolve overlaps: no byte is masked twice, and a losing finding is trimmed to its
+    //    uncovered fragments, never discarded whole. One narrow exception: a short
+    //    ASCII-punctuation-only `Secret` fragment beside a more specific finding it lost
+    //    to is dropped (and still counted as handled), see `resolve_overlaps`.
     // 6. Classify and intern in FORWARD document order (so vault ordinals read top-to-
     //    bottom: the first email in the buffer is EMAIL_001), collecting replacements;
     //    splices are applied back-to-front afterwards so offsets stay valid.
-    let ordered = resolve_overlaps(findings);
+    let (ordered, absorbed) = resolve_overlaps(&input.buf, findings);
 
     let mut mapping_refs: Vec<MappingRef> = Vec::new();
     // display → MappingRef for every placeholder minted (contract v1.2). Deduped in lockstep
@@ -346,6 +345,31 @@ pub fn mask(
         }
     }
 
+    // A Secret absorbed by more specific findings (covered by them, or its leftover
+    // punctuation dropped beside them; see `resolve_overlaps`) counts as handled once, so
+    // downstream consumers never read it as an unmasked Secret. Only when its bytes really
+    // were replaced: neither its own class nor any specific finding over it is `Pass`
+    // (DDD cycle 5). A Secret with any masked fragment is already counted above.
+    let is_pass = |ty: &EntityType| {
+        matches!(
+            policy.engine.classify_entity(ty.clone()),
+            HandlingClass::Pass
+        )
+    };
+    for finding in &absorbed {
+        let covered_by_pass = ordered.iter().any(|f| {
+            f.entity_type != EntityType::Secret
+                && f.span.start < finding.span.end
+                && finding.span.start < f.span.end
+                && is_pass(&f.entity_type)
+        });
+        if !is_pass(&finding.entity_type) && !covered_by_pass {
+            *handled_counts
+                .entry(finding.entity_type.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
     // 7. One `AuditEvent::Scan`: counts are ALL detections (including policy-Passed
     //    ones — the audit trail must be able to answer "what was found"); the pack's
     //    `MaskStats.counts` below are the *handled* subset (what was actually replaced).
@@ -402,8 +426,268 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
         .unwrap_or_default()
 }
 
-/// Resolves overlapping findings so no two accepted findings cover the same bytes — and
-/// no detected byte is ever dropped: the more specific entity type wins over the generic
+/// Runs every detector over the buffer and returns their findings. The one shared
+/// detection path for [`scan`] and [`mask`] (the benchmark scores `scan` and the proxy
+/// ships `mask`, so the two must never disagree on what is found). Every span is valid for
+/// the caller's original bytes, which is what `mask` interns and splices from.
+///
+/// Protected literals ([`PROTECTED_LITERALS`]) are handled in two steps whose safety does
+/// not depend on what any detector does with scrubbed bytes (Codex review of the first
+/// scrub design: rewriting the ID's digits for *every* detector changed the entropy of a
+/// whole token glued to it, so `<id>=<secret>` could drop below the threshold and leak):
+///
+/// 1. Every detector runs on the **original** buffer, and only a finding lying entirely
+///    inside a bounded protected occurrence is removed. Every other finding `main` made is
+///    kept, so the scrub can never hide a byte outside the constant's own bytes.
+/// 2. Only when an occurrence exists, every detector also runs over a short window of the
+///    `scrub_copy` copy around it (`SCRUB_WINDOW` bytes either side,
+///    overlapping windows merged), and a finding from that pass is **added** only when it
+///    starts at most `MAX_GLUE` bytes after an occurrence ends (the one place the ID's
+///    digits can merge into a neighbour), overlaps no occurrence, does not touch a window
+///    edge cut out of the middle of the buffer (a truncated token), and is not an exact
+///    duplicate of a step-1 finding (so audit counts are not inflated). This only ever adds masking: it is
+///    what finds `555-1234` in `<id> 555-1234`, where on the original the ID's digits join
+///    the number into one 16-digit candidate the phone detector rejects whole.
+///
+/// `spans` come from the parsers over the *original* buffer (see `parser_spans`); the
+/// window pass runs without parser spans, which can only make it find more, not less.
+fn detect(buf: &[u8], spans: &[Span], ctx: &Context) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for detector in ctx.detectors {
+        findings.extend(detector.detect(buf, spans));
+    }
+    let occurrences = protected_occurrences(buf);
+    if occurrences.is_empty() {
+        return findings;
+    }
+    // `occurrences` is ascending and non-overlapping, so each query is a binary search
+    // (Codex: linear scans made a request dense with IDs and findings quadratic).
+    let inside = |s: &Span| {
+        let i = occurrences.partition_point(|&(a, _)| a <= s.start);
+        i > 0 && s.end <= occurrences[i - 1].1
+    };
+    let overlaps = |s: &Span| {
+        let i = occurrences.partition_point(|&(a, _)| a < s.end);
+        i > 0 && occurrences[i - 1].1 > s.start
+    };
+    let glued_after = |s: &Span| {
+        let i = occurrences.partition_point(|&(_, b)| b <= s.start);
+        i > 0 && s.start - occurrences[i - 1].1 <= MAX_GLUE
+    };
+    findings.retain(|f| !inside(&f.span));
+    let seen: HashSet<(EntityType, usize, usize)> = findings
+        .iter()
+        .map(|f| (f.entity_type.clone(), f.span.start, f.span.end))
+        .collect();
+
+    let scrubbed = scrub_copy(buf, &occurrences);
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in &occurrences {
+        let lo = start.saturating_sub(SCRUB_WINDOW);
+        let hi = (end + SCRUB_WINDOW).min(buf.len());
+        match windows.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => windows.push((lo, hi)),
+        }
+    }
+    let mut added = Vec::new();
+    for (lo, hi) in windows {
+        for detector in ctx.detectors {
+            for mut f in detector.detect(&scrubbed[lo..hi], &[]) {
+                let cut_edge =
+                    (f.span.start == 0 && lo > 0) || (lo + f.span.end == hi && hi < buf.len());
+                f.span.start += lo;
+                f.span.end += lo;
+                let already = seen.contains(&(f.entity_type.clone(), f.span.start, f.span.end));
+                if glued_after(&f.span) && !cut_edge && !already && !overlaps(&f.span) {
+                    added.push(f);
+                }
+            }
+        }
+    }
+    findings.extend(added);
+    findings
+}
+
+/// Byte-exact literals the detectors must never be shown as digits: the dated Claude API
+/// model IDs (veil-proxy#90, XREPO-021). A real Claude Code system prompt sends
+/// `claude-haiku-4-5-20251001` on every request, and the phone detector's regex matches
+/// its `5-20251001` tail (9 digits, a hyphen marker) -- the detector cannot tell that
+/// apart from a number by shape: five review cycles of shape rules in `phone.rs` each
+/// leaked a real number (`kontakt-030-20150612`, `tel-1-20251001_ext99`, ...), and a
+/// listed ID glued to a real number (`claude-haiku-4-5-20251001 555-1234`) made one
+/// 16-digit candidate the digit-count filter rejected whole, sending `555-1234` raw. So
+/// the fix lives in `vg-core`'s shared detection path, as an exact match on the whole ID
+/// (see `detect`).
+///
+/// **A code constant, deliberately not policy.** A repo- or session-layer list would be an
+/// exfiltration primitive: whoever can write that layer (the upstream model is the
+/// adversary on the response path, and it can ask the wrapped client to edit files) could
+/// list a real value and have detection look away from it. Nothing here is fetched,
+/// configurable, or case-folded. Matching is exact, case-sensitive bytes: `CLAUDE-HAIKU-
+/// 4-5-20251001` is not a Claude API model ID and still over-masks (fails toward masking).
+/// **A new dated model over-masks until it is added here** (`docs/next-actions.md`), as do
+/// other providers' dated IDs (`o1-2024-12-17`, `gpt-4.5-20251001`).
+///
+/// Every entry starts with [`PROTECTED_LITERAL_FIRST_BYTE`] and none is a prefix of
+/// another (both unit-tested), which is what lets the scrub's search stay a single pass.
+pub const PROTECTED_LITERALS: &[&[u8]] = &[
+    b"claude-3-haiku-20240307",
+    b"claude-3-opus-20240229",
+    b"claude-3-sonnet-20240229",
+    b"claude-3-5-sonnet-20240620",
+    b"claude-3-5-sonnet-20241022",
+    b"claude-3-5-haiku-20241022",
+    b"claude-3-7-sonnet-20250219",
+    b"claude-sonnet-4-20250514",
+    b"claude-opus-4-20250514",
+    b"claude-opus-4-1-20250805",
+    b"claude-sonnet-4-5-20250929",
+    b"claude-haiku-4-5-20251001",
+    b"claude-opus-4-5-20251101",
+];
+
+/// The byte every [`PROTECTED_LITERALS`] entry starts with: the scrub only tries the
+/// literal list at positions holding it, so the per-request cost is one pass over the
+/// buffer plus at most `PROTECTED_LITERALS.len()` short prefix compares per `c`.
+const PROTECTED_LITERAL_FIRST_BYTE: u8 = b'c';
+
+/// The prefix every [`PROTECTED_LITERALS`] entry shares (unit-tested), checked once before
+/// the list is tried.
+const PROTECTED_LITERAL_PREFIX: &[u8] = b"claude-";
+
+/// Bytes of scrubbed context the window pass in `detect` gives each side of an
+/// occurrence: well over the longest phone candidate the regex can build (about 31
+/// bytes), which is the neighbour the window pass exists to find.
+const SCRUB_WINDOW: usize = 64;
+
+/// Most bytes between an occurrence's end and the start of a window-pass finding it may
+/// add (one or two separator bytes: `<id> 555-1234`, `<id>-555-1234`, `<id>, 555-1234`).
+/// A finding anywhere else in the window was already judged on the original with full
+/// context, and the slice can hide context a detector looks at (Codex: a `commit` word
+/// outside the window turned a git SHA into a `Secret`), so it is never added.
+const MAX_GLUE: usize = 2;
+
+/// The three-byte UTF-8 encodings of U+2018/U+2019/U+201C/U+201D (`‘ ’ “ ”`): the only
+/// non-ASCII bytes that bound a protected literal. Seen around model IDs in real agent
+/// traffic (DDD cycle 5 on the shape rules this scrub replaced).
+const TYPOGRAPHIC_QUOTES: [&[u8]; 4] = [
+    b"\xE2\x80\x98",
+    b"\xE2\x80\x99",
+    b"\xE2\x80\x9C",
+    b"\xE2\x80\x9D",
+];
+
+/// Returns a copy of `buf` in which every *bounded* occurrence of a [`PROTECTED_LITERALS`]
+/// entry has had its digits overwritten, or `None` when `buf` holds no such occurrence
+/// (the common case: no copy, no cost beyond the single scan). The copy is the same
+/// length as `buf`, byte-for-byte identical outside the occurrences, so detector offsets
+/// found on it address the same bytes of the original.
+///
+/// **What is overwritten.** Only the literal's ASCII digits, each replaced by the uppercase
+/// letter `A` + digit (`claude-haiku-4-5-20251001` → `claude-haiku-E-F-CACFBAAB`). Letters
+/// are what no digit-based detector (phone, IP, IBAN, sort code) can match, so no
+/// candidate in the copy can borrow the ID's digits. The copy is only ever used by the
+/// window pass in `detect`, which can add findings but never remove one, so what the fill
+/// does to a glued token's entropy cannot cause a leak (Codex: as the sole detector input
+/// it could, in both directions).
+///
+/// **Bounded.** The byte before the occurrence and the byte after it (when present) are
+/// both non-identifier-forming: not an ASCII alphanumeric, not `_`, and not a non-ASCII
+/// byte -- except that the four typographic quotes (`TYPOGRAPHIC_QUOTES`) count as bounds.
+/// So `-`, `.`, `/`, `\`, `@`, `[`, `*`, `=`, `?`, `&`, `|` and every ASCII quote or
+/// bracket bound an occurrence; `claude-haiku-4-5-20251001_ext99`, `…20251001x`,
+/// `…202510019`, `xclaude-…` and `caféclaude-…` are not occurrences and still over-mask
+/// (fail-safe). Why `-` and `.` bound even though each continues a phone candidate
+/// (`5-20251001-5551234`): Bedrock writes `anthropic.<id>-v1:0`, and what the detectors
+/// then see for the neighbour (`-5551234`) is exactly what they see for that neighbour
+/// anywhere else in the text. A finding made on the original that extends past the
+/// occurrence is always kept (`detect` step 1). The window pass is what finds `555-1234`
+/// in `<id>-555-1234` (one 16-digit candidate on the original, rejected whole, so it
+/// egressed raw before); `<id>-5551234` stays unchanged, as `ref-5551234` does, because
+/// the phone detector declines a bare 7-digit run everywhere. Non-ASCII bytes are
+/// identifier-forming for the same reason `phone.rs`'s word-boundary checks treat them so
+/// (the last byte of `é` is not a word boundary); the four quotes are the exception
+/// because they are the one non-ASCII neighbour real agent traffic puts beside a model ID,
+/// and a quote glyph is never part of a value the ID could be hiding.
+///
+/// Cost: one pass over `buf`; at each `PROTECTED_LITERAL_FIRST_BYTE` at most
+/// `PROTECTED_LITERALS.len()` prefix compares, each failing within a few bytes on
+/// non-matching text; the copy is made lazily on the first occurrence.
+#[cfg(test)]
+fn scrub_protected_literals(buf: &[u8]) -> Option<Vec<u8>> {
+    let occurrences = protected_occurrences(buf);
+    (!occurrences.is_empty()).then(|| scrub_copy(buf, &occurrences))
+}
+
+/// The `[start, end)` byte ranges of every bounded protected-literal occurrence in `buf`,
+/// in ascending, non-overlapping order. One pass; the literal list is only tried where
+/// the shared `PROTECTED_LITERAL_PREFIX` matches, so adversarial input (a run of `c`
+/// bytes, Codex review) costs one short compare per byte rather than one per literal.
+fn protected_occurrences(buf: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != PROTECTED_LITERAL_FIRST_BYTE || !buf[i..].starts_with(PROTECTED_LITERAL_PREFIX)
+        {
+            i += 1;
+            continue;
+        }
+        // No entry is a prefix of another (unit-tested), so at most one can match here.
+        let hit = PROTECTED_LITERALS
+            .iter()
+            .find(|lit| buf[i..].starts_with(lit))
+            .map(|lit| i + lit.len());
+        match hit {
+            Some(end) if bounded_left(buf, i) && bounded_right(buf, end) => {
+                out.push((i, end));
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// `buf` with the ASCII digits of each occurrence overwritten (`A` + digit); same length.
+fn scrub_copy(buf: &[u8], occurrences: &[(usize, usize)]) -> Vec<u8> {
+    let mut copy = buf.to_vec();
+    for &(start, end) in occurrences {
+        for b in &mut copy[start..end] {
+            if b.is_ascii_digit() {
+                *b = b'A' + (*b - b'0');
+            }
+        }
+    }
+    copy
+}
+
+/// Identifier-forming: a byte that continues a word/identifier rather than ending it.
+/// ASCII alphanumerics, `_`, and every non-ASCII byte (a multi-byte character is never
+/// a boundary, with the typographic-quote exception handled by the callers).
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
+}
+
+/// Whether a protected literal starting at `start` is bounded on the left: start of
+/// input, a non-identifier ASCII byte, or a typographic quote ending right there.
+fn bounded_left(buf: &[u8], start: usize) -> bool {
+    start == 0
+        || !is_identifier_byte(buf[start - 1])
+        || TYPOGRAPHIC_QUOTES.iter().any(|q| buf[..start].ends_with(q))
+}
+
+/// Whether a protected literal ending at `end` is bounded on the right: end of input, a
+/// non-identifier ASCII byte, or a typographic quote starting right there.
+fn bounded_right(buf: &[u8], end: usize) -> bool {
+    end == buf.len()
+        || !is_identifier_byte(buf[end])
+        || TYPOGRAPHIC_QUOTES.iter().any(|q| buf[end..].starts_with(q))
+}
+
+/// Resolves overlapping findings so no two accepted findings cover the same bytes — and,
+/// apart from the one narrow exception below, no detected byte is ever dropped: the more
+/// specific entity type wins over the generic
 /// entropy `Secret`, and among equally specific findings the longer span wins (T03's docs
 /// anticipate exactly the `Email`-over-`Secret` case). A losing finding is **trimmed to
 /// its fragments not covered by higher-priority findings**, never discarded whole.
@@ -415,9 +699,28 @@ fn parser_spans(input: &Input, ctx: &Context) -> Vec<Span> {
 /// finding surviving raw into the masked output. Trimming masks both: the email as
 /// `EMAIL_NNN`, the uncovered head as its own `Secret` fragment.
 ///
-/// Returned findings are sorted in forward document order (ascending span start), which
-/// the caller relies on for top-to-bottom vault ordinal minting.
-fn resolve_overlaps(mut findings: Vec<Finding>) -> Vec<Finding> {
+/// **One narrow exception (veil-proxy#90, XREPO-021):** a `Secret` fragment of at most
+/// `MAX_DROPPED_PUNCTUATION` bytes, made only of ASCII punctuation, is dropped rather than
+/// masked, when the `Secret` lost bytes to a *more specific* (non-`Secret`) finding. The entropy tokenizer counts `.`/`!`/`*` etc.
+/// as token bytes, so `<email>.` or `**<email>**` became one `Secret` whose leftover
+/// punctuation was masked as its own `[REDACTED:SECRET]` beside `EMAIL_001` -- seen live
+/// in a real Claude Code system prompt. An untrimmed `Secret` is always masked whole; a
+/// `Secret` trimmed only by another `Secret` keeps every fragment; any fragment holding a
+/// byte that is not ASCII punctuation (letter, digit, whitespace, control, non-ASCII) is
+/// always masked. The fragment must also share a boundary with one of the specific
+/// findings this `Secret` lost bytes to, not merely with any specific finding (DDD cycles
+/// 4 and 5). A `Secret` with no kept fragment after losing to specific findings -- every
+/// fragment dropped, or none left because they covered it exactly -- is returned
+/// separately, once, so the caller can count it as handled exactly once (otherwise the
+/// audit trail would show a detected-but-unhandled Secret, or count one Secret twice).
+/// **Accepted residual:** up to 3 ASCII-punctuation bytes glued to *any* more specific
+/// finding (email, phone, IP, IBAN -- including a false positive inside a real secret),
+/// before or after it, now egress raw: `!#$<email>`, `<email>!!$` (a password shaped like
+/// `Tr0ub4dor&3xK@horse.battery!!$` loses its last 3 bytes); longer runs stay masked.
+///
+/// Returned findings (both lists) are sorted in forward document order (ascending span
+/// start), which the caller relies on for top-to-bottom vault ordinal minting.
+fn resolve_overlaps(buf: &[u8], mut findings: Vec<Finding>) -> (Vec<Finding>, Vec<Finding>) {
     findings.sort_by(|a, b| {
         specificity(&b.entity_type)
             .cmp(&specificity(&a.entity_type))
@@ -429,18 +732,26 @@ fn resolve_overlaps(mut findings: Vec<Finding>) -> Vec<Finding> {
     });
 
     let mut accepted: Vec<Finding> = Vec::new();
+    let mut absorbed: Vec<Finding> = Vec::new();
     for finding in findings {
         // Subtract every already-accepted interval from this finding's span; keep each
         // surviving fragment as a finding of the same type. An exact duplicate (or a
         // fully-covered lower-priority finding) yields no fragments and drops out — that
         // is the "never double-mask" half of the contract.
         let mut fragments = vec![(finding.span.start, finding.span.end)];
-        for acc in &accepted {
+        // Indices into `accepted` of the more specific findings this one lost bytes to.
+        let mut winners: Vec<usize> = Vec::new();
+        for (idx, acc) in accepted.iter().enumerate() {
             let mut next = Vec::new();
             for (start, end) in fragments {
                 if acc.span.start >= end || acc.span.end <= start {
                     next.push((start, end)); // no overlap with this accepted span
                 } else {
+                    if specificity(&acc.entity_type) > specificity(&finding.entity_type)
+                        && !winners.contains(&idx)
+                    {
+                        winners.push(idx);
+                    }
                     if start < acc.span.start {
                         next.push((start, acc.span.start)); // fragment left of the winner
                     }
@@ -454,21 +765,48 @@ fn resolve_overlaps(mut findings: Vec<Finding>) -> Vec<Finding> {
                 break;
             }
         }
+        let mut kept_any = false;
         for (start, end) in fragments {
             debug_assert!(start < end);
-            accepted.push(Finding {
+            let fragment = Finding {
                 span: Span {
                     start,
                     end,
                     node_kind: finding.span.node_kind.clone(),
                 },
                 ..finding.clone()
+            };
+            let punctuation_only = end - start <= MAX_DROPPED_PUNCTUATION
+                && buf
+                    .get(start..end)
+                    .is_some_and(|b| b.iter().all(u8::is_ascii_punctuation));
+            // Beside a finding this Secret actually lost bytes to, not any specific one.
+            let beside_winner = winners.iter().any(|&w| {
+                let acc = &accepted[w];
+                acc.span.end == start || acc.span.start == end
             });
+            if beside_winner && finding.entity_type == EntityType::Secret && punctuation_only {
+            } else {
+                kept_any = true;
+                accepted.push(fragment);
+            }
+        }
+        // Covered entirely by, or dropped beside, more specific findings: every detected
+        // byte was handled by those, so the caller counts this Secret once (DDD cycle 5,
+        // Codex: an exactly-covered Secret previously went uncounted).
+        if !winners.is_empty() && !kept_any && finding.entity_type == EntityType::Secret {
+            absorbed.push(finding);
         }
     }
     accepted.sort_by_key(|f| f.span.start);
-    accepted
+    absorbed.sort_by_key(|f| f.span.start);
+    (accepted, absorbed)
 }
+
+/// Longest punctuation-only `Secret` fragment `resolve_overlaps` may drop: covers the
+/// observed `.`, `!`, `**` and `**.` shapes while bounding how many bytes of a real secret
+/// that merely looks like `x@y.z!!` can egress raw (DDD cycle 5).
+const MAX_DROPPED_PUNCTUATION: usize = 3;
 
 /// Priority for overlap resolution. The entropy detector's catch-all `Secret` is the one
 /// generic type — any concretely-typed finding (`Email`, `Iban`, `Password`, …) is more
@@ -727,7 +1065,7 @@ pub fn benchmark(corpus: &Corpus, ctx: &Context, policy: &Policy) -> Metrics {
 
     for sample in &corpus.samples {
         let start = Instant::now();
-        let detected = resolve_overlaps(scan(&sample.input, ctx));
+        let (detected, _dropped) = resolve_overlaps(&sample.input.buf, scan(&sample.input, ctx));
         latencies_us.push(start.elapsed().as_micros() as u64);
 
         // A value is only *protected* if a detector found it AND the policy masks/redacts
@@ -817,11 +1155,160 @@ fn p95(latencies_us: &mut [u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DetectorId;
 
     // `rehydrate`'s hard-deny gate and its pack-driven substitution both need a real
     // `Policy` (engine + vault + audit) now that it is wired (contract v1.2), so those
     // assertions live in `tests/demask.rs`, which composes the real Wave B crates as
     // `tests/pipeline.rs` does. Only the pure, dependency-free checks stay here.
+
+    fn finding(entity_type: EntityType, start: usize, end: usize) -> Finding {
+        Finding {
+            entity_type,
+            span: Span {
+                start,
+                end,
+                node_kind: None,
+            },
+            confidence: 1.0,
+            detector: DetectorId("test".to_string()),
+        }
+    }
+
+    fn spans(findings: &[Finding]) -> Vec<(usize, usize)> {
+        findings
+            .iter()
+            .map(|f| (f.span.start, f.span.end))
+            .collect()
+    }
+
+    #[test]
+    fn punctuation_only_secret_fragment_beside_a_specific_finding_is_dropped() {
+        // veil-proxy#90: `**<email>**` -- Secret over the whole token, Email inside it.
+        let buf = b"**a@example.com**";
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, 17),
+                finding(EntityType::Email, 2, 15),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(2, 15)]);
+        // Both fragments dropped: the raw Secret is reported once, not per fragment.
+        assert_eq!(spans(&dropped), vec![(0, 17)]);
+    }
+
+    #[test]
+    fn a_punctuation_fragment_not_beside_the_specific_finding_is_kept() {
+        // DDD cycle 4: `!!!!` (40..44) touches only another Secret, never the Email, so it
+        // stays masked even though its Secret overlapped the Email elsewhere.
+        let buf = b"a@example.com_ZZZZZZZZZZZZZZZZZZZZZZZZZZ!!!!";
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Email, 0, 13),
+                finding(EntityType::Secret, 0, 40),
+                finding(EntityType::Secret, 10, 44),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13), (13, 40), (40, 44)]);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_secret_trimmed_only_by_another_secret_keeps_its_punctuation() {
+        // DDD cycle 3 (Codex + fresh-context): the exception applies only after losing
+        // bytes to a MORE specific finding, never to an equally generic Secret.
+        let buf = b"!@#$AB12CD34";
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 4, 12),
+                finding(EntityType::Secret, 0, 6),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 4), (4, 12)]);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_non_ascii_or_whitespace_secret_fragment_is_never_dropped() {
+        // DDD cycle 3 (Codex): a custom detector's Secret may cover non-ASCII bytes;
+        // only pure ASCII punctuation qualifies for the drop.
+        let buf = "\u{e9}a@example.com".as_bytes(); // `é` is 2 bytes
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, buf.len()),
+                finding(EntityType::Email, 2, buf.len()),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 2), (2, buf.len())]);
+        assert!(dropped.is_empty());
+
+        let buf = b"! a@example.com";
+        let (accepted, dropped) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, buf.len()),
+                finding(EntityType::Email, 2, buf.len()),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 2), (2, buf.len())]);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_secret_covered_exactly_by_a_specific_finding_is_absorbed() {
+        // DDD cycle 5 (Codex): an exactly-covered Secret yields no fragments; it must
+        // still be reported so the caller counts it as handled.
+        let buf = b"a@example.com";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, 13),
+                finding(EntityType::Email, 0, 13),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13)]);
+        assert_eq!(spans(&absorbed), vec![(0, 13)]);
+    }
+
+    #[test]
+    fn a_punctuation_fragment_longer_than_the_cap_is_kept() {
+        // DDD cycle 5: bounds how much of a real `x@y.z!!!!`-shaped secret can egress.
+        let buf = b"a@example.com!!!!";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Secret, 0, 17),
+                finding(EntityType::Email, 0, 13),
+            ],
+        );
+        assert_eq!(spans(&accepted), vec![(0, 13), (13, 17)]);
+        assert!(absorbed.is_empty());
+    }
+
+    #[test]
+    fn a_punctuation_fragment_beside_a_finding_it_never_lost_to_is_kept() {
+        // DDD cycle 5: B's `!!!!` (40..44) touches only the IP, which B never overlapped;
+        // B lost bytes to the Email elsewhere, which must not qualify the fragment.
+        let buf = b"a@example.com_ZZZZZZZZZZZZZZZZZZZZZZZZZZ!!!10.0.0.1";
+        let (accepted, absorbed) = resolve_overlaps(
+            buf,
+            vec![
+                finding(EntityType::Email, 0, 13),
+                finding(EntityType::Secret, 0, 40),
+                finding(EntityType::Secret, 10, 43),
+                finding(EntityType::InternalIp, 43, 51),
+            ],
+        );
+        assert_eq!(
+            spans(&accepted),
+            vec![(0, 13), (13, 40), (40, 43), (43, 51)]
+        );
+        assert!(absorbed.is_empty());
+    }
 
     #[test]
     fn destination_id_is_stable_for_policy_lookups() {
@@ -865,5 +1352,100 @@ mod tests {
             redaction_marker(&EntityType::Password),
             "[REDACTED:PASSWORD]"
         );
+    }
+
+    #[test]
+    fn protected_literals_share_a_first_byte_and_none_is_a_prefix_of_another() {
+        // Both are what `scrub_protected_literals` relies on for its single-pass search.
+        for (i, lit) in PROTECTED_LITERALS.iter().enumerate() {
+            assert_eq!(lit[0], PROTECTED_LITERAL_FIRST_BYTE, "{lit:?}");
+            assert!(lit.starts_with(PROTECTED_LITERAL_PREFIX), "{lit:?}");
+            assert!(lit.is_ascii(), "{lit:?}");
+            for (j, other) in PROTECTED_LITERALS.iter().enumerate() {
+                assert!(
+                    i == j || !other.starts_with(lit),
+                    "{lit:?} is a prefix of {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_replaces_only_the_digits_of_a_bounded_occurrence_and_keeps_length() {
+        let raw = b"Haiku 4.5: 'claude-haiku-4-5-20251001'. Use it";
+        let scrubbed = scrub_protected_literals(raw).expect("one occurrence");
+        assert_eq!(scrubbed.len(), raw.len());
+        assert_eq!(
+            &scrubbed[..],
+            &b"Haiku 4.5: 'claude-haiku-E-F-CACFBAAB'. Use it"[..]
+        );
+        assert!(
+            scrubbed.iter().all(u8::is_ascii),
+            "fill must stay ASCII letters"
+        );
+
+        // Two occurrences, different literals, nothing else touched.
+        let raw = b"claude-opus-4-5-20251101 and claude-3-5-sonnet-20241022 at 415-555-1234";
+        assert_eq!(
+            scrub_protected_literals(raw).as_deref(),
+            Some(&b"claude-opus-E-F-CACFBBAB and claude-D-F-sonnet-CACEBACC at 415-555-1234"[..])
+        );
+    }
+
+    #[test]
+    fn scrub_returns_none_when_no_bounded_literal_is_present() {
+        for raw in [
+            &b""[..],
+            b"call 415-555-1234 now",
+            b"claude-haiku-4-5-2025100",   // truncated
+            b"CLAUDE-HAIKU-4-5-20251001",  // case-sensitive
+            b"claude-haiku-4-5-20251001x", // continued by a letter
+            b"claude-haiku-4-5-202510019", // continued by a digit
+            b"claude-haiku-4-5-20251001_ext99",
+            b"xclaude-haiku-4-5-20251001",
+            b"_claude-haiku-4-5-20251001",
+            "caf\u{e9}claude-haiku-4-5-20251001".as_bytes(),
+            "claude-haiku-4-5-20251001\u{e9}".as_bytes(),
+            "claude-haiku-4-5-20251001\u{a0}".as_bytes(), // NBSP: non-ASCII, not a quote
+        ] {
+            assert_eq!(
+                scrub_protected_literals(raw),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_treats_every_ascii_non_identifier_byte_and_typographic_quotes_as_bounds() {
+        let id = "claude-haiku-4-5-20251001";
+        let mut shapes: Vec<String> = vec![
+            id.to_string(),
+            format!("anthropic.{id}-v1:0"),
+            format!("models/{id}/invoke"),
+            format!("{id}[1m]"),
+            format!("\\\"{id}\\\""),
+            format!("**{id}**"),
+            format!("?model={id}&x=1"),
+            format!("{id}@example.com"),
+            format!("{id}-555-1234"),
+            format!("{id}-5551234"),
+            format!("\u{2018}{id}\u{2019}"),
+            format!("\u{201c}{id}\u{201d}"),
+        ];
+        for b in 0u8..=127 {
+            if !is_identifier_byte(b) {
+                let b = b as char;
+                shapes.push(format!("{b}{id}{b}"));
+            }
+        }
+        for raw in shapes {
+            let scrubbed = scrub_protected_literals(raw.as_bytes()).unwrap_or_else(|| {
+                panic!("expected a bounded occurrence in {raw:?}");
+            });
+            let expected = raw.replace(id, "claude-haiku-E-F-CACFBAAB");
+            assert_eq!(scrubbed, expected.into_bytes(), "{raw:?}");
+        }
     }
 }

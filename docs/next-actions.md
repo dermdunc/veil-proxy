@@ -14,6 +14,33 @@ not deliver "invisible governance / PII never leaves the machine" without an egr
 the keychain UX is poor. See the 2026-07-19 T11 sign-off entry in `docs/decisions.md`. The mask/
 demask logic, vault, detectors, pipeline, and tool-path masking are all validated.
 
+## veil-proxy#90 (XREPO-021) — fix on a branch, 2026-10-18
+
+- [ ] Human: review and merge the over-masking fix PR (closes #90).
+- [ ] Then veil-demo bumps its pin to the merge commit, and XREPO-021 closes in veil-ecosystem.
+- [ ] **Standing:** every new dated Claude API model ID must be added to
+      `vg_core::PROTECTED_LITERALS` (`crates/vg-core/src/api.rs`); until it is, the new ID
+      over-masks as `…-PHONE_NNN` on every request (fails toward masking). Exact bytes only.
+- [ ] Follow-up (out of #90's scope): dated IDs not in the constant still over-mask as PHONE
+      (`o1-2024-12-17` → `oPHONE_001`, `gpt-4.1-2025-04-14` → `gpt-4.PHONE_002`,
+      `gpt-4.5-20251001`, `claude-v4-20251001`, `sonnet4-5-20251001`,
+      `CLAUDE-HAIKU-4-5-20251001`), as do listed IDs glued through `_` (`_<id>_`).
+- [ ] Follow-up (phone detector, on `main` before and after #90): a >15-digit greedy regex
+      candidate is rejected whole, so a real number glued by `-`/`.`/space to any *unlisted*
+      digit-bearing prefix egresses raw -- `x-20251001 555-1234` is one 16-digit candidate and
+      `555-1234` is not masked. The scrub closes this only for listed model IDs. Fix belongs in
+      `phone.rs` (split an over-long candidate at its separators, or retry the tail), with the
+      ISBN/zip expansion residuals in mind.
+- [ ] Follow-up (entropy detector, on `main`): tokens merging a model ID with a non-word
+      segment are redacted whole as `[REDACTED:SECRET]` -- `anthropic.<id>-v1:0` →
+      `[REDACTED:SECRET]:0` (Bedrock), `**<id>**`, `use <id>!`, `?model=<id>&x=1` -- because
+      `v1`/`&x=1`/`**` defeat `is_structured_segments` and the token clears 3.5 bits/byte.
+      Found end-to-end while moving the #90 phone tests into `vg-core`; the scrub is neutral on
+      it. Fail-safe but garbles Bedrock model IDs in agent traffic.
+- [ ] veil-observatory: `MaskStats` Secret counts now include Secrets absorbed by an Email/IP
+      etc. (they matched the Scan event's detected count only after this fix); expect higher
+      handled-Secret numbers on email-bearing traffic.
+
 ## Now — the next milestone (supersedes the prior sign-off blocker order)
 
 - [x] **M1 — transport + routing skeleton (2026-07-25, merged to main as 8da9561).**
